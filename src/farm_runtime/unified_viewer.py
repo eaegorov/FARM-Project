@@ -413,29 +413,73 @@ def _resolve_inside(
     return candidate
 
 
-def _preflight_source_fingerprint(run_dir: Path, source: SourceFingerprint) -> Mapping[str, Any]:
+def _preflight_source_fingerprint(
+    run_dir: Path,
+    source_path: Path,
+    configured: SourceFingerprint,
+) -> Mapping[str, Any]:
+    """Bind a FARM run's recorded Gaussian input to the configured source file.
+
+    The registry and the producer are allowed to use different supported hash
+    algorithms. This is needed for old registries that pin the historical
+    sampled digest while current FARM runs record a full SHA-256 for the same
+    release-critical PLY. Algorithm conversion is never inferred from a path:
+    both fingerprints are verified against the actual configured file.
+    """
+
     report = _load_json(run_dir / "input" / "scene_preflight.json")
-    matches: list[Mapping[str, Any]] = []
-    for check in report.get("checks", []):
-        if not isinstance(check, Mapping) or check.get("name") != "fingerprints":
-            continue
-        metrics = check.get("metrics")
-        if isinstance(metrics, Mapping):
-            for row in metrics.get("files", []):
-                if isinstance(row, Mapping) and str(row.get("path", "")).lower().endswith(".ply"):
-                    matches.append(row)
-    exact = [
-        row for row in matches
-        if row.get("algorithm") == source.algorithm
-        and row.get("digest") == source.digest
-        and int(row.get("size_bytes", -1)) == source.size_bytes
+    checks = [
+        check for check in report.get("checks", [])
+        if isinstance(check, Mapping) and check.get("name") == "fingerprints"
     ]
-    if len(exact) != 1:
+    if len(checks) != 1:
         raise UnifiedViewerError(
-            "FARM run is not bound to the configured source PLY fingerprint "
-            f"({len(exact)} exact records)"
+            "FARM scene preflight must contain exactly one fingerprints check "
+            f"(got {len(checks)})"
         )
-    return exact[0]
+    check = checks[0]
+    if str(check.get("status", "")).lower() != "pass":
+        raise UnifiedViewerError("FARM scene-preflight fingerprints check did not pass")
+    metrics = check.get("metrics")
+    files = metrics.get("files") if isinstance(metrics, Mapping) else None
+    if not isinstance(files, list):
+        raise UnifiedViewerError("FARM scene-preflight fingerprints files must be a list")
+
+    canonical_source = source_path.expanduser().resolve(strict=True)
+    path_matches: list[Mapping[str, Any]] = []
+    for row in files:
+        if not isinstance(row, Mapping):
+            continue
+        recorded_path = row.get("path")
+        if not isinstance(recorded_path, str) or not recorded_path.strip():
+            continue
+        candidate = Path(recorded_path).expanduser()
+        if not candidate.is_absolute():
+            # Preflight records resolved absolute inputs. Treat a relative
+            # value as malformed instead of guessing a base directory.
+            continue
+        if candidate.resolve(strict=False) == canonical_source:
+            path_matches.append(row)
+    if len(path_matches) != 1:
+        raise UnifiedViewerError(
+            "FARM run is not bound to the configured source PLY path "
+            f"({len(path_matches)} exact records)"
+        )
+
+    row = path_matches[0]
+    required = {"algorithm", "digest", "size_bytes", "chunk_bytes", "sampled_offsets"}
+    missing = sorted(required - set(row))
+    if missing:
+        raise UnifiedViewerError(
+            "FARM source PLY fingerprint record is incomplete: " + ", ".join(missing)
+        )
+    producer = SourceFingerprint.from_mapping(
+        {name: row[name] for name in required},
+        field_name="FARM source PLY fingerprint",
+    )
+    if producer != configured:
+        producer.validate(canonical_source)
+    return row
 
 
 def _validate_source_snapshot(run_dir: Path, manifest: Mapping[str, Any]) -> tuple[str, bool]:
@@ -1080,9 +1124,7 @@ def _validate_farm(spec: SceneSpec) -> tuple[FarmBundle, PlyTable]:
         raise UnifiedViewerError("invalid FARM world-up or metric scale")
     world_up = world_up / np.linalg.norm(world_up)
     spec.source_fingerprint.validate(spec.source_ply)
-    source_record = _preflight_source_fingerprint(run_dir, spec.source_fingerprint)
-    if int(source_record.get("chunk_bytes", spec.source_fingerprint.chunk_bytes)) != spec.source_fingerprint.chunk_bytes:
-        raise UnifiedViewerError("run/configured source fingerprint chunk size mismatch")
+    _preflight_source_fingerprint(run_dir, spec.source_ply, spec.source_fingerprint)
     source_table = open_binary_ply(spec.source_ply)
     source_note, source_warning = _validate_source_snapshot(run_dir, manifest)
     evidence, evidence_reason = _farm_evidence_bundle(

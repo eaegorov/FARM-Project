@@ -15,6 +15,7 @@ from farm_runtime.unified_viewer import (
     SceneValidationFailure,
     UnifiedViserViewer,
     UnifiedViewerError,
+    _canonical_sampled_sha256,
     _markdown_text,
     camera_presets,
     focus_pose,
@@ -195,6 +196,43 @@ def _write_registry(
         }],
     }, sort_keys=False), encoding="utf-8")
     return registry
+
+
+def _set_registry_source_fingerprint(
+    registry: Path,
+    source: Path,
+    *,
+    algorithm: str,
+    chunk_bytes: int = 8,
+) -> None:
+    raw = yaml.safe_load(registry.read_text(encoding="utf-8"))
+    if algorithm == "sha256":
+        digest = sha256_file(source)
+        offsets: tuple[int, ...] = ()
+    else:
+        digest, offsets = _canonical_sampled_sha256(source, chunk_bytes=chunk_bytes)
+    raw["scenes"][0]["source_fingerprint"] = {
+        "algorithm": algorithm,
+        "digest": digest,
+        "size_bytes": source.stat().st_size,
+        "chunk_bytes": chunk_bytes,
+        "sampled_offsets": list(offsets),
+    }
+    registry.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+
+
+def _preflight_source_record(run: Path, source: Path) -> tuple[dict[str, object], dict[str, object]]:
+    path = run / "input" / "scene_preflight.json"
+    report = json.loads(path.read_text(encoding="utf-8"))
+    rows = [
+        row
+        for check in report["checks"]
+        if check["name"] == "fingerprints"
+        for row in check["metrics"]["files"]
+        if Path(str(row["path"])).resolve() == source.resolve()
+    ]
+    assert len(rows) == 1
+    return report, rows[0]
 
 
 def _artifact(path: Path) -> dict[str, object]:
@@ -574,6 +612,90 @@ def test_registry_validates_required_farm_source_and_reports_optional_layers(tmp
     assert "all 4 source rows; Viser float16/uint8 quantized DC preview" in (
         scene.layers["source_gaussians"].reason
     )
+
+
+def test_full_sha_producer_binds_to_legacy_sampled_registry_pin(tmp_path: Path) -> None:
+    run, source = _make_run(tmp_path)
+    registry = _write_registry(tmp_path, run, source)
+    _set_registry_source_fingerprint(
+        registry, source, algorithm="sha256-sampled-v1", chunk_bytes=8
+    )
+
+    validation = validate_registry(registry)
+
+    assert validation.ok
+    assert validation.ready_scenes[0].source_table.count == 4
+
+
+def test_legacy_sampled_producer_binding_still_passes(tmp_path: Path) -> None:
+    run, source = _make_run(tmp_path)
+    registry = _write_registry(tmp_path, run, source)
+    _set_registry_source_fingerprint(
+        registry, source, algorithm="sha256-sampled-v1", chunk_bytes=8
+    )
+    report, row = _preflight_source_record(run, source)
+    digest, offsets = _canonical_sampled_sha256(source, chunk_bytes=8)
+    row.update({
+        "algorithm": "sha256-sampled-v1",
+        "digest": digest,
+        "chunk_bytes": 8,
+        "sampled_offsets": list(offsets),
+    })
+    _write_json(run / "input" / "scene_preflight.json", report)
+
+    assert validate_registry(registry).ok
+
+
+def test_full_sha_producer_detects_mutation_outside_registry_sample(tmp_path: Path) -> None:
+    run, source = _make_run(tmp_path)
+    registry = _write_registry(tmp_path, run, source)
+    chunk_bytes = 8
+    _set_registry_source_fingerprint(
+        registry, source, algorithm="sha256-sampled-v1", chunk_bytes=chunk_bytes
+    )
+    sampled_before, offsets = _canonical_sampled_sha256(source, chunk_bytes=chunk_bytes)
+    covered = {
+        index
+        for offset in offsets
+        for index in range(offset, min(source.stat().st_size, offset + chunk_bytes))
+    }
+    mutation_index = next(index for index in range(source.stat().st_size) if index not in covered)
+    payload = bytearray(source.read_bytes())
+    payload[mutation_index] ^= 1
+    source.write_bytes(payload)
+    assert _canonical_sampled_sha256(source, chunk_bytes=chunk_bytes)[0] == sampled_before
+
+    validation = validate_registry(registry)
+
+    assert not validation.ok
+    assert "source PLY sha256 mismatch" in validation.scenes[0].reason
+
+
+@pytest.mark.parametrize("failure", ["digest", "size", "count", "path"])
+def test_producer_source_binding_rejects_wrong_record_semantics(
+    tmp_path: Path,
+    failure: str,
+) -> None:
+    run, source = _make_run(tmp_path)
+    registry = _write_registry(tmp_path, run, source)
+    report, row = _preflight_source_record(run, source)
+    if failure == "digest":
+        row["digest"] = "0" * 64
+    elif failure == "size":
+        row["size_bytes"] = source.stat().st_size + 1
+    elif failure == "count":
+        report["checks"][0]["metrics"]["files"].append(dict(row))
+    else:
+        row["path"] = str((tmp_path / "different-source.ply").resolve())
+    _write_json(run / "input" / "scene_preflight.json", report)
+
+    validation = validate_registry(registry)
+
+    assert not validation.ok
+    if failure in {"count", "path"}:
+        assert "configured source PLY path" in validation.scenes[0].reason
+    else:
+        assert "source PLY" in validation.scenes[0].reason
 
 
 def test_registry_fails_closed_for_source_mutation_and_path_escape(tmp_path: Path) -> None:

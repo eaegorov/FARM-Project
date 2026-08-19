@@ -10,11 +10,10 @@ scenes:
     farm_run: ../../../output/farm_pipeline/factory/latest
     source_ply: ../../../data/factory_scene_last.ply
     source_fingerprint:
-      algorithm: sha256-sampled-v1
-      digest: 6d05168cfdf9289f0f1dd12ec7d3812eb27885a608c8de1e290b9377331d5516
+      algorithm: sha256
+      digest: fdc6fc3fff65812234ee663bd8d42d48ba5a524ea0a9a429b4269e624bd3fe92
       size_bytes: 1411594650
       chunk_bytes: 1048576
-      sampled_offsets: [0, 705273037, 1410546074]
     bridge_roots:
       - ../../../output/farm_shaper_bridge/factory
       - ../../../output/farm_shaper_bridge/factory-generic-v7-v1
@@ -22,6 +21,7 @@ scenes:
       - ../../../output/farm_gaussian_lift/factory
     shaper_roots:
       - ../../../output/farm_shaper_bridge/factory
+      - ../../../output/farm_shaper_bridge/factory/factory-production-v3-release-v1/scene-quality-v1
       - ../../../output/farm_shaper_bridge/factory-generic-v7-exact-calibration-v2
       - ../../../output/farm_shaper_bridge/factory-generic-v7-v1
 
