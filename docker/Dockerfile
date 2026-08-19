@@ -74,7 +74,7 @@ RUN /usr/local/bin/uv pip install \
         loguru numpy Pillow PyYAML requests \
         "networkx>=2.8" supervision tqdm timm \
         scikit-learn scipy transforms3d \
-        "imageio[ffmpeg]" matplotlib pydantic viser \
+        "imageio[ffmpeg]" matplotlib pydantic "viser==1.0.30" \
         "vllm>=0.20.0" accelerate safetensors \
         "qwen-vl-utils>=0.0.14" \
         "setuptools<70" \

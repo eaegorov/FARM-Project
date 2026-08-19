@@ -19,6 +19,7 @@ from typing import Any, Mapping, Sequence
 from .config import Finalizer, Plan, PlanError, Stage, canonical_json, plan_to_public_dict, render_template, resolve_plan_path
 from .process import atomic_write_json, run_monitored_process, utc_now
 from .process import atomic_write_text
+from .integrity import DirectoryIntegrityError, directory_tree_descriptor
 from .source_snapshot import (
     SourceSnapshotIntegrityError,
     validated_source_snapshot_project_root,
@@ -113,6 +114,7 @@ _SOURCE_SNAPSHOT_DIRECTORIES = (
     "scripts",
     "src",
     "tests",
+    "tools",
     # The main runtime image installs these two pinned submodule packages in
     # editable mode. The signed snapshot is bind-mounted over the repository
     # inside the container, so it must carry the actual import targets rather
@@ -607,6 +609,10 @@ class RunOrchestrator:
             "host": socket.gethostname(),
             "platform": platform.platform(),
             "python": sys.version.split()[0],
+            "control_plane": {
+                "python_executable": sys.executable,
+                "pyyaml": str(yaml.__version__),
+            },
             "stage_order": list(self.plan.stage_order),
         }
         atomic_write_json(run_dir / "manifest.json", manifest)
@@ -812,6 +818,7 @@ class RunOrchestrator:
         viewer_dir = run_dir / "viewer"
         artifacts = self.plan.resolved_artifacts(run_dir)
         relative_artifacts: dict[str, str] = {}
+        artifact_integrity: dict[str, dict[str, Any]] = {}
         for name, path in artifacts.items():
             if not path.exists():
                 raise PipelineRunError(f"Final artifact {name!r} is missing: {path}")
@@ -823,12 +830,32 @@ class RunOrchestrator:
                     f"Final artifact {name!r} is outside the immutable run bundle: {resolved_path}"
                 ) from exc
             relative_artifacts[name] = os.path.relpath(resolved_path, viewer_dir)
+            if resolved_path.is_file():
+                artifact_integrity[name] = {
+                    "kind": "file",
+                    "path": relative_artifacts[name],
+                    "bytes": int(resolved_path.stat().st_size),
+                    "sha256": _sha256_file(resolved_path),
+                }
+            else:
+                try:
+                    tree = directory_tree_descriptor(resolved_path)
+                except DirectoryIntegrityError as exc:
+                    raise PipelineRunError(
+                        f"Final artifact directory {name!r} cannot be made immutable: {exc}"
+                    ) from exc
+                artifact_integrity[name] = {
+                    "kind": "directory",
+                    "path": relative_artifacts[name],
+                    **tree,
+                }
 
         bundle: dict[str, Any] = {
             "schema": "farm.viewer-bundle.v1",
             "scene_id": self.plan.scene_id,
             "run_id": run_dir.name,
             "artifacts": relative_artifacts,
+            "artifact_integrity": artifact_integrity,
             "configured": self.plan.viewer is not None,
         }
         if self.plan.viewer is not None:
@@ -1059,6 +1086,9 @@ class RunOrchestrator:
                 "stage_actions": stage_actions,
                 "total_wall_seconds": timing["total_wall_seconds"],
                 "viewer_bundle": "viewer/bundle.json",
+                "viewer_bundle_sha256": _sha256_file(
+                    run_dir / "viewer" / "bundle.json"
+                ),
                 "run_report": report,
             }
             self._validated_execution_root(run_dir)

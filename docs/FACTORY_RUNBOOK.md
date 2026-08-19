@@ -5,6 +5,10 @@ pipeline. Its configuration is `configs/scenes/factory_3dgs_colmap.yaml`.
 The removed legacy launcher is preserved only in historical source snapshots;
 new runs use the generic `farm` CLI.
 
+The complete clone, image/model pinning, dense-lift, ShapeR and unified-viewer
+procedure is [PRODUCTION_PIPELINE.md](PRODUCTION_PIPELINE.md). This page records
+only Factory-specific inputs, commands and current acceptance status.
+
 ## Inputs
 
 - virtual PINHOLE COLMAP: `../data/factory_pinhole_multi/sparse/0`;
@@ -13,45 +17,57 @@ new runs use the generic `farm` CLI.
 - Hugging Face secret: `../secrets.json`, mounted read-only and never persisted;
 - output root: `../output/farm_pipeline`.
 
-The full five-view conversion is validated at preflight. Mapping uses the
-geometry-selected cam00+cam01 centre-view backbone, avoiding all 6310 virtual
-images while preserving COLMAP connectivity.
+The full five-view conversion is validated at preflight. The current mapping
+configuration uses only the geometry-selected cam00+cam01 centre-view
+backbone. The observed selection is 174 physical timestamps / 348 individual
+views. The selector uses motion, COLMAP tracks and connectivity bridges; a
+coverage-balanced 480–640-view selector has not been implemented.
 
 ## Commands
 
 ```bash
-farm validate-plan --config configs/scenes/factory_3dgs_colmap.yaml
-farm run --config configs/scenes/factory_3dgs_colmap.yaml
-farm status --config configs/scenes/factory_3dgs_colmap.yaml --json
-farm serve --config configs/scenes/factory_3dgs_colmap.yaml --port 8081 --runtime docker
-farm stop --config configs/scenes/factory_3dgs_colmap.yaml
+export FARM_PY="$PWD/.venv-control/bin/python"
+
+"$FARM_PY" scripts/farm_pipeline.py validate-plan \
+  --config configs/scenes/factory_3dgs_colmap.yaml
+"$FARM_PY" scripts/farm_pipeline.py run \
+  --config configs/scenes/factory_3dgs_colmap.yaml \
+  --run-id factory-production-v3
+"$FARM_PY" scripts/farm_pipeline.py status \
+  --config configs/scenes/factory_3dgs_colmap.yaml --attempt --json
 ```
 
 Resume the latest interrupted attempt:
 
 ```bash
-farm run --config configs/scenes/factory_3dgs_colmap.yaml --resume
+"$FARM_PY" scripts/farm_pipeline.py run \
+  --config configs/scenes/factory_3dgs_colmap.yaml \
+  --run-id factory-production-v3 --resume
 ```
 
-Successful runs are immutable. Use a new run ID for a fresh experiment.
+Resume only when the recorded snapshot and existing artifacts still validate.
+Successful runs are immutable. Use a new run ID after any source, pin or scene
+configuration change and for every cold acceptance attempt.
 
-## Verified clean result
+## Current cold-validation record
 
-`factory-generic-v7` is the single retained autonomous factory bundle. Its
-canonical stages completed in 776.04 seconds. Selection converged to 174
-timestamps / 348 views with zero residual graph edges. Final QA retained 49
-metric multi-view objects; all 49 have captions and both text/VL embeddings.
-Peak selected-device usage was 27.51 GiB, with 25.36 GiB incremental delta.
-These are whole-device measurements, not per-process attribution.
+The historical `factory-generic-v7` bundle predates the current
+hash-manifested execution-snapshot and final-acceptance contracts. It is not
+proof that the current checkout passes and its numbers must not be reported as
+current-run measurements.
 
-Use `final/scene_state.pt`, `final/catalog.json`,
-`final/presentation_catalog.json` and `final/cloud.npz` downstream. The full
-evidence trail remains under `qa/`, and `viewer/launch.sh` opens the offline
-click-to-inspect presentation with a default point size of 0.004 m.
-`reports/self_containment.json` records required artifact hashes and
-`reports/FARM-Project-source-without-models.tar.gz` freezes the exact source
-tree used for the consolidated result. Semantic lineage inputs are materialized
-under `qa/semantics/consensus/evidence/`; no predecessor run is required.
+Two current-source cold attempts were rejected correctly:
+
+- `factory-production-v1`, commit `9ddcba7`, reached final acceptance and
+  failed after 1184.23 s;
+- `factory-production-v2`, commit `6749025`, failed mapping after 134.81 s
+  because the execution snapshot omitted editable runtime package targets.
+
+Commit `757f654` adds those YOLOE/MobileCLIP import targets to the snapshot.
+It still needs a separate from-zero 17-stage run ending in root
+`_SUCCESS.json`. Until that exists, there is no accepted current Factory
+result. Failed attempts remain diagnostic evidence and must not update
+`latest`.
 
 ## Quality boundary
 
@@ -59,6 +75,10 @@ The detector is a static open-vocabulary YOLOE profile. The result is an
 evidence-backed catalog, not a guaranteed exhaustive inventory: very small,
 occluded or out-of-vocabulary objects can still be missed. Rollout requires a
 cold validation on several scenes with different rigs, scales and content.
+
+There is no fixed runtime or VRAM guarantee. Use only the per-stage wall/RSS/
+VRAM records from the exact accepted run; whole-device VRAM includes unrelated
+processes on the selected GPU.
 
 The current standard semantic implementation also includes tight mask-grounded
 object crops, conflict-only blind reconciliation and a non-regressive consensus

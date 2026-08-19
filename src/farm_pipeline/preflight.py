@@ -114,13 +114,24 @@ def _canonical_sha256(value: Any) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
-def fingerprint_file(path: Path, full_hash_max_bytes: int, chunk_bytes: int) -> dict[str, Any]:
-    """Content fingerprint a file without reading every byte of large inputs."""
+def fingerprint_file(
+    path: Path,
+    full_hash_max_bytes: int,
+    chunk_bytes: int,
+    *,
+    force_full: bool = False,
+) -> dict[str, Any]:
+    """Content fingerprint a file, optionally requiring a full SHA-256.
+
+    Generic large inputs retain the explicit sampled fingerprint used by the
+    inexpensive discovery gate. The source Gaussian PLY is release-critical
+    and callers force a full digest regardless of size.
+    """
 
     stat = path.stat()
     size = int(stat.st_size)
     digest = hashlib.sha256()
-    if size <= full_hash_max_bytes:
+    if force_full or size <= full_hash_max_bytes:
         with path.open("rb") as stream:
             while True:
                 chunk = stream.read(chunk_bytes)
@@ -1148,7 +1159,12 @@ def _check_fingerprints(config: SceneConfig, source_files: Sequence[Path]) -> Ch
     for path in unique:
         try:
             fingerprints.append(
-                fingerprint_file(path, config.preflight.full_hash_max_bytes, config.preflight.hash_chunk_bytes)
+                fingerprint_file(
+                    path,
+                    config.preflight.full_hash_max_bytes,
+                    config.preflight.hash_chunk_bytes,
+                    force_full=path == config.inputs.gaussian_ply,
+                )
             )
         except OSError as exc:
             result.add("error", "fingerprint.read_error", "failed to fingerprint an input", path=str(path), error=str(exc))

@@ -38,6 +38,7 @@ STANDARD_SHARED_CODE_INPUTS = (
     "src/farm_pipeline/resources.py",
     "src/farm_pipeline/scene_config.py",
     "src/farm_runtime/process.py",
+    "src/farm_runtime/integrity.py",
     "src/farm_runtime/source_snapshot.py",
     "src/farm_runtime/standard.py",
 )
@@ -297,12 +298,16 @@ def compile_standard_scene(
         "artifacts": {
             "scene_state": f"{run}/final/scene_state.pt",
             "catalog": f"{run}/final/catalog.json",
+            "presentation_catalog": f"{run}/final/presentation_catalog.json",
             "cloud": f"{run}/final/cloud.npz",
             "rgbd": f"{run}/rgbd",
             "mapping": f"{run}/mapping",
             "qa": f"{run}/qa/result.json",
             "qa_summary": f"{run}/qa/summary.json",
             "resolved_context": f"{run}/input/resolved_context.json",
+            "scene_preflight": f"{run}/input/scene_preflight.json",
+            "resource_preflight": f"{run}/input/resource_preflight.json",
+            "final_acceptance": f"{run}/qa/acceptance/result.json",
         },
         "viewer": {
             "runtime": "docker",

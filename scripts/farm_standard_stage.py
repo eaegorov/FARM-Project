@@ -234,6 +234,9 @@ class Context:
         self.models = load_model_manifest(self.manifest_path)
         self.main_image = self.models.runtimes["main"].image_id
         self.prep_image = self.models.runtimes["prep"].image_id
+        self.prep_python = self.models.runtimes["prep"].python
+        if self.prep_python is None:
+            raise RuntimeError("runtime 'prep' has no pinned Python interpreter")
         self.counter = 0
 
     @property
@@ -364,7 +367,7 @@ class Context:
             "-e", "HF_HUB_OFFLINE=1", "-e", "TRANSFORMERS_OFFLINE=1",
             "-v", f"{ROOT}:/project:ro", "-v", f"{self.run_dir}:/farm-run",
             "-v", f"{self.config.inputs.gaussian_ply}:/input/scene.ply:ro",
-            "--entrypoint", "/opt/conda/envs/rest3d/bin/python", self.prep_image,
+            "--entrypoint", self.prep_python, self.prep_image,
             f"/project/scripts/{script}", *map(str, arguments),
         ]
         run(command)
@@ -600,7 +603,7 @@ class Context:
             "-v", f"{self.config.inputs.colmap_model}:/input/colmap:ro",
             "-v", f"{self.config.inputs.image_root}:/input/images:ro",
             "-v", f"{self.config.inputs.gaussian_ply}:/input/scene.ply:ro",
-            "--entrypoint", "/opt/conda/envs/rest3d/bin/python", self.prep_image,
+            "--entrypoint", self.prep_python, self.prep_image,
             "/project/scripts/prepare_colmap_3dgs_rgbd.py", "--colmap-model", "/input/colmap",
             "--image-root", "/input/images", "--ply", "/input/scene.ply",
             "--selected-names", "/farm-run/selection/selected_names.txt",

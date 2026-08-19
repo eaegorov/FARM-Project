@@ -4,6 +4,8 @@ The supported production entry point is `farm` / `scripts/farm_pipeline.py`.
 Canonical `farm.scene.v1` stages are declared in
 `src/farm_runtime/standard.py`; their implementation programs remain in
 `scripts/` and are fingerprinted per stage for safe resume invalidation.
+See [PRODUCTION_PIPELINE.md](PRODUCTION_PIPELINE.md) for the end-to-end
+production commands and release boundary.
 
 ## Canonical pipeline and preparation
 
@@ -22,6 +24,23 @@ Canonical `farm.scene.v1` stages are declared in
 - Models/services: `download_farm_models.py`,
   `download_dinov3_vits16plus.py`, `hf_download_with_secret.py`,
   `start_farm_vllm.sh`.
+- Portability: `pin_farm_runtime_images.py` audits or atomically updates only
+  manifest runtime image IDs after inspecting every configured Docker tag.
+- Unified viewer: `serve_farm_unified_viewer.py` serves the validated scene
+  registry on loopback port 8080 by default. It is an unauthenticated
+  single-user inspection service; its all-N source layer is a float16/uint8
+  Viser DC preview, not a native-precision 3DGS renderer.
+
+## Dense lift and ShapeR bridge
+
+`tools/farm_shaper_bridge/` contains the exact contributor lift launcher,
+ShapeR runtime manager, verified-instance input builder, pinned inference
+runner, Docker-wrapped `run_bridge_stage.py prepare/assemble` host control,
+and metric-scene assembler. These are downstream products with their own
+release markers; they do not mutate the FARM run or source PLY. The
+prepare/assemble wrapper runs from the minimal control venv; runtime management
+and inference use the optional exact `bridge-control.lock.txt` launcher
+environment while computation remains in pinned images.
 
 ## Upstream research/evaluation utilities
 
@@ -37,4 +56,5 @@ The old factory selector/RGB-D launcher, H100 multi-service launcher, V6/V7/V8
 management-board renderers and one-off benchmark/regression plots were removed.
 They duplicated the generic stages, contained factory paths or fixed object
 policies, and were not referenced by the canonical DAG or tests. Historical
-commands remain in the immutable run logs and the v7 source snapshot.
+commands remain in immutable historical run artifacts only. Those artifacts
+do not prove that the current checkout passes its acceptance contract.

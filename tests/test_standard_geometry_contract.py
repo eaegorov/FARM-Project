@@ -160,6 +160,16 @@ def test_factory_manifest_pins_mobileclip_required_by_yoloe() -> None:
 
 
 def test_presentation_uses_pinned_prep_dependency_closure() -> None:
+    init_source = inspect.getsource(Context.__init__)
+    assert 'self.prep_python = self.models.runtimes["prep"].python' in init_source
+    assert '"--entrypoint", self.prep_python, self.prep_image' in inspect.getsource(
+        Context.prep_post
+    )
+    assert '"--entrypoint", self.prep_python, self.prep_image' in inspect.getsource(
+        Context.rgbd
+    )
+    assert "/opt/conda/envs/rest3d/bin/python" not in inspect.getsource(Context.prep_post)
+    assert "/opt/conda/envs/rest3d/bin/python" not in inspect.getsource(Context.rgbd)
     assert 'self.prep_post("prepare_farm_presentation.py"' in inspect.getsource(
         Context.presentation
     )

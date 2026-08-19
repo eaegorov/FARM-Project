@@ -31,7 +31,7 @@ dependencies = [
     "transforms3d",
     "matplotlib",
     "imageio[ffmpeg]",
-    "viser",
+    "viser==1.0.30",
 ]
 
 [project.urls]
@@ -52,6 +52,9 @@ vllm = [
     "qwen-vl-utils>=0.0.14",
 ]
 dev = ["pytest", "black", "flake8"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
 
 [build-system]
 requires = ["setuptools>=45", "wheel"]

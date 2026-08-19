@@ -1,127 +1,145 @@
 # Generic FARM pipeline runtime
 
-**farm** (backward-compatible alias: **farm-pipeline**) turns a COLMAP + 3DGS
-scene into an immutable, resumable run.
-The runtime contains no scene names, object IDs, category prompts, camera
-baselines or up-axis assumptions.
+The supported production entry point is `scripts/farm_pipeline.py` (installed
+aliases: `farm` and `farm-pipeline`). It turns a COLMAP + aligned 3DGS scene
+contract into an immutable, resumable FARM run. The complete build, lift,
+ShapeR and unified-viewer runbook is
+[PRODUCTION_PIPELINE.md](PRODUCTION_PIPELINE.md).
 
-## Canonical scene contract
+## Scene contract
 
-For a simple monocular sequence, copy the minimal
-**configs/farm_scene.example.yaml** and set the four scene fields:
+For a monocular sequence, start with `configs/farm_scene.example.yaml`:
 
-    schema_version: farm.scene.v1
-    scene_id: my_scene
-    inputs:
-      colmap_model: /data/my_scene/sparse/0
-      image_root: /data/my_scene/images
-      gaussian_ply: /data/my_scene/scene.ply
-    output_root: /output/farm
+```yaml
+schema_version: farm.scene.v1
+scene_id: my_scene
+inputs:
+  colmap_model: /data/my_scene/sparse/0
+  image_root: /data/my_scene/images
+  gaussian_ply: /data/my_scene/scene.ply
+output_root: /output/farm
+```
 
-Relative paths are resolved relative to the scene YAML. Multi-camera rigs,
-virtual fisheye views, metric baselines or explicit gravity should instead
-start from the fully annotated **configs/scenes/example_3dgs_colmap.yaml**.
-Ordinary PINHOLE/SIMPLE_PINHOLE monocular scenes need no overrides.
+Multi-camera rigs, virtual fisheye views, metric baselines and explicit
+gravity should start from `configs/scenes/example_3dgs_colmap.yaml`. Relative
+paths resolve from the YAML. Scene-specific object IDs, label tables and
+category prompts are not part of the contract.
 
-The canonical contract compiles to this fixed, fail-closed DAG:
+The fixed fail-closed DAG is:
 
-    preflight -> selection -> rgbd -> mapping -> mapping_qa -> presentation
-      -> geometry -> visual_consistency -> semantics -> part_whole -> assemblies
-      -> surface_support -> compound_geometry -> geometry_qa -> dedup
-      -> finalize -> qa_bundle
+```text
+preflight -> selection -> rgbd -> mapping -> mapping_qa -> presentation
+  -> geometry -> visual_consistency -> semantics -> part_whole -> assemblies
+  -> surface_support -> compound_geometry -> geometry_qa -> dedup
+  -> finalize -> qa_bundle
+```
 
-Every stage is executed as an argv list without a shell. The standard stage
-adapter is **scripts/farm_standard_stage.py**. A missing adapter is a declared
-input failure in preflight, never a partial successful result. Every stage must
-write a JSON result with status **PASS**. Root **_SUCCESS.json** is written only
-after **qa/result.json** reports PASS.
+Every stage executes an argv list without a shell and must write a declared
+PASS JSON. Root `_SUCCESS.json` is written only after final acceptance and QA
+pass.
 
 ## Commands
 
-    farm validate-plan --config scene.yaml
-    farm run --config scene.yaml
-    farm status --config scene.yaml --json
-    farm serve --config scene.yaml --host 127.0.0.1 --port 8081
-    farm stop --config scene.yaml
+With the control-plane venv from the production runbook:
 
-**serve** is the only command that starts a web process. It refuses an occupied
-port and never kills an unrelated process. PID plus Linux process-start
-identity are kept outside the immutable run. An existing demo on port 8080 is
-untouched unless that exact managed run is explicitly stopped.
+```bash
+export FARM_PY="$PWD/.venv-control/bin/python"
 
-Resume an interrupted attempt:
+"$FARM_PY" scripts/farm_pipeline.py validate-plan --config scene.yaml
+"$FARM_PY" scripts/farm_pipeline.py run --config scene.yaml --run-id my-run
+"$FARM_PY" scripts/farm_pipeline.py status --config scene.yaml --attempt --json
+```
 
-    farm run --config scene.yaml --resume
-    farm run --config scene.yaml --resume --force-stage geometry
+Resume a failed/interrupted attempt only when its execution snapshot and
+published stage outputs still validate:
 
-Forcing a stage also invalidates every descendant. Successful runs are
-immutable and cannot be resumed or overwritten.
+```bash
+"$FARM_PY" scripts/farm_pipeline.py run \
+  --config scene.yaml --run-id my-run --resume
+```
+
+`--force-stage geometry` invalidates geometry and every descendant. Use a new
+run ID for a cold run after source/config/model/runtime changes.
+
+The per-run FARM viewer remains available independently of the unified viewer:
+
+```bash
+"$FARM_PY" scripts/farm_pipeline.py serve \
+  --config scene.yaml --host 127.0.0.1 --port 8081 --runtime docker
+"$FARM_PY" scripts/farm_pipeline.py stop --config scene.yaml
+```
+
+It refuses an occupied port and stops only the process identity it owns. The
+multi-scene/layer viewer uses port 8080 and
+`scripts/serve_farm_unified_viewer.py`; see the production runbook.
+
+## Execution-source snapshot
+
+A new standard run atomically captures an allowlisted first-party source tree
+under `config/source_snapshot/FARM-Project`. The manifest records file modes,
+sizes, executable bits, per-file SHA-256 and a canonical tree SHA-256. It also
+contains the actual YOLOE/MobileCLIP editable-package import targets used by
+the main image. Secrets, models, caches and outputs are excluded; symlinks and
+special files are rejected.
+
+Stages, finalizers and reports execute from that snapshot, not the later live
+checkout. Full tree validation occurs around execution. The snapshot is
+hash-manifested; it is not a cryptographic author signature.
 
 ## Output contract
 
-    <output>/<scene_id>/
-      latest -> runs/<last successful run>
-      latest-attempt -> runs/<last attempted run>
-      .runtime/<run_id>/viewer/       # mutable PID and server logs
-      runs/<run_id>/
-        config/                        # redacted source + resolved plan
-        input/  selection/  rgbd/
-        mapping/  final/  qa/
-        visuals/  viewer/
-        logs/  stages/  timing/
-        manifest.json
-        _SUCCESS.json | _FAILED.json
+```text
+<output>/<scene_id>/
+  latest -> runs/<last successful run>
+  latest-attempt -> runs/<last attempted run>
+  .runtime/<run_id>/viewer/
+  runs/<run_id>/
+    config/ input/ selection/ rgbd/ mapping/ final/ qa/
+    visuals/ viewer/ logs/ stages/ timing/
+    manifest.json
+    _SUCCESS.json | _FAILED.json
+```
 
-Each stage stores its fingerprint, attempts, stdout, stderr, wall time,
-process-tree peak RSS, PID-attributed GPU memory, whole-device GPU memory and
-raw telemetry samples. Whole-device counters are explicitly tagged and the
-selected preflight GPU gets its own baseline/peak/delta record. Resume is
-accepted only when fingerprints and output metadata still match. Final viewer
-artifact paths are relative and must remain inside the run.
+Every stage state records its fingerprint, attempt, declared input/output
+fingerprints, stdout/stderr, raw telemetry, wall time, process-tree peak RSS,
+PID-attributed GPU memory where available, and whole-device baseline/peak/
+delta. Whole-device values include unrelated GPU processes and are labeled as
+such.
 
-`qa_bundle` reruns the generic quality analyzer on the final state, requires
-semantic/embedding coverage, builds a visual-only index under `visuals/`, and
-writes `qa/summary.json`, timing/resource snapshots, plus the explicit offline
-`viewer/launch.sh`. It records that a static open-vocabulary detector produces
-an evidence-backed catalog rather than a guaranteed exhaustive inventory.
+`qa_bundle` validates the final state, semantic/embedding coverage,
+final-acceptance artifacts and viewer bundle. It writes `qa/summary.json`,
+`qa/retention_funnel.json`, `visuals/index.json`, and the per-run viewer
+launcher. A static open-vocabulary detector produces an evidence-backed
+catalog, not guaranteed exhaustive semantic recall.
 
-Standard Docker workers receive only the configured GPU, immutable image IDs,
-resolved read-only model/cache mounts, and the immutable run. Mapping writes to
-a stage-owned attempt directory and promotes its state/masks only after the
-worker exits successfully, so retry never consumes partial mask output.
+## Semantic contract
 
-## Autonomous semantic contract
+The standard semantic stage is class- and scene-agnostic:
 
-The standard `semantics` stage is prompt-free with respect to scene contents:
-there is no object-ID table, scene vocabulary or hand-authored class override.
-It now performs, in order:
+1. every candidate gets mask-grounded multi-view review;
+2. unresolved or low-confidence candidates receive additional independent
+   adjudication;
+3. the standard reconciliation path keeps blind replacement disabled;
+4. a candidate-conditioned physical guard may veto an incompatible noun but
+   cannot propose a replacement;
+5. final consensus requires independent positive evidence and records
+   confirmed, probable or geometry-only status.
 
-1. FARM multi-view review on the saved object crop, with only non-target pixels
-   inside that crop dimmed by the stored segmentation mask;
-2. independent verification and open-vocabulary ensemble adjudication;
-3. a conflict-only blind pass over paired raw and mask-grounded crops;
-4. a class-agnostic consensus guard that accepts a replacement only when an
-   independent channel supports it, and prevents a last-resort generic form
-   from silently replacing a stronger FARM identity.
+A transport/model failure fails the stage. Unsupported semantic identity is
+retained as geometry-only instead of receiving a fabricated specific label.
 
-The semantic evidence is persisted under `qa/semantics/{review,ensemble,
-reconciliation,consensus}/`. Canonical processing consumes
-`consensus/semantic_consensus_catalog.json`; resume fingerprints include every
-semantic implementation module. A transport/model failure fails the stage and
-is never converted into an `unknown` label. A genuinely unsupported object may
-remain geometry-only in the audit layer rather than receiving a fabricated
-specific identity.
+## Advanced declarative plans
 
-## Advanced declarative plan
-
-Schema version 1 remains available for developers. It accepts an explicit
-pipeline stage DAG with command as an argv list, needs, inputs, outputs,
-pass_json, fingerprint_inputs, env, cwd and timeout.
+Schema version 1 remains available for explicit developer DAGs. A stage can
+declare `command` (argv), `needs`, `inputs`, `outputs`, `pass_json`,
+`fingerprint_inputs`, `env`, `cwd` and timeout.
 
 Secrets must use a dedicated environment mapping:
 
-    env:
-      HF_TOKEN: ${env:HF_TOKEN}
+```yaml
+env:
+  HF_TOKEN: ${env:HF_TOKEN}
+```
 
 Environment placeholders are forbidden in command arguments and paths so
-tokens cannot leak through process listings or persisted plans.
+tokens cannot leak through persisted plans or process listings.

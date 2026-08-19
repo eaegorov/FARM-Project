@@ -1,0 +1,7 @@
+# Minimal host-side control plane. All ML/GPU computation runs in pinned
+# containers; the host process parses the scene plan, manages Docker,
+# validates canonical visualization files, and provisions manifest-pinned
+# model artifacts.
+PyYAML==6.0.2
+huggingface_hub==1.26.0
+Pillow==11.0.0

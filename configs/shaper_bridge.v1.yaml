@@ -1,0 +1,111 @@
+schema_version: farm.shaper-bridge.config.v1
+seed: 20260819
+
+inputs:
+  require_release_lift: true
+  require_signed_farm_source: true
+
+views:
+  maximum_views: 32
+  minimum_valid_views: 4
+  minimum_distinct_timestamps: 3
+  minimum_visible_points: 16
+  minimum_baseline_m: 0.025
+  minimum_angular_span_degrees: 4.0
+  depth_absolute_tolerance_m: 0.045
+  depth_relative_tolerance: 0.015
+  radius_tolerance_multiplier: 2.5
+  maximum_projection_residual_px: 0.002
+
+shape:
+  minimum_verified_gaussians: 128
+  maximum_points: 4096
+  bounds_absolute_quantile: 0.995
+  bounds_padding: 1.08
+  minimum_bound_m: 0.015
+  maximum_transform_error_m: 0.00002
+  maximum_mesh_faces: 125000
+  minimum_mesh_vertices: 100
+  minimum_mesh_faces: 100
+  minimum_extent_ratio: 0.45
+  maximum_extent_ratio: 2.10
+  maximum_center_error_m: 0.12
+  maximum_center_error_diagonal_fraction: 0.35
+
+runtime:
+  image: shaper:cu128
+  image_id: sha256:9d68f89dbaaff71ca00c62f4b4e34ee9d1fa52090bdbf0cd9ff6c6d3b5467c15
+  build_recipe:
+    dockerfile: docker/Dockerfile.shaper
+    cuda_base_image: nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04
+    python_version: "3.10"
+    torch_cuda_arch_list: "9.0"
+    bit_reproducible: false
+  shaper_repository: https://github.com/facebookresearch/ShapeR.git
+  shaper_commit: d4402f55dc698104c69aaa7b5dc5e2c8e03bacd6
+  python: /opt/shaper-venv/bin/python
+  expected_inventory:
+    torch_cuda: "12.8"
+    packages:
+      torch: 2.7.1+cu128
+      torchvision: 0.22.1+cu128
+      torchaudio: 2.7.1+cu128
+      flash-attn: 2.8.3.post1
+      torchsparse: 1.4.0
+      transformers: 5.11.0
+      trimesh: 4.12.2
+  default_profile: balance
+  profiles:
+    speed:
+      views: 4
+      token_multiplier: 2
+      diffusion_steps: 10
+    balance:
+      views: 16
+      token_multiplier: 4
+      diffusion_steps: 25
+    quality:
+      views: 16
+      token_multiplier: 4
+      diffusion_steps: 50
+  checkpoints:
+    019-0-bfloat16.ckpt:
+      bytes: 2581709625
+      sha256: 61b42fbf57e0c5995597f34bba6500edaeea0319be9c9da479ae968855c83b03
+    vae-088-0-bfloat16.ckpt:
+      bytes: 383306451
+      sha256: fd55f48bf291e3f783ef1a17c96331ba5dc81f93422f4e98008c5315e05bb196
+    config.yaml:
+      bytes: 656
+      sha256: 430ebc813963e40eb75b8cb8d95c8a6529c06bd37cfc0a5449d520a20b026b34
+    vae-config.yaml:
+      bytes: 426
+      sha256: a482b0e127a543b7832c722e4486817e648aa373822ebe781a1bcca90768642d
+    dinov2_vitl14_reg4_pretrain.pth:
+      bytes: 1217607321
+      sha256: 36e4deffbaef061a2576705b0c36f93621e2ae20bf6274694821b0b492551b51
+  checkpoint_repository: facebook/ShapeR
+  checkpoint_revision: a7ffd10934ba5057c521208651c1a11446ad6f30
+  required_huggingface_models:
+    models--google--t5-v1_1-xl:
+      repository: google/t5-v1_1-xl
+      revision: e827710dfd12562d3ef5ea28853b2d0b31859bc6
+      files:
+        config.json: {blob: d6dd3022afa58ac49aebae60e01368633e8ee9fa, bytes: 591}
+        pytorch_model.bin: {blob: 72be4ab4cb05720c91e72995ad26fb5e2785fc1648c80ad0561c45ce432447fc, bytes: 11399285345}
+        special_tokens_map.json: {blob: 881bdbffc06e471924ecea57f962bc5f8e2a9f21, bytes: 1786}
+        spiece.model: {blob: 4e28ff6ebdf584f5372d9de68867399142435d9a, bytes: 791656}
+        tokenizer_config.json: {blob: b114c318caf72f6e89ea92e0755c41327a453198, bytes: 1857}
+    models--openai--clip-vit-large-patch14:
+      repository: openai/clip-vit-large-patch14
+      revision: 32bd64288804d66eefd0ccbe215aa642df71cc41
+      files:
+        config.json: {blob: 2c19f6666e0e163c7954df66cb901353fcad088e, bytes: 4519}
+        merges.txt: {blob: 76e821f1b6f0a9709293c3b6b51ed90980b3166b, bytes: 524619}
+        model.safetensors: {blob: a2bf730a0c7debf160f7a6b50b3aaf3703e7e88ac73de7a314903141db026dcb, bytes: 1710540580}
+        special_tokens_map.json: {blob: 9bfb42aa97dcd61e89f279ccaee988bccb4fabae, bytes: 389}
+        tokenizer.json: {blob: 580c79c6862f31d1f9bd08dd1a415ba0d0502cd9, bytes: 2224003}
+        tokenizer_config.json: {blob: 702bb12920b291cade3706cf215c1604d2255d93, bytes: 905}
+        vocab.json: {blob: 4297ea6a8d2bae1fea8f48b45e257814dcb11f69, bytes: 961143}
+  shm_size: 16g
+  tmpfs_size: 16g

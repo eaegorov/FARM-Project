@@ -124,6 +124,7 @@ class RuntimeSpec:
     image: str
     image_id: str
     user_uid: int | None = None
+    python: str | None = None
 
 
 @dataclass(frozen=True)
@@ -382,10 +383,25 @@ def load_model_manifest(path: Path | str) -> ModelManifest:
             raise ResourceConfigError(
                 f"runtimes.{runtime_name}.user_uid must be a positive non-root UID"
             )
+        python_raw = item.get("python")
+        python = None if python_raw is None else _string(
+            python_raw, f"runtimes.{runtime_name}.python"
+        )
+        if python is not None:
+            python_path = Path(python)
+            if (
+                not python_path.is_absolute()
+                or python_path.as_posix() != python
+                or any(part in {"", ".", ".."} for part in python_path.parts)
+            ):
+                raise ResourceConfigError(
+                    f"runtimes.{runtime_name}.python must be a normalized absolute path"
+                )
         runtimes[runtime_name] = RuntimeSpec(
             image=_string(item.get("image"), f"runtimes.{runtime_name}.image"),
             image_id=image_id,
             user_uid=user_uid,
+            python=python,
         )
     if not runtimes:
         raise ResourceConfigError("runtimes cannot be empty")
@@ -756,6 +772,8 @@ def run_resource_preflight(
             "image": runtime.image,
             "expected_image_id": runtime.image_id,
         }
+        if runtime.python is not None:
+            check.metrics["python"] = runtime.python
         if check_docker_images:
             try:
                 actual = resolver(runtime.image)

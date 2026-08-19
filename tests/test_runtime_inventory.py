@@ -54,8 +54,21 @@ def test_compare_inventory_is_fail_closed_for_missing_and_mismatch() -> None:
 
 
 def test_committed_runtime_profiles_are_exact_and_prep_closure_is_present() -> None:
+    control = parse_inventory(ROOT / "requirements/control-plane.lock.txt")
+    bridge_control = parse_inventory(ROOT / "requirements/bridge-control.lock.txt")
     prep = parse_inventory(ROOT / "requirements/prep-runtime.lock.txt")
     main = parse_inventory(ROOT / "requirements/main-runtime.observed.txt")
+    assert control == {
+        "huggingface-hub": "1.26.0",
+        "pillow": "11.0.0",
+        "pyyaml": "6.0.2",
+    }
+    assert bridge_control == {
+        "numpy": "1.26.0",
+        "opencv-python": "4.11.0.86",
+        "pyyaml": "6.0.2",
+        "scipy": "1.16.3",
+    }
     assert {
         "torch", "torchvision", "numpy", "pycolmap", "gsplat", "plyfile",
         "opencv-python", "pillow", "pyyaml", "scipy", "matplotlib",
@@ -77,6 +90,7 @@ def test_docker_contract_has_no_machine_specific_paths_or_viewer_port() -> None:
     dockerfile = (ROOT / "docker/Dockerfile.prep").read_text(encoding="utf-8")
     assert "requirements/prep-runtime.lock.txt" in dockerfile
     assert "farm_runtime_inventory.py validate" in dockerfile
+    assert "/opt/conda/envs/rest3d/bin/python" in dockerfile
 
 
 def test_canonical_name_matches_python_packaging_normalization() -> None:

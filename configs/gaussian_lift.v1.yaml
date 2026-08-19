@@ -1,0 +1,78 @@
+schema_version: farm.gaussian-lift.config.v1
+seed: 20260819
+
+split:
+  target_heldout_fraction: 0.25
+  minimum_heldout_fraction: 0.20
+  maximum_heldout_fraction: 0.35
+  temporal_bins: 4
+  require_early_late_heldout: true
+  strict_minimum_timestamps: 5
+  strict_minimum_build_timestamps: 3
+  strict_minimum_heldout_timestamps: 2
+  evidence_limited_minimum_timestamps: 3
+  solver_time_limit_seconds: 30.0
+  build_minimum_baseline_m: 0.04
+  build_minimum_angular_span_degrees: 6.0
+  heldout_minimum_baseline_m: 0.025
+  heldout_minimum_angular_span_degrees: 4.0
+
+render:
+  native_resolution_required: true
+  evidence_reference_long_side: 512
+  maximum_object_channels_per_call: 15
+  invariant_tolerance: 2.0e-5
+  alignment_guard_views: 3
+  alignment_guard_max_absolute_depth_error_m: 1.0e-5
+
+candidate:
+  obb_padding_m: 0.08
+  obb_padding_fraction: 0.12
+  minimum_opacity: 0.005
+  depth_absolute_tolerance_m: 0.04
+  depth_relative_tolerance: 0.015
+  radius_tolerance_multiplier: 2.5
+  maximum_radius_m: 0.30
+
+mask:
+  erosion_pixels: 2
+  negative_ring_pixels: 12
+  raw_interior_weight: 0.50
+  inlier_weight: 1.0
+  depth_discontinuity_m: 0.08
+  minimum_positive_pixels: 16
+
+build:
+  minimum_positive_weight: 0.012
+  minimum_negative_weight: 0.010
+  minimum_per_timestamp_purity: 0.55
+  minimum_global_purity: 0.58
+  minimum_gaussian_timestamps: 2
+  minimum_timestamp_margin: 1
+  score_log_weight: 0.08
+  minimum_winner_margin: 0.15
+  minimum_winner_ratio: 1.05
+  minimum_object_gaussians: 64
+  maximum_object_fraction: 0.05
+
+heldout:
+  alpha_threshold: 0.04
+  good_timestamp_iou: 0.40
+  minimum_good_timestamps: 2
+  minimum_median_iou: 0.50
+  minimum_q25_iou: 0.34
+  minimum_median_precision: 0.70
+  minimum_median_recall: 0.58
+  minimum_median_largest_component: 0.72
+  maximum_median_depth_error_m: 0.08
+  maximum_p90_depth_error_m: 0.20
+  minimum_depth_pixels: 32
+
+# Frozen after the 2026-08-19 Factory calibration: 28/40 strict objects passed
+# without changing any per-object build or held-out threshold. Knaack remains
+# a blind/no-retune validation scene; failures stay unknown rather than being
+# forced into the released instance bank.
+release:
+  calibrated: true
+  minimum_verified_objects: 1
+  minimum_verified_strict_fraction: 0.50

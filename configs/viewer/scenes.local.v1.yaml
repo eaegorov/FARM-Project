@@ -1,0 +1,45 @@
+schema_version: farm.unified-viewer-registry.v1
+
+# Paths are resolved relative to this registry.  Required FARM/source inputs
+# fail closed.  Bridge/ShapeR/dense-lift outputs are optional and appear with
+# an explicit unavailable reason until a derivative matches the exact current
+# FARM success marker and source PLY fingerprint.
+scenes:
+  - scene_id: factory
+    label: Factory
+    farm_run: ../../../output/farm_pipeline/factory/latest
+    source_ply: ../../../data/factory_scene_last.ply
+    source_fingerprint:
+      algorithm: sha256-sampled-v1
+      digest: 6d05168cfdf9289f0f1dd12ec7d3812eb27885a608c8de1e290b9377331d5516
+      size_bytes: 1411594650
+      chunk_bytes: 1048576
+      sampled_offsets: [0, 705273037, 1410546074]
+    bridge_roots:
+      - ../../../output/farm_shaper_bridge/factory
+      - ../../../output/farm_shaper_bridge/factory-generic-v7-v1
+    dense_lift_roots:
+      - ../../../output/farm_gaussian_lift/factory
+    shaper_roots:
+      - ../../../output/farm_shaper_bridge/factory
+      - ../../../output/farm_shaper_bridge/factory-generic-v7-exact-calibration-v2
+      - ../../../output/farm_shaper_bridge/factory-generic-v7-v1
+
+  - scene_id: knaack
+    label: Knaack
+    legacy_review_mode: true
+    farm_run: ../../../output/farm_pipeline/knaack/latest
+    source_ply: ../../../gcloud_splatica/pipeline-9389769e-9863-4c72-bb87-02d1ad9b3cdd/uuid500/gaussian_result/point_cloud_last.ply
+    source_fingerprint:
+      algorithm: sha256-sampled-v1
+      digest: 4b6192a46be2d6dafd197ba816f7cc6e86feb59efa998b2c3022c37ac2b00385
+      size_bytes: 2089536274
+      chunk_bytes: 1048576
+      sampled_offsets: [0, 1044243849, 2088487698]
+    bridge_roots:
+      - ../../../output/farm_shaper_bridge/knaack
+    dense_lift_roots:
+      - ../../../output/farm_gaussian_lift/knaack
+    shaper_roots:
+      - ../../../output/farm_shaper_bridge/knaack
+      - ../../../output/farm_shaper_bridge/knaack-generic-v5-exact-calibration-v1

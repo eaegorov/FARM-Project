@@ -83,6 +83,7 @@ def test_source_snapshot_is_exact_hashed_allowlisted_and_secret_free(
         "scripts/__pycache__",
         "src/cache",
         "tests/output",
+        "tools",
         "models",
         "third_party",
         "third_party/yoloe/ultralytics",
@@ -100,6 +101,7 @@ def test_source_snapshot_is_exact_hashed_allowlisted_and_secret_free(
     (tmp_path / "scripts/__pycache__/tool.pyc").write_bytes(b"pyc")
     (tmp_path / "src/cache/generated.py").write_text("generated\n", encoding="utf-8")
     (tmp_path / "tests/output/result.txt").write_text("generated\n", encoding="utf-8")
+    (tmp_path / "tools/bridge.py").write_text("# versioned post-processing tool\n", encoding="utf-8")
     (tmp_path / "models/weights.bin").write_bytes(b"weights")
     (tmp_path / "third_party/vendor.py").write_text("vendor\n", encoding="utf-8")
     (tmp_path / "third_party/yoloe/ultralytics/__init__.py").write_text(
@@ -129,6 +131,10 @@ def test_source_snapshot_is_exact_hashed_allowlisted_and_secret_free(
         (run_dir / "config/source_snapshot/manifest.json").read_text()
     )
     run_manifest = json.loads((run_dir / "manifest.json").read_text())
+    assert run_manifest["control_plane"] == {
+        "python_executable": sys.executable,
+        "pyyaml": yaml.__version__,
+    }
     copied = snapshot_root / "scripts/tool.py"
     assert copied.read_text(encoding="utf-8") == "print('dirty working tree v1')\n"
     assert stat.S_IMODE(copied.stat().st_mode) == 0o755
@@ -157,6 +163,7 @@ def test_source_snapshot_is_exact_hashed_allowlisted_and_secret_free(
         "file_count": len(snapshot_manifest["files"]),
     }
     assert (snapshot_root / "configs/models/runtime.json").is_file()
+    assert (snapshot_root / "tools/bridge.py").is_file()
     assert (snapshot_root / "third_party/yoloe/ultralytics/__init__.py").is_file()
     assert (
         snapshot_root
@@ -360,7 +367,7 @@ def test_viewer_runtime_is_persisted_in_bundle(tmp_path: Path) -> None:
     config_path = _advanced_config(
         tmp_path,
         [{"id": "noop", "command": [sys.executable, "-c", "pass"]}],
-        {},
+        {"payload": "${run_dir}/final/payload.bin"},
     )
     config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     config["viewer"] = {
@@ -378,9 +385,18 @@ def test_viewer_runtime_is_persisted_in_bundle(tmp_path: Path) -> None:
     runner = RunOrchestrator(load_plan(config_path))
     run_dir = runner.runs_root / "viewer-runtime"
     (run_dir / "viewer").mkdir(parents=True)
+    payload = run_dir / "final/payload.bin"
+    payload.parent.mkdir(parents=True)
+    payload.write_bytes(b"immutable viewer payload")
     runner._write_viewer_bundle(run_dir)
     bundle = json.loads((run_dir / "viewer/bundle.json").read_text(encoding="utf-8"))
     assert bundle["process"]["runtime"] == "docker"
+    assert bundle["artifact_integrity"]["payload"] == {
+        "kind": "file",
+        "path": "../final/payload.bin",
+        "bytes": len(b"immutable viewer payload"),
+        "sha256": hashlib.sha256(b"immutable viewer payload").hexdigest(),
+    }
 
 
 def _helper(path: Path) -> None:
@@ -737,6 +753,9 @@ def test_scene_contract_compiles_full_standard_dag(tmp_path: Path) -> None:
     assert plan.artifacts["resolved_context"] == "${run_dir}/input/resolved_context.json"
     assert plan.artifacts["mapping"] == "${run_dir}/mapping"
     assert plan.artifacts["qa_summary"] == "${run_dir}/qa/summary.json"
+    assert plan.artifacts["scene_preflight"] == "${run_dir}/input/scene_preflight.json"
+    assert plan.artifacts["resource_preflight"] == "${run_dir}/input/resource_preflight.json"
+    assert plan.artifacts["final_acceptance"] == "${run_dir}/qa/acceptance/result.json"
     assert plan.viewer is not None
     assert plan.viewer.runtime == "docker"
     assert "${host}" in plan.viewer.command

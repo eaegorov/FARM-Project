@@ -1,11 +1,15 @@
 # FARM resource and model reproducibility
 
 FARM separates scene validation from GPU/runtime validation. Run both before a
-new scene is processed:
+new scene is processed. Use the pinned control-plane venv from
+[PRODUCTION_PIPELINE.md](PRODUCTION_PIPELINE.md):
 
 ```bash
-python3 scripts/farm_preflight.py --config configs/scenes/my_scene.yaml --strict
-python3 scripts/farm_resource_preflight.py \
+export FARM_PY="$PWD/.venv-control/bin/python"
+
+"$FARM_PY" scripts/farm_preflight.py \
+  --config configs/scenes/my_scene.yaml --strict
+"$FARM_PY" scripts/farm_resource_preflight.py \
   --gpu 0 \
   --secrets-file ../secrets.json \
   --all-models \
@@ -31,10 +35,21 @@ paths are resolved against the manifest, not the caller's working directory.
 - `--all-models` includes pipeline weights and both runtime images. A stage
   launcher checks only the selected vLLM model and its required runtime.
 
-After intentionally replacing a model or rebuilding an image, update the
-manifest revision/checksum/image ID in the same reviewed change. Do not make a
-floating branch, `latest` tag alone, or a cache `refs/main` file the production
-identity.
+Provision or audit the complete manifest through
+`FARM_MODEL_PYTHON="$FARM_PY" ./bootstrap_models.sh --local-files-only`; do
+not copy ad-hoc Hugging Face commands into a production procedure. After
+rebuilding an image, inspect every configured tag and atomically update only
+its ID:
+
+```bash
+"$FARM_PY" scripts/pin_farm_runtime_images.py
+"$FARM_PY" scripts/pin_farm_runtime_images.py --write
+git diff -- configs/models/farm_models.v1.json
+```
+
+Review and commit any intentional model revision/checksum or runtime image-ID
+change before a new cold run. A floating branch, `latest` tag alone, cache
+`refs/main` file or uncommitted local ID is not a production identity.
 
 ## Sequential vLLM lifecycle
 
@@ -102,9 +117,14 @@ visible through the free-VRAM gate and are never terminated automatically.
 
 ## Runtime inventory
 
-- `requirements/prep-runtime.lock.txt` is the reproducible preparation stack
-  verified in the pinned prep image (Torch 2.5.1+cu121, pycolmap 3.11.1,
-  gsplat 1.5.3, NumPy 1.26.0).
+- `requirements/control-plane.lock.txt` is the minimal FARM/model-bootstrap
+  host inventory, including Pillow for host-side canonical-image validation.
+- `requirements/bridge-control.lock.txt` is the optional exact direct-package
+  NumPy/OpenCV/SciPy launcher inventory for current ShapeR host validators. It
+  requires Python 3.11+ and is not the inference runtime.
+- `requirements/prep-runtime.lock.txt` is the version-pinned direct
+  preparation inventory verified in the pinned prep image (Torch
+  2.5.1+cu121, pycolmap 3.11.1, gsplat 1.5.3, NumPy 1.26.0).
 - `requirements/main-runtime.observed.txt` records imports verified in the
   pinned main image. It is an audit inventory, not a promise that its CUDA
   wheels can be recreated on every host with a plain `pip install`.

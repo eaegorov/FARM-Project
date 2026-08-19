@@ -63,7 +63,11 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, Path]:
         "schema_version": "farm.models.v1",
         "cache_root": "../cache",
         "runtimes": {
-            "main": {"image": "synthetic:latest", "image_id": IMAGE_ID},
+            "main": {
+                "image": "synthetic:latest",
+                "image_id": IMAGE_ID,
+                "python": "/opt/synthetic/bin/python",
+            },
         },
         "services": {
             "caption": {
@@ -155,9 +159,24 @@ def test_manifest_paths_snapshot_revision_and_content_hash_pass(tmp_path: Path) 
     assert service.model.local_path == (
         tmp_path / "cache/hub/models--Example--Caption/snapshots" / REVISION
     ).resolve()
+    assert manifest.runtimes["main"].python == "/opt/synthetic/bin/python"
     report = _run(tmp_path / "run")
     assert report.status == "pass", report.to_dict()
     assert report.services["caption"]["container_model_path"].endswith(REVISION)
+    runtime = next(check for check in report.checks if check.name == "runtime:main")
+    assert runtime.metrics["python"] == "/opt/synthetic/bin/python"
+
+
+@pytest.mark.parametrize("value", ["bin/python", "/opt/../bin/python", "/opt//bin/python"])
+def test_runtime_python_must_be_a_normalized_absolute_path(
+    tmp_path: Path, value: str
+) -> None:
+    manifest_path, _local_model, _secret = _fixture(tmp_path)
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    payload["runtimes"]["main"]["python"] = value
+    manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="normalized absolute path"):
+        load_model_manifest(manifest_path)
 
 
 def test_secret_value_is_never_serialized(tmp_path: Path) -> None:

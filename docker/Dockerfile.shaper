@@ -1,0 +1,131 @@
+# syntax=docker/dockerfile:1.7
+#
+# Runtime-only ShapeR environment for the FARM bridge.  ShapeR source and
+# checkpoints are intentionally not copied into this image: run_shaper.py
+# mounts a clean `git archive` of the pinned upstream commit and the exact
+# checkpoint directory read-only at execution time.
+#
+# This recipe is functionally reproducible, not bit-reproducible.  The Ubuntu
+# apt repositories and several Python transitive wheels are external mutable
+# indexes.  Every built image must therefore be inspected and its immutable
+# OCI image ID recorded in configs/shaper_bridge.v1.yaml with the explicit
+# repin workflow before it can produce release output.
+
+ARG CUDA_BASE_IMAGE=nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04
+FROM ${CUDA_BASE_IMAGE}
+
+ARG DEBIAN_FRONTEND=noninteractive
+ARG PYTHON_VERSION=3.10
+# Hopper default used by the audited local image.  Override at build time for
+# the deployment GPU(s), e.g. "8.6" or "8.9;9.0".
+ARG TORCH_CUDA_ARCH_LIST=9.0
+ARG TORCHSPARSE_COMMIT=20ccc92a3adceef1d88f63227b8e1d01b9c7ebcc
+
+LABEL org.splatica.farm.component="shaper-runtime" \
+      org.splatica.farm.recipe-version="1" \
+      org.splatica.farm.shaper-upstream="https://github.com/facebookresearch/ShapeR"
+
+ENV PYTHONUNBUFFERED=1 \
+    VIRTUAL_ENV=/opt/shaper-venv \
+    CUDA_HOME=/usr/local/cuda \
+    CUDA_INCLUDE=/usr/local/cuda/include \
+    CUDA_LIB=/usr/local/cuda/lib64 \
+    SPHASH_INCLUDE=/usr/include \
+    FORCE_CUDA=1 \
+    TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST} \
+    CPATH=/usr/local/cuda/include \
+    LIBRARY_PATH=/usr/local/cuda/lib64 \
+    LD_LIBRARY_PATH=/usr/local/cuda/lib64
+
+ENV PATH="${VIRTUAL_ENV}/bin:${PATH}"
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates \
+      curl \
+      ffmpeg \
+      git \
+      build-essential \
+      gcc-11 \
+      g++-11 \
+      ninja-build \
+      libsparsehash-dev \
+      libegl1 \
+      libgl1 \
+      libglib2.0-0 \
+      libosmesa6 \
+      libxext6 \
+      libxrender1 \
+      python${PYTHON_VERSION} \
+      python${PYTHON_VERSION}-dev \
+      python${PYTHON_VERSION}-venv \
+    && update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-11 100 \
+    && update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-11 100 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN python${PYTHON_VERSION} -m venv "${VIRTUAL_ENV}" \
+    && python -m pip install --no-cache-dir \
+      pip==26.1.2 wheel==0.47.0 setuptools==74.1.3 ninja==1.13.0
+
+# Versions below are the audited inventory of image
+# sha256:9d68f89dbaaff71ca00c62f4b4e34ee9d1fa52090bdbf0cd9ff6c6d3b5467c15.
+# Exact top-level pins reduce drift; the immutable post-build image ID remains
+# the release authority because transitive wheels and apt packages are not
+# supplied from a content-addressed internal mirror.
+RUN python -m pip install --no-cache-dir \
+      numpy==2.2.6 \
+      tqdm==4.68.2 \
+      hydra-core==1.3.3 \
+      matplotlib==3.10.9 \
+      opencv-python==4.13.0.92 \
+      imageio==2.37.3 \
+      easydict==1.13 \
+      munch==4.0.0 \
+      plyfile==1.1.4 \
+      huggingface_hub==1.18.0
+
+RUN python -m pip install --no-cache-dir \
+      torch==2.7.1 \
+      torchvision==0.22.1 \
+      torchaudio==2.7.1 \
+      --index-url https://download.pytorch.org/whl/cu128
+
+RUN python -m pip install --no-cache-dir \
+      transformers==5.11.0 \
+      trimesh==4.12.2 \
+      scikit-image==0.25.2 \
+      diffusers==0.38.0 \
+      gradio==6.17.3 \
+      peft==0.19.1 \
+      einops==0.8.2 \
+      "imageio[ffmpeg]==2.37.3" \
+      "imageio[pyav]==2.37.3" \
+      pymeshlab==2025.7.post1 \
+      sophuspy==1.2.0 \
+      fast_simplification==0.1.13 \
+      scikit-learn==1.7.2 \
+      timm==1.0.27 \
+      plotly==6.8.0 \
+      torchdiffeq==0.2.5 \
+      sentencepiece==0.2.1 \
+      protobuf==7.35.0 \
+      pyrender==0.1.45 \
+      jupyter==1.1.1 \
+      pycolmap==4.0.4 \
+      fpsample==1.0.2
+
+RUN python -m pip install --no-cache-dir \
+      flash-attn==2.8.3.post1 --no-build-isolation
+
+RUN python -m pip install --no-cache-dir \
+      torch-cluster==1.6.3 \
+      -f https://data.pyg.org/whl/torch-2.7.1+cu128.html
+
+RUN python -m pip install --no-cache-dir --no-build-isolation \
+      "git+https://github.com/nihalsid/torchsparse@${TORCHSPARSE_COMMIT}"
+
+# Build-time, CPU-only import smoke.  GPU/device compatibility is checked by
+# the explicit runtime validation command on the deployment machine.
+RUN python -c "import flash_attn, torch, torchsparse, transformers, trimesh; assert torch.__version__.startswith('2.7.1'); assert torch.version.cuda == '12.8'; print('ShapeR runtime import smoke: PASS')"
+
+WORKDIR /opt/shaper
+CMD ["/bin/bash"]

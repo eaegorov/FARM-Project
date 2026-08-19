@@ -219,6 +219,23 @@ def test_large_file_fingerprint_is_explicitly_sampled(tmp_path: Path) -> None:
     assert first["sampled_offsets"] == [0, 30, 60]
 
 
+def test_release_critical_gaussian_ply_fingerprint_is_always_full(tmp_path: Path) -> None:
+    config_path = _fixture(tmp_path)
+    raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    raw["preflight"]["full_hash_max_bytes"] = 1
+    raw["preflight"]["hash_chunk_bytes"] = 7
+    config_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    config = load_scene_config(config_path)
+    report = run_preflight(config)
+    fingerprints = _check(report, "fingerprints").metrics["files"]
+    by_path = {row["path"]: row for row in fingerprints}
+    ply = by_path[str(config.inputs.gaussian_ply)]
+    assert ply["algorithm"] == "sha256"
+    assert ply["sampled_offsets"] == []
+    generic = fingerprint_file(config.config_path, full_hash_max_bytes=1, chunk_bytes=7)
+    assert generic["algorithm"] == "sha256-sampled-v1"
+
+
 def test_json_schema_and_example_are_valid_json_yaml() -> None:
     root = Path(__file__).resolve().parents[1]
     schema = json.loads((root / "configs/schema/farm_scene.schema.json").read_text())

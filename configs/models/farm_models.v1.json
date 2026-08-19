@@ -9,7 +9,8 @@
     },
     "prep": {
       "image": "rest3d:factory-baseline",
-      "image_id": "sha256:94ab3ea00d91f439b7d1e77a2177ef74ceab5cbd1a886fb1050b3aec557de0e0"
+      "image_id": "sha256:94ab3ea00d91f439b7d1e77a2177ef74ceab5cbd1a886fb1050b3aec557de0e0",
+      "python": "/opt/conda/envs/rest3d/bin/python"
     }
   },
   "services": {
@@ -144,27 +145,63 @@
     "yoloe-v8l-seg": {
       "kind": "local_file",
       "path": "../../models/yoloe/yoloe-v8l-seg.pt",
-      "sha256": "14e9c146f7f7efa0bfea8c5f82952c9f95fb1f9c3bf0f18b3727b76624f9d746"
+      "sha256": "14e9c146f7f7efa0bfea8c5f82952c9f95fb1f9c3bf0f18b3727b76624f9d746",
+      "source": {
+        "kind": "url",
+        "url": "https://huggingface.co/jameslahm/yoloe/resolve/main/yoloe-v8l-seg.pt"
+      }
     },
     "yoloe-v8l-seg-pf": {
       "kind": "local_file",
       "path": "../../models/yoloe/yoloe-v8l-seg-pf.pt",
-      "sha256": "a247e963341bafca421deae39a82f0a6627c3c7fac4564473b4e0149f65b2fd8"
+      "sha256": "a247e963341bafca421deae39a82f0a6627c3c7fac4564473b4e0149f65b2fd8",
+      "source": {
+        "kind": "url",
+        "url": "https://huggingface.co/jameslahm/yoloe/resolve/main/yoloe-v8l-seg-pf.pt"
+      }
     },
     "dinov3-vits16plus": {
       "kind": "local_file",
       "path": "../../models/dinov3-vits16plus/model.safetensors",
-      "sha256": "208146e499dace99e4c9376ddb8a26f77d64c31c46c4dc4b86ff8bc63b0235e2"
+      "sha256": "208146e499dace99e4c9376ddb8a26f77d64c31c46c4dc4b86ff8bc63b0235e2",
+      "source": {
+        "kind": "huggingface_snapshot",
+        "repo_id": "facebook/dinov3-vits16plus-pretrain-lvd1689m",
+        "revision": "c93d816fc9e567563bc068f01475bec89cc634a6",
+        "required_files": [
+          "config.json",
+          "model.safetensors",
+          "preprocessor_config.json"
+        ]
+      }
     },
     "siglip2-large-patch16-256": {
       "kind": "local_file",
       "path": "../../models/siglip2-large-patch16-256/model.safetensors",
-      "sha256": "fa34f822f016dbb167d8d0e3a8af99b5e199aa28573360d4295252b9ec418e2a"
+      "sha256": "fa34f822f016dbb167d8d0e3a8af99b5e199aa28573360d4295252b9ec418e2a",
+      "source": {
+        "kind": "huggingface_snapshot",
+        "repo_id": "google/siglip2-large-patch16-256",
+        "revision": "787800c8990e6f058423089178e718139608408c",
+        "required_files": [
+          "config.json",
+          "model.safetensors",
+          "preprocessor_config.json",
+          "special_tokens_map.json",
+          "tokenizer.json",
+          "tokenizer.model",
+          "tokenizer_config.json"
+        ]
+      }
     },
     "mobileclip": {
       "kind": "local_file",
       "path": "../../models/mobileclip/mobileclip_blt.pt",
-      "sha256": "670844f7a886dd6eff7a9285adfc53f3d3c889c03bfc8354010cb5c6bf27441a"
+      "sha256": "670844f7a886dd6eff7a9285adfc53f3d3c889c03bfc8354010cb5c6bf27441a",
+      "source": {
+        "kind": "url",
+        "url": "https://docs-assets.developer.apple.com/ml-research/datasets/mobileclip/mobileclip_blt.pt"
+      }
     }
   }
 }

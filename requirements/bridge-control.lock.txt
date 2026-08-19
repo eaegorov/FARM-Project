@@ -1,0 +1,8 @@
+# Optional host-side ShapeR metadata/runtime launcher inventory. ShapeR
+# inference and prepare/assemble computation remain inside pinned Docker
+# images; these packages satisfy the current host validators imported by
+# manage_runtime.py and run_shaper.py. SciPy 1.16.3 requires Python 3.11+.
+PyYAML==6.0.2
+numpy==1.26.0
+opencv-python==4.11.0.86
+scipy==1.16.3
