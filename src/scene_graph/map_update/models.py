@@ -58,6 +58,7 @@ class SceneState(TypedDict, total=False):
     object_image_ids: List[List[int]]
     viewpoint_image_ids: List[List[int]]
     object_mask_observations: List[List[Dict[str, Any]]]
+    object_pair_mask_overlap_evidence: Dict[str, Any]
     images: List[Any]
     image_positions: List[torch.Tensor]
 
@@ -154,6 +155,11 @@ def initialize_scene_graph_state(
         "object_image_ids": [],
         "viewpoint_image_ids": [],
         "object_mask_observations": [],
+        "object_pair_mask_overlap_evidence": {
+            "schema": "farm.object-pair-mask-overlap.v1",
+            "max_images_per_pair": 16,
+            "pairs": {},
+        },
         "view_means": [],
         "view_cov6": [],
         "images": [],

@@ -91,6 +91,9 @@ def declare_mapper_parameters(node: Node) -> None:
     node.declare_parameter("filter_uninformative_yoloe_labels_enabled", True)
     node.declare_parameter("filter_detections_duplicates_iou_enabled", True)
     node.declare_parameter("filter_duplicates_iou_min", 0.9)
+    # Keep containment suppression opt-in. Nested part/whole detections are
+    # retained for the category-agnostic post-mapping assembly stage.
+    node.declare_parameter("filter_duplicates_containment_min", 1.0)
     node.declare_parameter("correspondence_feature_sim_thresh", 0.5)
     node.declare_parameter("correspondence_hellinger_thresh", 0.8)
     # Deployable merge policy updated on 2026-05-13:

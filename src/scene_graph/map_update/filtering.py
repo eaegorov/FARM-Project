@@ -206,11 +206,19 @@ def filter_duplicate_masks_iou(
     masks: torch.Tensor,
     min_iou: float,
     *,
+    min_containment: float = 1.0,
     max_chunk_bytes: int = 128 * 1024 * 1024,
 ) -> torch.Tensor:
-    """Return a keep mask by suppressing masks with IoU > min_iou.
+    """Suppress duplicate and nearly-contained masks from one image.
 
-    This uses chunked comparisons to avoid large temporary allocations.
+    IoU alone misses part/whole duplicates: a smaller mask can be almost
+    entirely contained in a larger mask while their union makes IoU look only
+    moderate.  ``min_containment`` therefore gates ``intersection / min(area)``.
+    When containment filtering is enabled, masks are considered largest-first
+    so the more complete observation wins independent of detector ordering.
+
+    Set ``min_containment=1.0`` to retain the legacy IoU-only behaviour.  The
+    comparisons remain chunked to avoid large temporary allocations.
     """
     if masks is None or not isinstance(masks, torch.Tensor) or masks.numel() == 0:
         return torch.empty((0,), dtype=torch.bool, device="cpu")
@@ -229,10 +237,18 @@ def filter_duplicate_masks_iou(
         keep = torch.zeros(num_masks, dtype=torch.bool, device=device)
         kept_indices: list[int] = []
 
+        if float(min_containment) < 1.0:
+            try:
+                processing_order = torch.argsort(areas, descending=True, stable=True).tolist()
+            except TypeError:  # pragma: no cover - compatibility with older torch
+                processing_order = torch.argsort(areas, descending=True).tolist()
+        else:
+            processing_order = list(range(num_masks))
+
         bytes_per_mask = max(1, height * width)
         chunk_size = max(1, int(max_chunk_bytes // bytes_per_mask))
 
-        for i in range(num_masks):
+        for i in processing_order:
             if not kept_indices:
                 keep[i] = True
                 kept_indices.append(i)
@@ -248,7 +264,13 @@ def filter_duplicate_masks_iou(
                 inter = (chunk_masks & m_i).sum(dim=(1, 2)).float()
                 union = area_i + areas[idx_chunk] - inter
                 iou = torch.where(union > 0, inter / union, torch.zeros_like(union))
-                if torch.any(iou > min_iou):
+                smaller_area = torch.minimum(area_i.expand_as(inter), areas[idx_chunk])
+                containment = torch.where(
+                    smaller_area > 0,
+                    inter / smaller_area,
+                    torch.zeros_like(inter),
+                )
+                if torch.any((iou > float(min_iou)) | (containment > float(min_containment))):
                     is_duplicate = True
                     break
 
@@ -263,6 +285,7 @@ def filter_duplicate_masks_iou(
             return filter_duplicate_masks_iou(
                 masks.detach().to("cpu"),
                 min_iou,
+                min_containment=min_containment,
                 max_chunk_bytes=max_chunk_bytes,
             )
         raise
@@ -354,21 +377,29 @@ def filter_uninformative_yoloe_labels(
     return seg_outputs
 
 
-def filter_detections_duplicates_iou(seg_outputs: dict, min_iou: float) -> dict:
+def filter_detections_duplicates_iou(
+    seg_outputs: dict,
+    min_iou: float,
+    min_containment: float = 1.0,
+) -> dict:
     masks = seg_outputs.get("masks")
     batch_ids = seg_outputs.get("batch_ids")
     if masks is None or len(masks) == 0 or batch_ids is None:
         return seg_outputs
 
     unique_batch_ids = torch.unique(batch_ids)
-    all_keep_masks = []
+    all_keep_masks = torch.ones(len(masks), dtype=torch.bool, device=batch_ids.device)
     for unique_batch_id in unique_batch_ids:
-        masks_for_batch_id = [mask for mask, batch_id in zip(masks, batch_ids) if batch_id == unique_batch_id]
+        batch_indices = torch.nonzero(batch_ids == unique_batch_id, as_tuple=False).flatten()
+        masks_for_batch_id = [masks[int(idx)] for idx in batch_indices.tolist()]
         masks_for_batch_id = torch.stack(masks_for_batch_id, dim=0)
-        keep_mask = filter_duplicate_masks_iou(masks_for_batch_id, min_iou=min_iou)
-        all_keep_masks.append(keep_mask)
+        keep_mask = filter_duplicate_masks_iou(
+            masks_for_batch_id,
+            min_iou=min_iou,
+            min_containment=min_containment,
+        )
+        all_keep_masks[batch_indices] = keep_mask.to(all_keep_masks.device)
 
-    all_keep_masks = torch.hstack(all_keep_masks)
     if all_keep_masks.numel() and not bool(torch.all(all_keep_masks)):
         return mask_seg_outputs(seg_outputs, all_keep_masks)
     return seg_outputs

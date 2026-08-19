@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -e -o pipefail
 
+# Keep bind-mounted run artifacts writable by the host GID while preserving a
+# non-root image UID.  The orchestrator supplies the host GID explicitly.
+umask 0002
+
 # Source ROS 2
 [ -f /opt/ros/humble/setup.bash ] && source /opt/ros/humble/setup.bash
 
@@ -34,8 +38,33 @@ else
     echo "[entrypoint] WARNING: $COLCON_OUT/install/setup.bash not found — ROS2 messages will be unavailable."
 fi
 
+normalize_run_permissions() {
+    local requested_run_dir="${FARM_RUN_DIR:-/run}"
+    [ -d "$requested_run_dir" ] || return 0
+    local run_dir
+    run_dir="$(cd -- "$requested_run_dir" 2>/dev/null && pwd -P)" || return 0
+    # FARM_RUN_DIR must identify one run, never the filesystem root.  Resolve
+    # it first so whitespace, trailing slashes, and symlinked mount paths do
+    # not weaken the exact source-snapshot exclusion below.
+    [ -n "$run_dir" ] && [ "$run_dir" != "/" ] || return 0
+    local source_snapshot_dir="$run_dir/config/source_snapshot"
+    local uid
+    uid="$(id -u)"
+    find "$run_dir" -xdev \
+        \( -path "$source_snapshot_dir" -o -path "$source_snapshot_dir/*" \) -prune -o \
+        -uid "$uid" -type d -exec chmod g+rwx {} + 2>/dev/null || true
+    find "$run_dir" -xdev \
+        \( -path "$source_snapshot_dir" -o -path "$source_snapshot_dir/*" \) -prune -o \
+        -uid "$uid" -type f -exec chmod g+rw {} + 2>/dev/null || true
+}
+
 if [ "$#" -eq 0 ]; then
     exec bash
 else
-    exec "$@"
+    set +e
+    "$@"
+    status=$?
+    set -e
+    normalize_run_permissions
+    exit "$status"
 fi

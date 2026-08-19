@@ -234,6 +234,7 @@ class PipelineOrchestrator:
             seg_outputs = filter_detections_duplicates_iou(
                 seg_outputs,
                 min_iou=cfg.duplicates_iou_min,
+                min_containment=cfg.duplicates_containment_min,
             )
         return seg_outputs
 

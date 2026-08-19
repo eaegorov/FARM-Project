@@ -1,0 +1,9 @@
+schema_version: farm.scene.v1
+scene_id: example_scene
+
+inputs:
+  colmap_model: /data/example/sparse/0
+  image_root: /data/example/images
+  gaussian_ply: /data/example/scene.ply
+
+output_root: /output/farm

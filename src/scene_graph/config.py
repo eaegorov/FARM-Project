@@ -153,6 +153,13 @@ class FilteringConfig:
     uninformative_yoloe_labels_enabled: bool = True
     duplicates_iou_enabled: bool = True
     duplicates_iou_min: float = 0.9
+    # Suppress near-nested part/whole masks that IoU alone misses.  A strict
+    # 0.98 threshold removes only masks whose smaller support is almost fully
+    # covered by another detection; the larger, more complete mask is kept.
+    # Disabled by default: destructive part/whole suppression reduced robust
+    # assembly recall in the factory ablation. Use the post-mapping hierarchy
+    # for contained tracks instead; values below 1.0 remain opt-in for tests.
+    duplicates_containment_min: float = 1.0
 
 
 # ---------------------------------------------------------------------------

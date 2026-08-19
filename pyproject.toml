@@ -40,6 +40,10 @@ Repository = "https://github.com/GoldenGait/FARM-Project"
 Paper = "https://arxiv.org/abs/2606.15476"
 Dataset = "https://huggingface.co/datasets/GoldenGait/FARM-Scenes"
 
+[project.scripts]
+farm = "farm_runtime.cli:main"
+farm-pipeline = "farm_runtime.cli:main"
+
 [project.optional-dependencies]
 vllm = [
     "vllm>=0.20.0",

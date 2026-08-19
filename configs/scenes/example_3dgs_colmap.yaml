@@ -1,0 +1,79 @@
+schema_version: farm.scene.v1
+scene_id: example_scene
+
+# Every relative path is resolved from this YAML file, not from the shell cwd.
+inputs:
+  colmap_model: ../../../data/example_scene/sparse/0
+  image_root: ../../../data/example_scene/images
+  gaussian_ply: ../../../data/example_scene/scene.ply
+output_root: ../../../output
+
+camera:
+  accepted_models: [PINHOLE, SIMPLE_PINHOLE]
+  require_virtual_pinhole: true
+
+# For a rig, make grouping explicit. For a monocular ordered COLMAP use
+# mode: single. Named groups may be changed below without changing code.
+camera_grouping:
+  mode: regex
+  pattern: '(?:^|/)(?P<camera>cam[0-9]+)_(?P<timestamp>[0-9]+)_(?P<view>center)[.](?:png|jpg|jpeg)$'
+  timestamp_group: timestamp
+  member_group: camera
+  view_group: view
+  required_members: [cam00, cam01]
+  required_views: [center]
+
+selection:
+  target_timestamps: 160
+  max_timestamps: 180
+  rotation_weight_m_per_rad: 0.5
+  max_motion_gap: 1.35
+  min_shared_tracks: 20
+  min_overlap_ratio: 0.015
+  output_views: [center]
+
+resources:
+  profile: auto
+  gpu: "0"
+  # model_manifest: ../models/farm_models.v1.json
+  # secrets_file: ../../../secrets.json
+  render_resolution: 896
+  depth_batch_size: 1
+  mapping_batch_size: 5
+
+models:
+  segmentation: yoloe-v8l
+  visual_features: dinov3-vits16plus
+  caption: Qwen/Qwen3-VL-8B-Instruct
+  offline: true
+
+# Replace the example baseline with the measured physical calibration for the
+# target rig. Do not copy a baseline from another scene.
+metric_scale:
+  required: true
+  source: rig_baseline
+  expected_baseline_m: 0.10
+  baseline_tolerance_m: 0.005
+  baseline_members: [cam00, cam01]
+  baseline_view: center
+
+gravity:
+  required: true
+  mode: auto
+  min_camera_consensus: 0.75
+
+viewer:
+  host: 127.0.0.1
+  port: 8080
+  scene_point_size_m: 0.004
+  max_context_points: 1500000
+
+preflight:
+  image_check: all
+  require_3dgs_schema: true
+  min_registered_images: 2
+  min_sparse_points: 10
+  min_gaussians: 10
+  alignment:
+    sample_points: 65536
+    nearest_neighbor_points: 4096

@@ -1,0 +1,40 @@
+# Script inventory
+
+The supported production entry point is `farm` / `scripts/farm_pipeline.py`.
+Canonical `farm.scene.v1` stages are declared in
+`src/farm_runtime/standard.py`; their implementation programs remain in
+`scripts/` and are fingerprinted per stage for safe resume invalidation.
+
+## Canonical pipeline and preparation
+
+- Runtime: `farm_pipeline.py`, `farm_standard_stage.py`, `farm_preflight.py`,
+  `farm_resource_preflight.py`, `farm_runtime_inventory.py`.
+- Inputs: `convert_colmap_kb4_to_pinhole.py`,
+  `select_colmap_keyframes.py`, `prepare_colmap_3dgs_rgbd.py`.
+- Mapping QA, geometry and semantics: every `farm_*`, `analyze_farm_*`,
+  `audit_farm_gaussian_support.py`, `build_farm_*`, `review_farm_*`,
+  `reconcile_farm_semantics.py`, `finalize_farm_semantic_consensus.py`,
+  `refine_farm_*`, `resolve_farm_track_duplicates.py`,
+  `unify_farm_compound_presentation.py`, `validate_farm_geometry.py`, and
+  the generic `plot_farm_*` / `visualize_farm_scene_state.py` programs named
+  by the standard stage map.
+- Viewer/report: `view_scene_state.py`, `build_farm_run_report.py`.
+- Models/services: `download_farm_models.py`,
+  `download_dinov3_vits16plus.py`, `hf_download_with_secret.py`,
+  `start_farm_vllm.sh`.
+
+## Upstream research/evaluation utilities
+
+`eval_*`, `run_scene_graph_*`, `render_hm3d_trajectory.py`,
+`convert_ours_to_canonical.py`, `inspect_pipeline_trace.py`,
+`run_pipeline.py`, `query_scene_graph.py`, `score_largescale_predictions.py`
+and sensor conversion helpers are retained because they belong to upstream
+FARM evaluation/debug workflows, not generated experiment clutter.
+
+## Removed superseded factory experiment tools
+
+The old factory selector/RGB-D launcher, H100 multi-service launcher, V6/V7/V8
+management-board renderers and one-off benchmark/regression plots were removed.
+They duplicated the generic stages, contained factory paths or fixed object
+policies, and were not referenced by the canonical DAG or tests. Historical
+commands remain in the immutable run logs and the v7 source snapshot.

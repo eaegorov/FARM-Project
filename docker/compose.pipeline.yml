@@ -1,0 +1,98 @@
+name: farm-generic-pipeline
+
+x-prep-service: &prep-service
+  image: ${FARM_PREP_IMAGE:-farm-prep:local}
+  build:
+    context: ..
+    dockerfile: docker/Dockerfile.prep
+    args:
+      FARM_UID: ${FARM_UID:-1000}
+      FARM_GID: ${FARM_GID:-1000}
+  working_dir: /opt/farm
+  user: "${FARM_UID:-1000}:${FARM_GID:-1000}"
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  environment:
+    HOME: /tmp/farm-home
+    MPLCONFIGDIR: /tmp/farm-matplotlib
+    XDG_CACHE_HOME: /tmp/farm-cache
+    PYTHONDONTWRITEBYTECODE: "1"
+    NVIDIA_DRIVER_CAPABILITIES: compute,utility
+  tmpfs:
+    - /tmp:rw,nosuid,nodev,size=8g
+  volumes:
+    - type: bind
+      source: ${FARM_SCENE_ROOT:?Set FARM_SCENE_ROOT to the directory containing the scene config and inputs}
+      target: /scene
+      read_only: true
+    - type: bind
+      source: ${FARM_OUTPUT_ROOT:?Set FARM_OUTPUT_ROOT to a writable experiment root}
+      target: /runs
+
+services:
+  scene-preflight:
+    <<: *prep-service
+    profiles: [preflight]
+    command:
+      - python3
+      - scripts/farm_preflight.py
+      - --config
+      - /scene/${FARM_SCENE_CONFIG:-scene.yaml}
+      - --report
+      - /runs/preflight.json
+
+  prep-runtime-validate:
+    <<: *prep-service
+    profiles: [smoke]
+    command:
+      - python3
+      - scripts/farm_runtime_inventory.py
+      - validate
+      - --lock
+      - requirements/prep-runtime.lock.txt
+      - --report
+      - /runs/prep-runtime-validation.json
+
+  prep:
+    <<: *prep-service
+    profiles: [prep]
+    ipc: host
+    shm_size: 8gb
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${FARM_PREP_GPU:-0}"]
+              capabilities: [gpu]
+    # The generic runner supplies scene-specific arguments with
+    # `docker compose run prep python3 scripts/<stage>.py ...`.
+    command: [python3, scripts/prepare_colmap_3dgs_rgbd.py, --help]
+
+  main-runtime-validate:
+    image: ${FARM_MAIN_IMAGE:?Set FARM_MAIN_IMAGE to the manifest-pinned main image reference}
+    profiles: [main-smoke]
+    working_dir: /workspace/farm
+    user: "${FARM_UID:-1000}:${FARM_GID:-1000}"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    entrypoint: [/home/scene_graph/.venv/bin/python]
+    command:
+      - /workspace/farm/scripts/farm_runtime_inventory.py
+      - validate
+      - --lock
+      - /workspace/farm/requirements/main-runtime.observed.txt
+      - --report
+      - /runs/main-runtime-validation.json
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=2g
+    volumes:
+      - type: bind
+        source: ..
+        target: /workspace/farm
+        read_only: true
+      - type: bind
+        source: ${FARM_OUTPUT_ROOT:?Set FARM_OUTPUT_ROOT to a writable experiment root}
+        target: /runs

@@ -504,6 +504,9 @@ class StreamingMapper(Node):
             self.get_parameter("filter_detections_duplicates_iou_enabled").value
         )
         self._filter_duplicates_iou_min = float(self.get_parameter("filter_duplicates_iou_min").value)
+        self._filter_duplicates_containment_min = float(
+            self.get_parameter("filter_duplicates_containment_min").value
+        )
         self._correspondence_feature_sim_thresh = float(
             self.get_parameter("correspondence_feature_sim_thresh").value
         )
@@ -2637,9 +2640,16 @@ class StreamingMapper(Node):
         if self._filter_detections_duplicates_iou_enabled:
             n_in = _n(seg_outputs)
             seg_in = seg_outputs
-            seg_outputs = filter_detections_duplicates_iou(seg_outputs, min_iou=self._filter_duplicates_iou_min)
+            seg_outputs = filter_detections_duplicates_iou(
+                seg_outputs,
+                min_iou=self._filter_duplicates_iou_min,
+                min_containment=self._filter_duplicates_containment_min,
+            )
             _record("duplicates_iou", n_in, seg_outputs,
-                    {"min_iou": float(self._filter_duplicates_iou_min)},
+                    {
+                        "min_iou": float(self._filter_duplicates_iou_min),
+                        "min_containment": float(self._filter_duplicates_containment_min),
+                    },
                     seg_in=seg_in)
         self._add_debug_info(debug_info, "seg_outputs_filtered_duplicates_iou", seg_outputs)
         # Strip the trace-only field before returning so downstream code (caption
@@ -2705,6 +2715,7 @@ class StreamingMapper(Node):
                             "uninformative_labels_enabled": bool(self._filter_uninformative_yoloe_labels_enabled),
                             "duplicates_iou_enabled": bool(self._filter_detections_duplicates_iou_enabled),
                             "duplicates_iou_min": float(self._filter_duplicates_iou_min),
+                            "duplicates_containment_min": float(self._filter_duplicates_containment_min),
                         },
                         "correspondence": {
                             "feature_sim_thresh": float(self._correspondence_feature_sim_thresh),
@@ -3618,7 +3629,7 @@ class StreamingMapper(Node):
         self._request_shutdown("service_save_and_shutdown")
         return response
 
-    def destroy_node(self) -> bool:
+    def destroy_node(self, *, save_scene_state: bool = True) -> bool:
         if self._timing_enabled and self._timing_image_count > 0:
             avg_ms = (self._timing_sum_s / self._timing_image_count) * 1000.0
             self.get_logger().info(
@@ -3639,7 +3650,7 @@ class StreamingMapper(Node):
                     self._caption_manager.shutdown_worker()
                     self._caption_manager.drain_results()
         with contextlib.suppress(Exception):
-            if self._scene_state_save_on_shutdown and self._scene_state_save_path:
+            if save_scene_state and self._scene_state_save_on_shutdown and self._scene_state_save_path:
                 with self._scene_state_save_lock:
                     try:
                         saved_path = self._save_scene_state_now(reason="shutdown")

@@ -1,0 +1,170 @@
+{
+  "schema_version": "farm.models.v1",
+  "cache_root": "../../../.cache/huggingface",
+  "runtimes": {
+    "main": {
+      "image": "scene_graph:latest",
+      "image_id": "sha256:b2f14c8eebfd1987bd21ff3d4959b2c00c06bebbafee45b68249a9beaf043351",
+      "user_uid": 1000
+    },
+    "prep": {
+      "image": "rest3d:factory-baseline",
+      "image_id": "sha256:94ab3ea00d91f439b7d1e77a2177ef74ceab5cbd1a886fb1050b3aec557de0e0"
+    }
+  },
+  "services": {
+    "caption": {
+      "runtime": "main",
+      "served_model_name": "qwen3-vl-8b",
+      "port": 8000,
+      "model": {
+        "kind": "huggingface_snapshot",
+        "repo_id": "Qwen/Qwen3-VL-8B-Instruct",
+        "revision": "0c351dd01ed87e9c1b53cbc748cba10e6187ff3b",
+        "required_files": [
+          "config.json",
+          "generation_config.json",
+          "model.safetensors.index.json",
+          "preprocessor_config.json",
+          "tokenizer.json",
+          {
+            "path": "model-00001-of-00004.safetensors",
+            "sha256": "d5d0aef0eb170fc7453a296c43c0849a56f510555d3588e4fd662bb35490aefa",
+            "checksum_mode": "content_addressed"
+          },
+          {
+            "path": "model-00002-of-00004.safetensors",
+            "sha256": "8be88fb5501e4d5719a6d4cc212e6a13480330e74f3e8c77daa1a68f199106b5",
+            "checksum_mode": "content_addressed"
+          },
+          {
+            "path": "model-00003-of-00004.safetensors",
+            "sha256": "83de00eafe6e0d57ccd009dbcf71c9974d74df2f016c27afb7e95aafd16b2192",
+            "checksum_mode": "content_addressed"
+          },
+          {
+            "path": "model-00004-of-00004.safetensors",
+            "sha256": "0a88b98e9f96270973f567e6a2c103ede6ccdf915ca3075e21c755604d0377a5",
+            "checksum_mode": "content_addressed"
+          }
+        ]
+      },
+      "memory": {
+        "target_allocated_gib": 24.0,
+        "minimum_total_gib": 39.0,
+        "reserve_free_gib": 6.0,
+        "utilization_min": 0.30,
+        "utilization_max": 0.65
+      },
+      "vllm_args": [
+        "--max-model-len", "3084",
+        "--dtype", "half",
+        "--max-num-seqs", "2",
+        "--max-num-batched-tokens", "2048",
+        "--enable-chunked-prefill",
+        "--reasoning-parser", "qwen3",
+        "--disable-log-stats"
+      ]
+    },
+    "text-embed": {
+      "runtime": "main",
+      "served_model_name": "qwen3-emb-0.6b",
+      "port": 8002,
+      "model": {
+        "kind": "huggingface_snapshot",
+        "repo_id": "Qwen/Qwen3-Embedding-0.6B",
+        "revision": "97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3",
+        "required_files": [
+          "config.json",
+          "modules.json",
+          "tokenizer.json",
+          {
+            "path": "model.safetensors",
+            "sha256": "0437e45c94563b09e13cb7a64478fc406947a93cb34a7e05870fc8dcd48e23fd",
+            "checksum_mode": "content_addressed"
+          }
+        ]
+      },
+      "memory": {
+        "target_allocated_gib": 5.0,
+        "minimum_total_gib": 12.0,
+        "reserve_free_gib": 4.0,
+        "utilization_min": 0.06,
+        "utilization_max": 0.30
+      },
+      "vllm_args": [
+        "--runner", "pooling",
+        "--dtype", "half",
+        "--max-model-len", "512",
+        "--max-num-seqs", "5",
+        "--max-num-batched-tokens", "2048",
+        "--enforce-eager",
+        "--disable-log-stats"
+      ]
+    },
+    "vl-embed": {
+      "runtime": "main",
+      "served_model_name": "qwen3-vl-emb-2b",
+      "port": 8006,
+      "model": {
+        "kind": "huggingface_snapshot",
+        "repo_id": "Qwen/Qwen3-VL-Embedding-2B",
+        "revision": "9f2f7e710d6d81056aa5c0a4f04764fec6bb7bda",
+        "required_files": [
+          "config.json",
+          "modules.json",
+          "preprocessor_config.json",
+          "tokenizer.json",
+          {
+            "path": "model.safetensors",
+            "sha256": "c73fa9caeddeb3ff831d46c085a7a5708343248ca777e90f2d486964464509c1",
+            "checksum_mode": "content_addressed"
+          }
+        ]
+      },
+      "memory": {
+        "target_allocated_gib": 10.0,
+        "minimum_total_gib": 24.0,
+        "reserve_free_gib": 4.0,
+        "utilization_min": 0.12,
+        "utilization_max": 0.45
+      },
+      "vllm_args": [
+        "--runner", "pooling",
+        "--dtype", "half",
+        "--max-model-len", "600",
+        "--max-num-seqs", "5",
+        "--max-num-batched-tokens", "2048",
+        "--enforce-eager",
+        "--disable-log-stats"
+      ]
+    }
+  },
+  "pipeline_models": {
+    "yoloe-v8l-seg": {
+      "kind": "local_file",
+      "path": "../../models/yoloe/yoloe-v8l-seg.pt",
+      "sha256": "14e9c146f7f7efa0bfea8c5f82952c9f95fb1f9c3bf0f18b3727b76624f9d746"
+    },
+    "yoloe-v8l-seg-pf": {
+      "kind": "local_file",
+      "path": "../../models/yoloe/yoloe-v8l-seg-pf.pt",
+      "sha256": "a247e963341bafca421deae39a82f0a6627c3c7fac4564473b4e0149f65b2fd8"
+    },
+    "dinov3-vits16plus": {
+      "kind": "local_file",
+      "path": "../../models/dinov3-vits16plus/model.safetensors",
+      "sha256": "208146e499dace99e4c9376ddb8a26f77d64c31c46c4dc4b86ff8bc63b0235e2"
+    },
+    "siglip2-large-patch16-256": {
+      "kind": "local_file",
+      "path": "../../models/siglip2-large-patch16-256/model.safetensors",
+      "sha256": "fa34f822f016dbb167d8d0e3a8af99b5e199aa28573360d4295252b9ec418e2a"
+    },
+    "mobileclip": {
+      "kind": "local_file",
+      "path": "../../models/mobileclip/mobileclip_blt.pt",
+      "sha256": "670844f7a886dd6eff7a9285adfc53f3d3c889c03bfc8354010cb5c6bf27441a"
+    }
+  }
+}

@@ -1,0 +1,15 @@
+# Observed import inventory inside scene_graph:latest.
+# This is an audit record, not a cross-platform pip lock.
+# image ID: sha256:b2f14c8eebfd1987bd21ff3d4959b2c00c06bebbafee45b68249a9beaf043351
+torch==2.11.0+cu128
+torchvision==0.26.0+cu128
+numpy==2.2.6
+vllm==0.26.0
+transformers==5.14.1
+huggingface_hub==1.26.0
+qwen-vl-utils==0.0.14
+ultralytics==8.3.39
+timm==0.9.5
+Pillow==12.3.0
+PyYAML==6.0.3
+viser==1.0.30

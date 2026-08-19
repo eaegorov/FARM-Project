@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import json
 import logging
 import os
 import sys
@@ -311,6 +312,12 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--timing-report-path",
+        type=Path,
+        default=None,
+        help="Write an end-to-end JSON timing report for this offline run.",
+    )
+    parser.add_argument(
         "--preload-scene-state",
         action="store_true",
         help="Allow loading the default scene_state.pt under ~/.ros at startup. "
@@ -515,9 +522,110 @@ def make_frame_source(args: argparse.Namespace):
     raise SystemExit(f"Unknown source: {args.source}")
 
 
+def _duration_summary(values: list[float]) -> dict[str, float | int | None]:
+    finite = sorted(float(value) for value in values if value >= 0.0)
+    if not finite:
+        return {"count": 0, "total": 0.0, "mean": None, "p50": None, "p95": None, "max": None}
+
+    def percentile(fraction: float) -> float:
+        position = fraction * (len(finite) - 1)
+        left = int(position)
+        right = min(left + 1, len(finite) - 1)
+        alpha = position - left
+        return finite[left] * (1.0 - alpha) + finite[right] * alpha
+
+    total = float(sum(finite))
+    return {
+        "count": len(finite),
+        "total": total,
+        "mean": total / len(finite),
+        "p50": percentile(0.50),
+        "p95": percentile(0.95),
+        "max": finite[-1],
+    }
+
+
+def _atomic_write_json(path: Path, value: object) -> None:
+    """Durably replace a JSON report without exposing a partial file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        with temporary.open("w", encoding="utf-8") as handle:
+            json.dump(value, handle, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            temporary.unlink()
+
+
+def _run_warmup(
+    mapper: object,
+    src_iter: object,
+    *,
+    warmup_frames: int,
+    batch_size: int,
+    recorder: object | None,
+    batch_durations: list[float],
+    progress: dict[str, int],
+) -> int:
+    """Process warmup frames; mapping/recording failures deliberately propagate."""
+    warmup_batch: list = []
+    warmup_count = 0
+    progress["frames"] = 0
+    while warmup_count < warmup_frames:
+        _wait_for_viser_streaming_resume(mapper)
+        try:
+            item = next(src_iter)  # type: ignore[arg-type]
+        except StopIteration:
+            break
+        warmup_batch.append(item)
+        if len(warmup_batch) >= batch_size:
+            t_batch_start = time.perf_counter()
+            result = mapper._run_mapping_batch(warmup_batch)  # type: ignore[attr-defined]
+            t_batch_end = time.perf_counter()
+            batch_durations.append(t_batch_end - t_batch_start)
+            if result is not None:
+                _record_viser_snapshot(
+                    recorder,
+                    mapper,
+                    duration_s=t_batch_end - t_batch_start,
+                    batch_size=len(warmup_batch),
+                    warmup=True,
+                )
+            warmup_count += len(warmup_batch)
+            progress["frames"] = warmup_count
+            warmup_batch = []
+    if warmup_batch:
+        t_batch_start = time.perf_counter()
+        result = mapper._run_mapping_batch(warmup_batch)  # type: ignore[attr-defined]
+        t_batch_end = time.perf_counter()
+        batch_durations.append(t_batch_end - t_batch_start)
+        if result is not None:
+            _record_viser_snapshot(
+                recorder,
+                mapper,
+                duration_s=t_batch_end - t_batch_start,
+                batch_size=len(warmup_batch),
+                warmup=True,
+            )
+        warmup_count += len(warmup_batch)
+        progress["frames"] = warmup_count
+    return warmup_count
+
+
+def _destroy_mapper(mapper: object, *, run_succeeded: bool) -> object:
+    """Release mapper resources, persisting state only for a successful run."""
+    return mapper.destroy_node(save_scene_state=bool(run_succeeded))  # type: ignore[attr-defined]
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(name)s: %(message)s")
     args = parse_args(argv)
+    overall_started = time.perf_counter()
+    runtime_init_started = time.perf_counter()
 
     import rclpy
 
@@ -527,8 +635,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     ros_args = build_ros_args(args)
     LOGGER.info("rclpy.init args: %s", " ".join(ros_args))
     rclpy.init(args=ros_args)
+    runtime_init_seconds = time.perf_counter() - runtime_init_started
 
+    source_init_started = time.perf_counter()
     source = make_frame_source(args)
+    source_init_seconds = time.perf_counter() - source_init_started
     batch_size = max(1, args.batch_size)
     recorder = None
     if args.viser_record_dir is not None:
@@ -549,8 +660,22 @@ def main(argv: Optional[List[str]] = None) -> int:
         LOGGER.info("Viser replay recording enabled: %s", recorder.root)
 
     mapper = None
+    mapper_init_seconds = 0.0
+    warmup_seconds = 0.0
+    steady_seconds = 0.0
+    finalize_seconds = 0.0
+    warmup_frames_consumed = 0
+    frame_count = 0
+    n_dropped = 0
+    warmup_batch_seconds: list[float] = []
+    steady_batch_seconds: list[float] = []
+    run_status = "failed"
+    run_error: str | None = None
+    source_closed = False
     try:
+        mapper_init_started = time.perf_counter()
         mapper = StreamingMapper()
+        mapper_init_seconds = time.perf_counter() - mapper_init_started
         LOGGER.info(
             "StreamingMapper ready (caption=%s, viser=%s, image_saving=%s)",
             args.caption,
@@ -574,56 +699,29 @@ def main(argv: Optional[List[str]] = None) -> int:
         # cascade-drop hundreds of subsequent frames.
         if warmup_frames > 0:
             t_warmup_start = time.perf_counter()
-            warmup_batch: list = []
-            warmup_count = 0
+            warmup_progress = {"frames": 0}
             try:
-                while warmup_count < warmup_frames:
-                    _wait_for_viser_streaming_resume(mapper)
-                    try:
-                        item = next(src_iter)
-                    except StopIteration:
-                        break
-                    warmup_batch.append(item)
-                    if len(warmup_batch) >= batch_size:
-                        t_batch_start = time.perf_counter()
-                        result = mapper._run_mapping_batch(warmup_batch)
-                        t_batch_end = time.perf_counter()
-                        if result is not None:
-                            _record_viser_snapshot(
-                                recorder,
-                                mapper,
-                                duration_s=t_batch_end - t_batch_start,
-                                batch_size=len(warmup_batch),
-                                warmup=True,
-                            )
-                        warmup_count += len(warmup_batch)
-                        frame_count += len(warmup_batch)
-                        warmup_batch = []
-                if warmup_batch:
-                    t_batch_start = time.perf_counter()
-                    result = mapper._run_mapping_batch(warmup_batch)
-                    t_batch_end = time.perf_counter()
-                    if result is not None:
-                        _record_viser_snapshot(
-                            recorder,
-                            mapper,
-                            duration_s=t_batch_end - t_batch_start,
-                            batch_size=len(warmup_batch),
-                            warmup=True,
-                        )
-                    warmup_count += len(warmup_batch)
-                    frame_count += len(warmup_batch)
-            except Exception as exc:
-                LOGGER.warning("Warmup phase failed mid-frame: %s", exc)
+                warmup_count = _run_warmup(
+                    mapper,
+                    src_iter,
+                    warmup_frames=warmup_frames,
+                    batch_size=batch_size,
+                    recorder=recorder,
+                    batch_durations=warmup_batch_seconds,
+                    progress=warmup_progress,
+                )
+            finally:
+                warmup_seconds = time.perf_counter() - t_warmup_start
+                warmup_frames_consumed = int(warmup_progress["frames"])
             LOGGER.info(
                 "Warmup: %d frames in %.1fs (timer now starts)",
                 warmup_count,
-                time.perf_counter() - t_warmup_start,
+                warmup_seconds,
             )
 
         # Reset frame counters after warmup so reported fps reflects steady-state
         # post-warmup performance only.
-        warmup_frames_consumed = frame_count
+        warmup_frames_consumed = int(warmup_frames_consumed)
         frame_count = 0
         t_start = time.perf_counter()
         # Wall-clock deadline for the next batch to *finish* by.
@@ -641,6 +739,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                     t_batch_start = time.perf_counter()
                     result = mapper._run_mapping_batch(batch)
                     t_batch_end = time.perf_counter()
+                    steady_batch_seconds.append(t_batch_end - t_batch_start)
                     frame_count += len(batch)
                     batch_size_actual = len(batch)
                     if result is not None:
@@ -703,6 +802,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 t_batch_start = time.perf_counter()
                 result = mapper._run_mapping_batch(batch)
                 t_batch_end = time.perf_counter()
+                steady_batch_seconds.append(t_batch_end - t_batch_start)
                 if result is not None:
                     _record_viser_snapshot(
                         recorder,
@@ -719,8 +819,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                 frame_count += len(batch)
         finally:
             source.close()
+            source_closed = True
 
         dt = time.perf_counter() - t_start
+        steady_seconds = dt
         drop_msg = f" dropped={n_dropped}" if drop_when_late else ""
         LOGGER.info("Done. %d frames in %.1fs (%.2f fps avg)%s", frame_count, dt, frame_count / max(dt, 1e-9), drop_msg)
         if recorder is not None:
@@ -729,14 +831,90 @@ def main(argv: Optional[List[str]] = None) -> int:
         if args.keep_viser_after_run and args.viser:
             _finalize_before_viser_idle(mapper)
             _keep_viser_alive(mapper, host=args.viser_host, port=args.viser_port)
+        run_status = "completed"
+    except BaseException as exc:
+        run_error = f"{type(exc).__name__}: {exc}"
+        raise
     finally:
+        finalize_started = time.perf_counter()
+        primary_failure = run_error is not None
+        cleanup_error: BaseException | None = None
         if recorder is not None:
             with contextlib.suppress(Exception):
                 recorder.close()
+        if not source_closed:
+            with contextlib.suppress(Exception):
+                source.close()
         if mapper is not None:
-            # destroy_node() handles caption drain + scene_state save + image worker close.
-            mapper.destroy_node()
-        rclpy.shutdown()
+            # Always release workers/tracers. A failed or interrupted run must
+            # never replace a previously valid scene_state with partial data.
+            try:
+                _destroy_mapper(mapper, run_succeeded=(run_status == "completed"))
+            except BaseException as exc:
+                cleanup_error = exc
+                LOGGER.exception("StreamingMapper cleanup failed")
+                if run_error is None:
+                    run_status = "failed"
+                    run_error = f"{type(exc).__name__}: {exc}"
+        try:
+            rclpy.shutdown()
+        except BaseException as exc:
+            LOGGER.exception("rclpy shutdown failed")
+            if cleanup_error is None:
+                cleanup_error = exc
+            if run_error is None:
+                run_status = "failed"
+                run_error = f"{type(exc).__name__}: {exc}"
+        finalize_seconds = time.perf_counter() - finalize_started
+        if args.timing_report_path is not None:
+            timing_path = args.timing_report_path.expanduser()
+            timing_path.parent.mkdir(parents=True, exist_ok=True)
+            total_seconds = time.perf_counter() - overall_started
+            total_frames = int(warmup_frames_consumed + frame_count)
+            report = {
+                "schema": "farm.offline-timing.v1",
+                "created_unix_s": time.time(),
+                "status": run_status,
+                "error": run_error,
+                "configuration": {
+                    "source": args.source,
+                    "frames_json_dir": str(args.frames_json_dir.expanduser()) if args.frames_json_dir else None,
+                    "batch_size": batch_size,
+                    "target_fps": float(args.target_fps),
+                    "warmup_frames_requested": int(args.warmup_frames),
+                    "caption_enabled": bool(args.caption),
+                    "covisibility_enabled": bool(args.covisibility),
+                    "regions_enabled": bool(args.regions),
+                    "extra_params": list(args.extra_param),
+                },
+                "frames": {
+                    "warmup": int(warmup_frames_consumed),
+                    "steady": int(frame_count),
+                    "total": total_frames,
+                    "dropped": int(n_dropped),
+                },
+                "stages_seconds": {
+                    "runtime_initialization": runtime_init_seconds,
+                    "frame_source_initialization": source_init_seconds,
+                    "mapper_and_model_initialization": mapper_init_seconds,
+                    "warmup_mapping": warmup_seconds,
+                    "steady_mapping": steady_seconds,
+                    "finalize_and_save": finalize_seconds,
+                    "end_to_end": total_seconds,
+                },
+                "batches_seconds": {
+                    "warmup": _duration_summary(warmup_batch_seconds),
+                    "steady": _duration_summary(steady_batch_seconds),
+                },
+                "throughput_views_per_second": {
+                    "steady": frame_count / max(steady_seconds, 1.0e-9),
+                    "end_to_end": total_frames / max(total_seconds, 1.0e-9),
+                },
+            }
+            _atomic_write_json(timing_path, report)
+            LOGGER.info("Timing report written: %s", timing_path)
+        if cleanup_error is not None and not primary_failure:
+            raise cleanup_error
     return 0
 
 

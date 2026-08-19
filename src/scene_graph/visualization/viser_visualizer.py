@@ -12,7 +12,7 @@ import subprocess
 import threading
 import time
 from dataclasses import dataclass
-from typing import Dict, Sequence
+from typing import Dict, Mapping, Sequence
 
 import numpy as np
 import torch
@@ -42,6 +42,266 @@ def _to_numpy(array) -> np.ndarray:
     if isinstance(array, torch.Tensor):
         return array.detach().cpu().numpy()
     return np.asarray(array)
+
+
+def _wxyz_to_matrix(value: np.ndarray) -> np.ndarray:
+    w, x, y, z = np.asarray(value, dtype=np.float64) / max(float(np.linalg.norm(value)), 1.0e-12)
+    return np.asarray([
+        [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+        [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+        [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+    ], dtype=np.float32)
+
+
+def _normalise_compound_box(record: object) -> dict | None:
+    """Return a finite metric child-OBB record, or ``None`` when malformed."""
+    if not isinstance(record, Mapping):
+        return None
+    try:
+        center = np.asarray(record.get("center_m", record.get("center")), dtype=np.float32).reshape(3)
+        dimensions = np.asarray(
+            record.get("dimensions_m", record.get("dimensions_lwh_m", record.get("dimensions"))),
+            dtype=np.float32,
+        ).reshape(3)
+        wxyz = np.asarray(record.get("wxyz", record.get("orientation_wxyz")), dtype=np.float32).reshape(4)
+    except (TypeError, ValueError):
+        return None
+    quaternion_norm = float(np.linalg.norm(wxyz))
+    if (
+        not np.isfinite(center).all()
+        or not np.isfinite(dimensions).all()
+        or not np.isfinite(wxyz).all()
+        or np.any(dimensions <= 0.0)
+        or quaternion_norm <= 1.0e-6
+    ):
+        return None
+    normalized = {
+        "center_m": center,
+        "dimensions_m": dimensions,
+        "wxyz": wxyz / quaternion_norm,
+    }
+    for key in ("label", "member_id", "consensus_cells", "gaussian_supported_rate"):
+        if key in record:
+            normalized[key] = record[key]
+    return normalized
+
+
+def _normalise_compound_boxes(value: object) -> list[dict]:
+    if not isinstance(value, (list, tuple)):
+        return []
+    boxes: list[dict] = []
+    for record in value:
+        normalized = _normalise_compound_box(record)
+        if normalized is not None:
+            boxes.append(normalized)
+    return boxes
+
+
+def _finite_consensus_points(value: object) -> np.ndarray:
+    if value is None:
+        return np.zeros((0, 3), dtype=np.float32)
+    try:
+        points = _to_numpy(value).astype(np.float32, copy=False).reshape(-1, 3)
+    except (TypeError, ValueError):
+        return np.zeros((0, 3), dtype=np.float32)
+    return points[np.isfinite(points).all(axis=1)].astype(np.float32, copy=False)
+
+
+def _normalise_world_up(value: object) -> np.ndarray:
+    """Return a finite unit world-up vector without snapping it to an axis."""
+
+    try:
+        up = np.asarray(value, dtype=np.float64).reshape(3)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("world_up must contain exactly three numbers") from exc
+    norm = float(np.linalg.norm(up))
+    if not np.isfinite(up).all() or not math.isfinite(norm) or norm <= 1.0e-8:
+        raise ValueError("world_up must be finite and non-zero")
+    return (up / norm).astype(np.float32)
+
+
+def _ground_basis(world_up: object) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Build a deterministic orthonormal basis for an arbitrary ground plane."""
+
+    up = _normalise_world_up(world_up).astype(np.float64)
+    axes = np.eye(3, dtype=np.float64)
+    seed = axes[int(np.argmin(np.abs(axes @ up)))]
+    first = seed - float(np.dot(seed, up)) * up
+    first /= max(float(np.linalg.norm(first)), 1.0e-12)
+    second = np.cross(up, first)
+    second /= max(float(np.linalg.norm(second)), 1.0e-12)
+    return first, second, up
+
+
+def _scene_relative_home_camera(
+    points: object,
+    *,
+    presentation_mode: bool,
+    world_up: object | None = None,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """Compute a deterministic overview camera from robust scene geometry.
+
+    The presentation preset views the dominant ground-plane axis from its
+    side, which makes long indoor scans read horizontally instead of looking
+    like a near top-down floor plan.  Every distance is proportional to the
+    scene's percentile extent; no factory-specific world position is used.
+    """
+
+    try:
+        pts = np.asarray(points, dtype=np.float64).reshape(-1, 3)
+    except (TypeError, ValueError):
+        return None
+    pts = pts[np.isfinite(pts).all(axis=1)]
+    if pts.shape[0] < 2:
+        return None
+    # Project centred coordinates. Besides improving covariance conditioning,
+    # this keeps the camera exactly translation-relative for large world
+    # coordinates and non-axis-aligned up vectors.
+    projection_origin = np.median(pts, axis=0)
+    projection_points = pts - projection_origin
+    if world_up is None:
+        # Preserve the legacy auto-axis behaviour for callers that never
+        # configured gravity.
+        minimum, maximum = np.percentile(pts, (2.0, 98.0), axis=0)
+        center = 0.5 * (minimum + maximum)
+        extent = maximum - minimum
+        if not np.isfinite(center).all() or not np.isfinite(extent).all():
+            return None
+        up_axis = int(np.argmin(extent))
+        ground_axes = [axis for axis in range(3) if axis != up_axis]
+        if not presentation_mode:
+            distance = max(float(np.linalg.norm(extent)) * 0.55, 2.0)
+            offset = np.zeros((3,), dtype=np.float64)
+            offset[ground_axes[0]] = 0.50 * distance
+            offset[ground_axes[1]] = -0.40 * distance
+            offset[up_axis] = 0.70 * distance
+            return (center + offset).astype(np.float32), center.astype(np.float32)
+        basis_first = np.eye(3, dtype=np.float64)[ground_axes[0]]
+        basis_second = np.eye(3, dtype=np.float64)[ground_axes[1]]
+        up = np.zeros((3,), dtype=np.float64)
+        up[up_axis] = -1.0
+        coordinates = np.column_stack([
+            projection_points @ basis_first,
+            projection_points @ basis_second,
+            projection_points @ up,
+        ])
+        minimum, maximum = np.percentile(coordinates, (2.0, 98.0), axis=0)
+        center_coordinates = 0.5 * (minimum + maximum)
+        extent = maximum - minimum
+        center = projection_origin + (
+            center_coordinates[0] * basis_first
+            + center_coordinates[1] * basis_second
+            + center_coordinates[2] * up
+        )
+    else:
+        basis_first, basis_second, up = _ground_basis(world_up)
+        coordinates = np.column_stack([
+            projection_points @ basis_first,
+            projection_points @ basis_second,
+            projection_points @ up,
+        ])
+        minimum, maximum = np.percentile(coordinates, (2.0, 98.0), axis=0)
+        center_coordinates = 0.5 * (minimum + maximum)
+        extent = maximum - minimum
+        center = projection_origin + (
+            center_coordinates[0] * basis_first
+            + center_coordinates[1] * basis_second
+            + center_coordinates[2] * up
+        )
+        if not np.isfinite(center).all() or not np.isfinite(extent).all():
+            return None
+        if not presentation_mode:
+            distance = max(float(np.linalg.norm(extent)) * 0.55, 2.0)
+            offset = distance * (0.50 * basis_first - 0.40 * basis_second + 0.70 * up)
+            return (center + offset).astype(np.float32), center.astype(np.float32)
+
+    # Fit the dominant direction only on the robust percentile interior so
+    # sparse range outliers cannot flip the management-facing opening view.
+    inside = np.all((coordinates >= minimum) & (coordinates <= maximum), axis=1)
+    ground = coordinates[inside, :2] if int(np.count_nonzero(inside)) >= 3 else coordinates[:, :2]
+    centered_ground = ground - np.median(ground, axis=0, keepdims=True)
+    covariance = centered_ground.T @ centered_ground / max(1, centered_ground.shape[0] - 1)
+    try:
+        eigenvalues, eigenvectors = np.linalg.eigh(covariance)
+        long_axis = np.asarray(eigenvectors[:, int(np.argmax(eigenvalues))], dtype=np.float64)
+    except np.linalg.LinAlgError:
+        long_axis = np.asarray([1.0, 0.0], dtype=np.float64)
+    if not np.isfinite(long_axis).all() or float(np.linalg.norm(long_axis)) <= 1.0e-8:
+        long_axis = np.asarray([1.0, 0.0], dtype=np.float64)
+    long_axis /= float(np.linalg.norm(long_axis))
+    # Eigenvectors have arbitrary sign. Canonicalise both the scene axis and
+    # the perpendicular viewing side for repeatable starts across runs.
+    if long_axis[int(np.argmax(np.abs(long_axis)))] < 0.0:
+        long_axis *= -1.0
+    view_axis = np.asarray([long_axis[1], -long_axis[0]], dtype=np.float64)
+    if view_axis[int(np.argmax(np.abs(view_axis)))] < 0.0:
+        view_axis *= -1.0
+    # A small longitudinal component gives a readable 3/4 view while keeping
+    # the dominant scene direction mostly horizontal on screen.
+    view_axis = view_axis + 0.12 * long_axis
+    view_axis /= max(float(np.linalg.norm(view_axis)), 1.0e-8)
+
+    ground_diagonal = float(np.linalg.norm(extent[:2]))
+    # Keep the robust scene bounds large in frame: 0.90× the ground diagonal
+    # fits the 52° vertical / widescreen horizontal presentation frustum while
+    # avoiding the excessive empty margin of the earlier 1.20× preset.
+    standoff = max(0.90 * ground_diagonal, 2.0)
+    view_world = view_axis[0] * basis_first + view_axis[1] * basis_second
+    position = center + standoff * view_world + 0.18 * standoff * up
+    look_at = center + 0.04 * max(float(extent[2]), 0.0) * up
+    return position.astype(np.float32), look_at.astype(np.float32)
+
+
+def _geometry_layer_render_mask(
+    active: object,
+    semantic_tiers: Sequence[object],
+    geometry_statuses: Sequence[object],
+    compound_boxes: Sequence[object],
+    consensus_points: Sequence[object],
+    layer: str,
+    *,
+    display_statuses: Sequence[object] | None = None,
+) -> np.ndarray:
+    """Build a display-only layer mask without mutating FARM's active state.
+
+    ``Presentation`` is deliberately the only layer that applies V9's display
+    suppression (duplicates and assembly parts).  The three audit layers keep
+    the complete geometry catalog visible so suppression never hides evidence
+    from review.
+    """
+    active_mask = np.asarray(_to_numpy(active), dtype=bool).reshape(-1)
+    render_mask = np.zeros_like(active_mask)
+    if display_statuses is None:
+        display_statuses = []
+    for index in range(active_mask.size):
+        status = str(geometry_statuses[index] if index < len(geometry_statuses) else "").strip().lower()
+        semantic_tier = str(
+            semantic_tiers[index] if index < len(semantic_tiers) else "confirmed"
+        ).strip().lower()
+        display_status = str(
+            display_statuses[index] if index < len(display_statuses) else ""
+        ).strip().lower()
+        geometry_pass = status == "geometry_pass" or status.endswith("_geometry_pass")
+        compound = "compound_geometry_probable" in status and "rejected" not in status
+        display_suppressed = display_status.endswith("_suppressed")
+        diagnostic = bool(
+            status not in {"", "not_evaluated"}
+            or _normalise_compound_boxes(compound_boxes[index] if index < len(compound_boxes) else [])
+            or _finite_consensus_points(consensus_points[index] if index < len(consensus_points) else None).shape[0]
+        )
+        if layer == "Presentation":
+            semantic_metric = semantic_tier in {"confirmed", "probable"}
+            render_mask[index] = (
+                not display_suppressed
+                and ((active_mask[index] and geometry_pass and semantic_metric) or compound)
+            )
+        elif layer == "Strict metric":
+            render_mask[index] = active_mask[index] and geometry_pass
+        elif layer == "Metric + compound probable":
+            render_mask[index] = (active_mask[index] and geometry_pass) or compound
+        else:
+            render_mask[index] = active_mask[index] or diagnostic
+    return render_mask
 
 
 def _cholesky_with_jitter(
@@ -126,13 +386,26 @@ def _cov6_to_matrix_torch(cov6: torch.Tensor) -> torch.Tensor:
 class PipelineViserVisualizer:
     """Lightweight Viser visualizer for batched mapping outputs."""
 
+    _PRESENTATION_PALETTE = np.asarray(
+        [
+            [255, 190, 74], [87, 207, 230], [238, 112, 154], [118, 210, 151],
+            [176, 141, 235], [245, 139, 79], [103, 164, 247], [225, 208, 105],
+            [105, 218, 203], [219, 130, 221], [156, 198, 106], [244, 161, 185],
+        ],
+        dtype=np.uint8,
+    )
+
     def __init__(
         self,
         enabled: bool = True,
         voxel_size_m: float = 0.1,
-        point_size_m: float = 0.01,
+        point_size_m: float = 0.004,
         host: str = "127.0.0.1",
         port: int = 8080,
+        server_label: str = "Scene Memory",
+        presentation_mode: bool = False,
+        scene_summary: dict | None = None,
+        query_enabled: bool = True,
         live_rgb_enabled: bool = True,
         live_rgb_max_side: int = 320,
         live_rgb_max_fps: float = 5.0,
@@ -165,12 +438,24 @@ class PipelineViserVisualizer:
         on_save_all=None,
         on_toggle_lock=None,
         on_add_object=None,
+        world_up: Sequence[float] | None = None,
     ) -> None:
         self._voxel_size = float(voxel_size_m)
         self._point_size = max(1.0e-4, float(point_size_m))
         self._rng = np.random.default_rng(0)
         self._host = str(host or "127.0.0.1")
         self._port = int(port)
+        self._server_label = str(server_label or "Scene Memory")
+        self._presentation_mode = bool(presentation_mode)
+        self._world_up_explicit = world_up is not None
+        self._world_up = _normalise_world_up(
+            world_up if world_up is not None else (0.0, -1.0, 0.0)
+        )
+        self._scene_summary = dict(scene_summary or {})
+        self._geometry_layers_available = bool(
+            self._scene_summary.get("geometry_layers_available", False)
+        )
+        self._query_enabled = bool(query_enabled)
         self._live_rgb_enabled = bool(live_rgb_enabled)
         self._live_rgb_max_side = max(1, int(live_rgb_max_side))
         self._live_rgb_max_fps = max(0.0, float(live_rgb_max_fps))
@@ -223,6 +508,8 @@ class PipelineViserVisualizer:
 
         # Handles
         self._point_handle = None
+        self._background_point_handle = None
+        self._background_point_size = 0.004
         self._gaussian_handle = None
         self._object_connection_handle = None
         self._region_connection_handle = None
@@ -238,6 +525,9 @@ class PipelineViserVisualizer:
         self._search_highlight_box_handle = None
         self._search_highlight_edges_handle = None
         self._search_relations_handle = None
+        self._selected_highlight_box_handle = None
+        self._selected_highlight_box_handles: list[object] = []
+        self._selected_label_handle = None
         self._query_roles: dict | None = None
         # When set (after a query), only these object ids are rendered (target /
         # confounders / anchors); every other object is hidden entirely — no box,
@@ -256,6 +546,8 @@ class PipelineViserVisualizer:
         # Object Management
         self._id_to_color: Dict[int, np.ndarray] = {}
         self._object_cube_handles: Dict[int, viser.SceneNodeHandle] = {}
+        self._object_compound_cube_handles: Dict[tuple[int, int], viser.SceneNodeHandle] = {}
+        self._object_compound_label_handles: Dict[int, viser.SceneNodeHandle] = {}
         self._detection_cube_handles: Dict[int, viser.SceneNodeHandle] = {}
         self._region_ball_handles: Dict[int, viser.SceneNodeHandle] = {}
         self._object_voxel_cache: dict[tuple[int, int, int, int, int, int, int], np.ndarray] = {}
@@ -307,9 +599,15 @@ class PipelineViserVisualizer:
 
         # Filter GUI handles
         self._max_side_slider = None
+        self._background_point_size_slider = None
+        self._semantic_layer_dropdown = None
 
         # State used for picking.
         self._latest_ids: np.ndarray | None = None
+        self._latest_box_centers: np.ndarray | None = None
+        self._latest_box_dimensions: np.ndarray | None = None
+        self._latest_box_wxyz: np.ndarray | None = None
+        self._latest_compound_boxes: list[list[dict]] | None = None
         self._latest_captions: list[str] | None = None
         self._latest_caption_edit_texts: list[str] | None = None
         self._latest_images: list[object | None] | None = None
@@ -342,11 +640,73 @@ class PipelineViserVisualizer:
             return
 
         try:
-            self._server = viser.ViserServer(host=self._host, port=self._port)
+            self._server = viser.ViserServer(host=self._host, port=self._port, label=self._server_label)
+            if self._presentation_mode:
+                with contextlib.suppress(Exception):
+                    self._server.gui.configure_theme(
+                        control_layout="fixed",
+                        control_width="large",
+                        dark_mode=True,
+                        show_logo=False,
+                        show_share_button=False,
+                        brand_color=(239, 174, 55),
+                    )
+                with contextlib.suppress(Exception):
+                    background = np.empty((2, 2, 3), dtype=np.uint8)
+                    background[...] = np.asarray([12, 18, 29], dtype=np.uint8)
+                    self._server.scene.set_background_image(background, format="png")
+            if self._presentation_mode or self._world_up_explicit:
+                with contextlib.suppress(Exception):
+                    self._server.scene.set_up_direction(tuple(float(v) for v in self._world_up))
             self._camera_frame = self._server.scene.add_frame(name="/camera_pose", axes_length=0.25, axes_radius=0.01)
+            if self._presentation_mode:
+                with contextlib.suppress(Exception):
+                    self._camera_frame.visible = False
 
             gui = getattr(self._server, "gui", None)
             if gui is not None:
+                if self._presentation_mode:
+                    with contextlib.suppress(Exception):
+                        with gui.add_folder(self._server_label):
+                            metric_objects = self._scene_summary.get(
+                                "metric_objects",
+                                self._scene_summary.get("active_objects", "—"),
+                            )
+                            confirmed_objects = self._scene_summary.get("confirmed_objects")
+                            probable_objects = self._scene_summary.get("probable_objects")
+                            geometry_only_objects = self._scene_summary.get("geometry_only_objects")
+                            presentation_objects = self._scene_summary.get("presentation_objects")
+                            views = self._scene_summary.get("views", "—")
+                            timestamps = self._scene_summary.get("timestamps", "—")
+                            cloud_points = self._scene_summary.get("cloud_points", "—")
+                            if confirmed_objects is None:
+                                catalog_line = f"{metric_objects} retained multi-view objects"
+                            else:
+                                prefix = (
+                                    f"{presentation_objects} presentation · "
+                                    if presentation_objects is not None else ""
+                                )
+                                catalog_line = (
+                                    f"{prefix}{metric_objects} metric OBB · "
+                                    f"{confirmed_objects} confirmed · {probable_objects} probable · "
+                                    f"{geometry_only_objects} geometry-only"
+                                )
+                            gui.add_markdown(
+                                "**Interactive object-centric 3D memory**\n\n"
+                                f"{catalog_line}\n\n{views} views · "
+                                f"{timestamps} timestamps · {cloud_points} context points\n\n"
+                                "Drag to orbit · scroll to zoom · click a coloured object · "
+                                "use **Focus selected object** for a stable close view"
+                            )
+                            overview_button = self._gui_add_button(gui, "Reset overview")
+                            if overview_button is not None:
+                                on_click = getattr(overview_button, "on_click", None)
+                                if callable(on_click):
+                                    with contextlib.suppress(Exception):
+
+                                        @on_click
+                                        def _(_event=None):
+                                            self._reset_view()
                 if self._live_rgb_enabled:
                     try:
                         with gui.add_folder("Live RGB"):
@@ -361,8 +721,10 @@ class PipelineViserVisualizer:
                         self._live_rgb_caption = None
                         self._live_rgb_display = None
                 try:
-                    with gui.add_folder("Last clicked object"):
-                        self._caption_display = gui.add_markdown("No object selected yet.")
+                    with gui.add_folder("Selected object"):
+                        self._caption_display = gui.add_markdown(
+                            "Click a coloured object to inspect its name, description and visual evidence."
+                        )
 
                         placeholder = np.zeros((64, 64, 3), dtype=np.uint8)
                         self._image_display = gui.add_image(
@@ -370,6 +732,16 @@ class PipelineViserVisualizer:
                             label="Object image",
                             format="jpeg",
                         )
+                        if self._presentation_mode:
+                            focus_button = self._gui_add_button(gui, "Focus selected object")
+                            if focus_button is not None:
+                                on_click = getattr(focus_button, "on_click", None)
+                                if callable(on_click):
+                                    with contextlib.suppress(Exception):
+
+                                        @on_click
+                                        def _(_event=None):
+                                            self._focus_selected_object()
                 except Exception:
                     self._caption_display = None
                     self._image_display = None
@@ -383,12 +755,18 @@ class PipelineViserVisualizer:
                     # Off-thread: a camera write can block until the client's
                     # first state message, and this callback must not stall the
                     # server's message loop (e.g. on a half-closed connection).
-                    threading.Thread(
-                        target=self._try_set_camera,
-                        args=(client,),
-                        kwargs={"position": home[0], "look_at": home[1]},
-                        daemon=True,
-                    ).start()
+                    def _set_initial_camera() -> None:
+                        # Wait for the browser's first camera-state packet. If
+                        # we write before it arrives, the client can restore
+                        # its default roll immediately afterwards.
+                        time.sleep(0.15)
+                        self._try_set_camera(
+                            client,
+                            position=home[0],
+                            look_at=home[1],
+                        )
+
+                    threading.Thread(target=_set_initial_camera, daemon=True).start()
 
         except Exception as exc:
             LOGGER.warning("Failed to start Viser server: %s", exc)
@@ -396,7 +774,8 @@ class PipelineViserVisualizer:
             return
 
         self._setup_filter_gui()
-        self._setup_query_gui()
+        if self._query_enabled:
+            self._setup_query_gui()
         self._setup_edit_gui()
 
     @property
@@ -487,12 +866,29 @@ class PipelineViserVisualizer:
             cols = None
         if cols is None:
             cols = np.full((pts.shape[0], 3), 0.55, dtype=np.float32)
-        self._server.scene.add_point_cloud(
-            name, points=pts, colors=cols, point_size=max(1.0e-4, float(point_size))
+        self._background_point_size = max(1.0e-4, float(point_size))
+        self._background_point_handle = self._server.scene.add_point_cloud(
+            name,
+            points=pts,
+            colors=cols,
+            point_size=self._background_point_size,
+            point_shape="circle",
+            point_shading="flat",
         )
+        if self._background_point_size_slider is not None:
+            with contextlib.suppress(Exception):
+                self._background_point_size_slider.value = self._background_point_size
         self._server.flush()
 
-    def add_trajectory(self, poses: np.ndarray | None, *, name: str = "/trajectory", axes_length: float = 0.15, axes_radius: float = 0.008) -> None:
+    def add_trajectory(
+        self,
+        poses: np.ndarray | None,
+        *,
+        name: str = "/trajectory",
+        axes_length: float = 0.15,
+        axes_radius: float = 0.008,
+        show_axes: bool = True,
+    ) -> None:
         """Draw the capture trajectory as one small coordinate frame per camera
         pose (for saved-state viewing, where no live frusta are streamed).
         *poses* is an (N, 4, 4) array of camera-to-world transforms."""
@@ -511,6 +907,21 @@ class PipelineViserVisualizer:
                 wxyzs = np.asarray(SO3.from_matrix(arr[:, :3, :3]).wxyz, dtype=np.float32).reshape(-1, 4)
         if wxyzs is None or wxyzs.shape[0] != positions.shape[0]:
             wxyzs = np.tile(np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32), (positions.shape[0], 1))
+        if positions.shape[0] >= 2:
+            with contextlib.suppress(Exception):
+                segments = np.stack([positions[:-1], positions[1:]], axis=1)
+                line_colors = np.tile(
+                    np.asarray([96, 207, 229], dtype=np.uint8), (segments.shape[0], 2, 1)
+                )
+                self._server.scene.add_line_segments(
+                    f"{name}/path",
+                    points=segments,
+                    colors=line_colors,
+                    line_width=1.5,
+                )
+        if not show_axes:
+            self._server.flush()
+            return
         with contextlib.suppress(Exception):
             self._server.scene.add_batched_axes(
                 name,
@@ -522,31 +933,35 @@ class PipelineViserVisualizer:
             self._server.flush()
 
     def set_home_view(self, points: np.ndarray | None) -> None:
-        """Frame *points* (Nx3) with an elevated 3/4 overview camera.
+        """Frame *points* (Nx3) with a scene-relative oblique overview.
 
         Applied to already-connected clients and to every client that connects
-        later, so a saved scene opens showing the whole scene instead of the
-        viser default near the origin. The vertical axis is inferred as the
-        AABB's smallest extent — scans are much wider than they are tall.
+        later. ``Reset overview`` reuses this exact stored preset.
         """
         if points is None or self._server is None:
             return
-        pts = np.asarray(points, dtype=np.float64).reshape(-1, 3)
-        pts = pts[np.isfinite(pts).all(axis=1)]
-        if pts.shape[0] < 2:
+        home = _scene_relative_home_camera(
+            points,
+            presentation_mode=self._presentation_mode,
+            world_up=(
+                getattr(self, "_world_up", (0.0, -1.0, 0.0))
+                if self._presentation_mode or getattr(self, "_world_up_explicit", False)
+                else None
+            ),
+        )
+        if home is None:
             return
-        # Percentile bounds so sparse range outliers don't inflate the framing.
-        mins, maxs = np.percentile(pts, 2.0, axis=0), np.percentile(pts, 98.0, axis=0)
-        center = (mins + maxs) / 2.0
-        extent = maxs - mins
-        up_axis = int(np.argmin(extent))
-        horiz = [i for i in range(3) if i != up_axis]
-        dist = max(float(np.linalg.norm(extent)) * 0.55, 2.0)
-        offset = np.zeros(3)
-        offset[horiz[0]] = 0.50 * dist
-        offset[horiz[1]] = -0.40 * dist
-        offset[up_axis] = 0.70 * dist
-        self._home_camera = ((center + offset).astype(np.float32), center.astype(np.float32))
+        # Keep an immutable-by-convention snapshot.  Some camera backends keep
+        # the assigned NumPy object by reference, so sharing these arrays would
+        # let later interactive camera motion silently corrupt the reset pose.
+        self._home_camera = (home[0].copy(), home[1].copy())
+        self._apply_home_view()
+
+    def _apply_home_view(self) -> None:
+        """Apply the stored home preset to every currently connected client."""
+
+        if self._home_camera is None or self._server is None:
+            return
         clients: dict = {}
         with contextlib.suppress(Exception):
             clients = self._server.get_clients()
@@ -1494,13 +1909,7 @@ class PipelineViserVisualizer:
                 with self._server.atomic():
                     self._update_gaussians(self._latest_scene_state)
                 self._server.flush()
-        home = self._home_camera
-        if home is not None and self._server is not None:
-            clients: dict = {}
-            with contextlib.suppress(Exception):
-                clients = self._server.get_clients()
-            for client in clients.values():
-                self._try_set_camera(client, position=home[0], look_at=home[1])
+        self._apply_home_view()
         self._gui_set_markdown(self._query_results_display, "_View reset._")
 
     def _jump_to_object_id(self, target_id: int) -> None:
@@ -1548,9 +1957,37 @@ class PipelineViserVisualizer:
         initial = float(min(max(initial, 0.1), ceiling))
         try:
             with gui.add_folder("Filters"):
+                if self._presentation_mode:
+                    if self._geometry_layers_available:
+                        layer_options = (
+                            "Presentation",
+                            "Strict metric",
+                            "Metric + compound probable",
+                            "Diagnostics",
+                        )
+                        layer_initial = "Presentation"
+                    else:
+                        layer_options = (
+                            "Confirmed + probable",
+                            "Confirmed only",
+                            "All metric geometry",
+                        )
+                        layer_initial = "Confirmed + probable"
+                    self._semantic_layer_dropdown = gui.add_dropdown(
+                        "Semantic layer", options=layer_options, initial_value=layer_initial
+                    )
                 self._max_side_slider = self._gui_add_slider(
                     gui, "Max box side (m)", min_v=0.1, max_v=ceiling, step=0.1, initial=initial
                 )
+                if self._presentation_mode:
+                    self._background_point_size_slider = self._gui_add_slider(
+                        gui,
+                        "Scene point size (m)",
+                        min_v=0.004,
+                        max_v=0.030,
+                        step=0.001,
+                        initial=self._background_point_size,
+                    )
         except Exception:
             return
 
@@ -1568,6 +2005,42 @@ class PipelineViserVisualizer:
                 def _(_event=None):
                     self._handle_max_side_changed()
 
+        semantic_dropdown = self._semantic_layer_dropdown
+        if semantic_dropdown is not None:
+            on_semantic_update = getattr(semantic_dropdown, "on_update", None)
+            if callable(on_semantic_update):
+                with contextlib.suppress(Exception):
+
+                    @on_semantic_update
+                    def _(_event=None):
+                        self._handle_semantic_layer_changed()
+
+        point_slider = self._background_point_size_slider
+        if point_slider is not None:
+            on_point_update = getattr(point_slider, "on_update", None)
+            if callable(on_point_update):
+                with contextlib.suppress(Exception):
+
+                    @on_point_update
+                    def _(_event=None):
+                        self._handle_background_point_size_changed()
+
+    def _handle_background_point_size_changed(self) -> None:
+        if self._background_point_size_slider is None:
+            return
+        try:
+            value = float(getattr(self._background_point_size_slider, "value"))
+        except Exception:
+            return
+        self._background_point_size = float(np.clip(value, 0.004, 0.030))
+        handle = self._background_point_handle
+        if handle is not None and hasattr(handle, "point_size"):
+            with contextlib.suppress(Exception):
+                handle.point_size = self._background_point_size
+        if self._server is not None:
+            with contextlib.suppress(Exception):
+                self._server.flush()
+
     def _handle_max_side_changed(self) -> None:
         if self._max_side_slider is None:
             return
@@ -1583,6 +2056,28 @@ class PipelineViserVisualizer:
             with self._server.atomic():
                 self._update_gaussians(self._latest_scene_state)
             self._server.flush()
+
+    def _handle_semantic_layer_changed(self) -> None:
+        if self._server is None or self._latest_scene_state is None:
+            return
+        with contextlib.suppress(Exception):
+            with self._server.atomic():
+                self._update_gaussians(self._latest_scene_state)
+            self._server.flush()
+
+    def _semantic_tier_is_visible(self, tier: str) -> bool:
+        value = "Confirmed + probable"
+        if self._semantic_layer_dropdown is not None:
+            with contextlib.suppress(Exception):
+                value = str(self._semantic_layer_dropdown.value)
+        if value in {"Presentation", "Strict metric", "Metric + compound probable", "Diagnostics"}:
+            return True
+        normalized = str(tier or "confirmed").strip().lower()
+        if value == "Confirmed only":
+            return normalized == "confirmed"
+        if value == "All metric geometry":
+            return normalized != "inactive"
+        return normalized in {"confirmed", "probable"}
 
     def _setup_edit_gui(self) -> None:
         """Set up interactive editing GUI in Viser."""
@@ -2188,26 +2683,36 @@ class PipelineViserVisualizer:
 
         return pos, look
 
-    @staticmethod
-    def _try_set_camera(client: object, *, position: np.ndarray, look_at: np.ndarray) -> None:
+    def _try_set_camera(self, client: object, *, position: np.ndarray, look_at: np.ndarray) -> None:
         cam = getattr(client, "camera", None)
         if cam is None:
             return
+        if self._presentation_mode or getattr(self, "_world_up_explicit", False):
+            with contextlib.suppress(Exception):
+                cam.fov = math.radians(52.0)
         # Best-effort across viser versions.
         with contextlib.suppress(Exception):
             if hasattr(cam, "position"):
-                cam.position = position
+                cam.position = np.asarray(position, dtype=np.float32).copy()
             elif hasattr(cam, "xyz"):
-                cam.xyz = position
+                cam.xyz = np.asarray(position, dtype=np.float32).copy()
         with contextlib.suppress(Exception):
             if hasattr(cam, "look_at"):
                 la = getattr(cam, "look_at")
                 if callable(la):
-                    la(look_at)
+                    la(np.asarray(look_at, dtype=np.float32).copy())
                 else:
-                    cam.look_at = look_at
+                    cam.look_at = np.asarray(look_at, dtype=np.float32).copy()
             elif hasattr(cam, "target"):
-                cam.target = look_at
+                cam.target = np.asarray(look_at, dtype=np.float32).copy()
+        if self._presentation_mode:
+            # Set world-up last. Viser recomputes camera orientation when
+            # `look_at` changes, so assigning up first can leave the opening
+            # view with a 90-degree roll in some browser/client versions.
+            with contextlib.suppress(Exception):
+                cam.up_direction = np.asarray(
+                    getattr(self, "_world_up", (0.0, -1.0, 0.0)), dtype=np.float32
+                ).copy()
 
     def _get_robot_position(
         self,
@@ -2296,6 +2801,12 @@ class PipelineViserVisualizer:
     def _row_value(rows: object, idx: int, default: object = None) -> object:
         if isinstance(rows, (list, tuple)) and 0 <= idx < len(rows):
             return rows[idx]
+        if isinstance(rows, torch.Tensor) and rows.ndim > 0 and 0 <= idx < int(rows.shape[0]):
+            value = rows[idx]
+            return value.item() if value.numel() == 1 else value
+        if isinstance(rows, np.ndarray) and rows.ndim > 0 and 0 <= idx < int(rows.shape[0]):
+            value = rows[idx]
+            return value.item() if np.asarray(value).size == 1 else value
         return default
 
     @staticmethod
@@ -2348,7 +2859,126 @@ class PipelineViserVisualizer:
         supercategory: str,
         attributes: list[str],
         decision: str,
+        observations: int = 0,
+        evidence_tier: str = "",
+        review_confidence: float = 0.0,
+        semantic_tier: str = "",
+        camera_distance_m: float | None = None,
+        geometry_status: str = "",
+        geometry_inside_rate: float = 0.0,
+        geometry_box_iou: float = 0.0,
+        geometry_box_support_rate: float = 0.0,
+        geometry_voxel_inside_rate: float = 0.0,
+        geometry_orientation_confidence: float = 0.0,
+        geometry_orientation_mode: str = "",
+        geometry_up_axis: str = "",
+        geometry_gravity_tilt_degrees: float | None = None,
+        assembly_member_ids: object = None,
+        assembly_containment: float = 0.0,
+        assembly_shared_frames: int = 0,
+        box_center: Sequence[float] | np.ndarray | None = None,
+        box_dimensions: Sequence[float] | np.ndarray | None = None,
+        box_wxyz: Sequence[float] | np.ndarray | None = None,
+        compound_boxes: object = None,
     ) -> str:
+        if self._presentation_mode:
+            # Model responses can contain Markdown heading markers. The card
+            # creates its own heading, so strip transport formatting here.
+            name = category.strip().lstrip("#").strip() or "object"
+            evidence: list[str] = []
+            if observations > 0:
+                evidence.append(f"{int(observations)} observations")
+            if evidence_tier:
+                evidence.append(str(evidence_tier).replace("_", " "))
+            if review_confidence > 0.0:
+                evidence.append(f"VLM {review_confidence:.0%}")
+            if semantic_tier:
+                evidence.insert(0, f"semantic {semantic_tier.replace('_', ' ')}")
+            if camera_distance_m is not None and math.isfinite(camera_distance_m):
+                evidence.append(f"nearest {camera_distance_m:.2f} m")
+            validation: list[str] = []
+            geometry_status_normalized = str(geometry_status or "").strip().lower()
+            normalized_compound_boxes = _normalise_compound_boxes(compound_boxes)
+            is_compound = bool(normalized_compound_boxes)
+            is_assembly = geometry_status_normalized.startswith("assembly_")
+            member_ids = self._string_list_value(assembly_member_ids)
+            if is_assembly and member_ids:
+                evidence.append("members " + ", ".join(f"#{value}" for value in member_ids))
+            if is_assembly and assembly_shared_frames > 0:
+                validation.append(f"nested-mask views {int(assembly_shared_frames)}")
+            if is_assembly and assembly_containment > 0.0:
+                validation.append(f"mask containment {assembly_containment:.0%}")
+            if is_assembly and geometry_voxel_inside_rate > 0.0:
+                validation.append(f"union voxel coverage {geometry_voxel_inside_rate:.0%}")
+            if is_assembly and geometry_orientation_confidence > 0.0:
+                validation.append(f"yaw {geometry_orientation_confidence:.0%}")
+            if geometry_status == "geometry_pass" and geometry_inside_rate > 0.0:
+                validation.append(f"centre {geometry_inside_rate:.0%}")
+            if geometry_status == "geometry_pass" and geometry_box_iou > 0.0:
+                validation.append(f"OBB IoU {geometry_box_iou:.0%}")
+            if geometry_status == "geometry_pass" and geometry_box_support_rate > 0.0:
+                validation.append(f"supported views {geometry_box_support_rate:.0%}")
+            if geometry_status == "geometry_pass" and geometry_voxel_inside_rate > 0.0:
+                validation.append(f"voxel agreement {geometry_voxel_inside_rate:.0%}")
+            if geometry_status == "geometry_pass" and geometry_orientation_confidence > 0.0:
+                confidence_label = "yaw" if geometry_orientation_mode == "gravity_yaw" else "rotation"
+                validation.append(f"{confidence_label} {geometry_orientation_confidence:.0%}")
+            lines = [f"## {name}", "", description.strip() or "No description available."]
+            try:
+                center_values = np.asarray(box_center, dtype=float).reshape(3)
+                dimension_values = np.asarray(box_dimensions, dtype=float).reshape(3)
+                quaternion_values = np.asarray(box_wxyz, dtype=float).reshape(4)
+            except Exception:
+                center_values = dimension_values = quaternion_values = np.asarray([])
+            if is_compound:
+                if len(normalized_compound_boxes) == 1:
+                    unified = normalized_compound_boxes[0]
+                    unified_dimensions = np.asarray(unified["dimensions_m"], dtype=float)
+                    unified_label = " × ".join(f"{value:.2f}" for value in unified_dimensions)
+                    lines += ["", f"- **Metric unified OBB L×W×H:** {unified_label} m"]
+                else:
+                    lines += ["", f"- **Metric compound OBB:** {len(normalized_compound_boxes)} parts"]
+                    for child_index, child in enumerate(normalized_compound_boxes, start=1):
+                        child_dimensions = np.asarray(child["dimensions_m"], dtype=float)
+                        child_label = " × ".join(f"{value:.2f}" for value in child_dimensions)
+                        lines += [f"  - part {child_index}: {child_label} m"]
+                compound_center = np.mean(
+                    np.stack([np.asarray(child["center_m"], dtype=float) for child in normalized_compound_boxes]),
+                    axis=0,
+                )
+                center_title = "Position XYZ" if len(normalized_compound_boxes) == 1 else "Compound centre XYZ"
+                lines += [f"- **{center_title}:** " + ", ".join(f"{value:.2f}" for value in compound_center) + " m"]
+                validation.append(
+                    "audited unified multi-view fit"
+                    if len(normalized_compound_boxes) == 1
+                    else "raw multi-view compound fit"
+                )
+            elif dimension_values.size == 3 and np.isfinite(dimension_values).all():
+                if is_assembly:
+                    dimension_label = "Metric assembly OBB L×W×H"
+                else:
+                    dimension_label = "Metric OBB L×W×H" if geometry_orientation_mode == "gravity_yaw" else "Metric OBB"
+                lines += ["", f"- **{dimension_label}:** " + " × ".join(f"{value:.2f}" for value in dimension_values) + " m"]
+            if not is_compound and center_values.size == 3 and np.isfinite(center_values).all():
+                lines += ["- **Position XYZ:** " + ", ".join(f"{value:.2f}" for value in center_values) + " m"]
+            if not is_compound and geometry_orientation_mode == "gravity_yaw":
+                axis = (geometry_up_axis or "y").upper()
+                tilt = (
+                    f"; residual tilt {geometry_gravity_tilt_degrees:.1f}°"
+                    if geometry_gravity_tilt_degrees is not None
+                    and math.isfinite(geometry_gravity_tilt_degrees)
+                    else ""
+                )
+                lines += [f"- **Orientation:** floor-aligned yaw · world {axis} up{tilt}"]
+            if not is_compound and quaternion_values.size == 4 and np.isfinite(quaternion_values).all():
+                lines += ["- **Rotation WXYZ:** " + ", ".join(f"{value:.3f}" for value in quaternion_values)]
+            if evidence:
+                lines += ["", "**Evidence**", "", " · ".join(evidence)]
+            if validation:
+                lines += ["", "**Validation**", "", " · ".join(validation)]
+            if attributes:
+                lines += ["", "**Attributes:** " + ", ".join(attributes)]
+            return "\n".join(lines)
         payload = {
             "category": category,
             "supercategory": supercategory,
@@ -2453,12 +3083,52 @@ class PipelineViserVisualizer:
         object_key_attributes = scene_state.get("object_key_attributes") or []
         object_det_maps = scene_state.get("object_detection_category_conf") or []
         object_images_all = scene_state.get("rgb_observations") or []
+        object_evidence_counts = scene_state.get("object_evidence_count")
+        object_evidence_tiers = scene_state.get("object_evidence_tier") or []
+        object_review_confidences = scene_state.get("object_review_confidence")
+        object_semantic_tiers = scene_state.get("object_semantic_tier") or []
+        object_camera_distances = scene_state.get("object_camera_distance_m")
+        object_geometry_statuses = scene_state.get("object_geometry_status") or []
+        object_display_statuses = scene_state.get("object_display_status") or []
+        object_geometry_inside_rates = scene_state.get("object_geometry_inside_rate")
+        object_geometry_box_ious = scene_state.get("object_geometry_projected_box_iou")
+        object_geometry_box_support_rates = scene_state.get("object_geometry_box_support_rate")
+        object_geometry_voxel_inside_rates = scene_state.get("object_geometry_voxel_inside_rate")
+        object_geometry_orientation_confidences = scene_state.get("object_geometry_orientation_confidence")
+        object_geometry_orientation_modes = scene_state.get("object_geometry_orientation_mode") or []
+        object_geometry_up_axis = self._string_value(scene_state.get("object_geometry_up_axis") or "")
+        object_geometry_gravity_tilts = scene_state.get("object_geometry_gravity_tilt_degrees")
+        object_assembly_member_ids = scene_state.get("object_assembly_member_ids") or []
+        object_assembly_containments = scene_state.get("object_assembly_containment")
+        object_assembly_shared_frames = scene_state.get("object_assembly_shared_frames")
+        object_compound_boxes_all = scene_state.get("object_compound_boxes") or []
+        object_consensus_points_all = scene_state.get("object_geometry_consensus_points") or []
 
         if active is None or means is None or cov6 is None:
             return
 
-        active_mask = _to_numpy(active).astype(bool)
-        if active_mask.size == 0 or not active_mask.any():
+        base_active_mask = _to_numpy(active).astype(bool)
+        render_mask = base_active_mask
+        geometry_layer = ""
+        if self._semantic_layer_dropdown is not None:
+            with contextlib.suppress(Exception):
+                geometry_layer = str(self._semantic_layer_dropdown.value)
+        if self._geometry_layers_available and geometry_layer in {
+            "Presentation",
+            "Strict metric",
+            "Metric + compound probable",
+            "Diagnostics",
+        }:
+            render_mask = _geometry_layer_render_mask(
+                base_active_mask,
+                object_semantic_tiers,
+                object_geometry_statuses,
+                object_compound_boxes_all,
+                object_consensus_points_all,
+                geometry_layer,
+                display_statuses=object_display_statuses,
+            )
+        if render_mask.size == 0 or not render_mask.any():
             if self._gaussian_handle is not None:
                 self._gaussian_handle.remove()
                 self._gaussian_handle = None
@@ -2468,6 +3138,14 @@ class PipelineViserVisualizer:
                 with contextlib.suppress(Exception):
                     handle.remove()
             self._object_cube_handles = {}
+            for handle in self._object_compound_cube_handles.values():
+                with contextlib.suppress(Exception):
+                    handle.remove()
+            self._object_compound_cube_handles = {}
+            for handle in self._object_compound_label_handles.values():
+                with contextlib.suppress(Exception):
+                    handle.remove()
+            self._object_compound_label_handles = {}
             if self._object_voxel_cloud_handle is not None:
                 with contextlib.suppress(Exception):
                     self._object_voxel_cloud_handle.remove()
@@ -2475,31 +3153,57 @@ class PipelineViserVisualizer:
 
             self._latest_ids = None
             self._latest_caption_edit_texts = None
+            self._latest_compound_boxes = None
             return
 
-        means_np = _to_numpy(means)[active_mask]
-        cov_np = self._cov6_to_covariance(_to_numpy(cov6)[active_mask])
+        means_np = _to_numpy(means)[render_mask]
+        cov_np = self._cov6_to_covariance(_to_numpy(cov6)[render_mask])
         box_dimensions = self._object_box_dimensions_from_covariances(cov_np)
 
         if object_ids is None:
             ids_np = np.arange(means_np.shape[0], dtype=int)
         else:
-            ids_np = _to_numpy(object_ids)[active_mask].astype(int)
+            ids_np = _to_numpy(object_ids)[render_mask].astype(int)
 
         # Metadata preparation
-        active_indices_all = np.nonzero(active_mask)[0]
+        active_indices_all = np.nonzero(render_mask)[0]
         box_centers, box_dimensions = self._object_box_geometry_from_voxels(
             scene_state,
             active_indices_all=active_indices_all,
             fallback_centers=means_np.astype(np.float32),
             fallback_dimensions=box_dimensions,
         )
+        box_wxyz = np.zeros((means_np.shape[0], 4), dtype=np.float32)
+        box_wxyz[:, 0] = 1.0
+        # Geometry-refined presentation states provide robust RGB-D quantile
+        # boxes explicitly. Prefer them over covariance-derived display boxes.
+        refined_centers = scene_state.get("object_box_centers_m")
+        refined_dimensions = scene_state.get("object_box_dimensions_m")
+        refined_wxyz = scene_state.get("object_box_wxyz")
+        if self._presentation_mode and refined_centers is not None and refined_dimensions is not None:
+            with contextlib.suppress(Exception):
+                centers_candidate = _to_numpy(refined_centers)[render_mask].astype(np.float32, copy=False)
+                dimensions_candidate = _to_numpy(refined_dimensions)[render_mask].astype(np.float32, copy=False)
+                valid = (
+                    np.isfinite(centers_candidate).all(axis=1)
+                    & np.isfinite(dimensions_candidate).all(axis=1)
+                    & (dimensions_candidate > 0.0).all(axis=1)
+                )
+                box_centers[valid] = centers_candidate[valid]
+                box_dimensions[valid] = dimensions_candidate[valid]
+                if refined_wxyz is not None:
+                    orientations_candidate = _to_numpy(refined_wxyz)[render_mask].astype(np.float32, copy=False)
+                    norms = np.linalg.norm(orientations_candidate, axis=1)
+                    valid_orientation = valid & np.isfinite(orientations_candidate).all(axis=1) & (norms > 1.0e-6)
+                    box_wxyz[valid_orientation] = orientations_candidate[valid_orientation] / norms[valid_orientation, None]
         captions = []
         caption_edit_texts = []
         is_clear_by_idx = []
         is_visible_by_idx = []
         has_caption_by_idx = []
         images = []
+        compound_boxes_by_idx: list[list[dict]] = []
+        labels_by_idx: list[str] = []
 
         # Map image_id -> on-disk reference so click-to-inspect can fall back
         # to the object's anchor view when live crops are absent (saved graphs).
@@ -2530,11 +3234,21 @@ class PipelineViserVisualizer:
             category = self._string_value(self._row_value(object_categories, obj_idx_all, ""))
             supercategory = self._string_value(self._row_value(object_supercategories, obj_idx_all, ""))
             key_attributes = self._string_list_value(self._row_value(object_key_attributes, obj_idx_all, []))
+            compound_boxes = _normalise_compound_boxes(
+                self._row_value(object_compound_boxes_all, obj_idx_all, [])
+            )
+            compound_boxes_by_idx.append(compound_boxes)
+            labels_by_idx.append(category or caption_text.strip().split("\n", 1)[0] or "object")
             decision = self._string_value(self._row_value(object_decisions, obj_idx_all, "")).lower()
             if decision not in {"keep", "drop"}:
                 decision = "keep" if (caption_text.strip() or category or supercategory or key_attributes) else ""
             is_clear = decision != "drop"
             is_visible = True
+            semantic_tier = self._string_value(
+                self._row_value(object_semantic_tiers, obj_idx_all, "confirmed")
+            )
+            if not self._semantic_tier_is_visible(semantic_tier):
+                is_visible = False
             det_map = object_det_maps[obj_idx_all] if 0 <= obj_idx_all < len(object_det_maps) else {}
             det_keys = " ".join(str(k) for k in det_map.keys()) if isinstance(det_map, dict) else ""
             if self._object_text_is_excluded(caption_text, category, supercategory, " ".join(key_attributes), det_keys):
@@ -2545,6 +3259,41 @@ class PipelineViserVisualizer:
                 supercategory=supercategory,
                 attributes=key_attributes,
                 decision=decision,
+                observations=int(self._row_value(object_evidence_counts, obj_idx_all, 0) or 0),
+                evidence_tier=self._string_value(self._row_value(object_evidence_tiers, obj_idx_all, "")),
+                review_confidence=float(self._row_value(object_review_confidences, obj_idx_all, 0.0) or 0.0),
+                semantic_tier=semantic_tier,
+                camera_distance_m=float(self._row_value(object_camera_distances, obj_idx_all, float("nan"))),
+                geometry_status=self._string_value(self._row_value(object_geometry_statuses, obj_idx_all, "")),
+                geometry_inside_rate=float(self._row_value(object_geometry_inside_rates, obj_idx_all, 0.0) or 0.0),
+                geometry_box_iou=float(self._row_value(object_geometry_box_ious, obj_idx_all, 0.0) or 0.0),
+                geometry_box_support_rate=float(
+                    self._row_value(object_geometry_box_support_rates, obj_idx_all, 0.0) or 0.0
+                ),
+                geometry_voxel_inside_rate=float(
+                    self._row_value(object_geometry_voxel_inside_rates, obj_idx_all, 0.0) or 0.0
+                ),
+                geometry_orientation_confidence=float(
+                    self._row_value(object_geometry_orientation_confidences, obj_idx_all, 0.0) or 0.0
+                ),
+                geometry_orientation_mode=self._string_value(
+                    self._row_value(object_geometry_orientation_modes, obj_idx_all, "")
+                ),
+                geometry_up_axis=object_geometry_up_axis,
+                geometry_gravity_tilt_degrees=float(
+                    self._row_value(object_geometry_gravity_tilts, obj_idx_all, float("nan"))
+                ),
+                assembly_member_ids=self._row_value(object_assembly_member_ids, obj_idx_all, []),
+                assembly_containment=float(
+                    self._row_value(object_assembly_containments, obj_idx_all, 0.0) or 0.0
+                ),
+                assembly_shared_frames=int(
+                    self._row_value(object_assembly_shared_frames, obj_idx_all, 0) or 0
+                ),
+                box_center=box_centers[idx],
+                box_dimensions=box_dimensions[idx],
+                box_wxyz=box_wxyz[idx],
+                compound_boxes=compound_boxes,
             )
             captions.append(caption_json)
             caption_edit_texts.append(caption_text)
@@ -2554,6 +3303,10 @@ class PipelineViserVisualizer:
             images.append(object_images_all[obj_idx_all] if 0 <= obj_idx_all < len(object_images_all) else None)
 
         self._latest_ids = ids_np
+        self._latest_box_centers = box_centers.astype(np.float32, copy=True)
+        self._latest_box_dimensions = box_dimensions.astype(np.float32, copy=True)
+        self._latest_box_wxyz = box_wxyz.astype(np.float32, copy=True)
+        self._latest_compound_boxes = compound_boxes_by_idx
         self._latest_captions = captions
         self._latest_caption_edit_texts = caption_edit_texts
         self._latest_images = images
@@ -2562,9 +3315,13 @@ class PipelineViserVisualizer:
         # Colors
         colors = np.zeros((means_np.shape[0], 3), dtype=np.uint8)
         for idx, obj_id in enumerate(ids_np):
-            if int(obj_id) not in self._id_to_color:
+            if self._presentation_mode:
+                colors[idx] = self._PRESENTATION_PALETTE[int(obj_id) % len(self._PRESENTATION_PALETTE)]
+            elif int(obj_id) not in self._id_to_color:
                 self._id_to_color[int(obj_id)] = self._rng.integers(low=0, high=255, size=(3,), dtype=np.uint8)
-            colors[idx] = self._id_to_color[int(obj_id)]
+                colors[idx] = self._id_to_color[int(obj_id)]
+            else:
+                colors[idx] = self._id_to_color[int(obj_id)]
 
         is_locked_list = scene_state.get("is_locked") or []
         is_locked_by_idx = [
@@ -2596,17 +3353,29 @@ class PipelineViserVisualizer:
             is_locked_by_idx,
             is_clear_by_idx,
             dimensions=box_dimensions,
+            orientations=box_wxyz,
             has_caption_by_idx=has_caption_by_idx,
             visible_by_idx=is_visible_by_idx,
+        )
+        self._update_compound_cubes(
+            ids=ids_np,
+            colors=colors,
+            boxes_by_idx=compound_boxes_by_idx,
+            labels=labels_by_idx,
+            visible_by_idx=is_visible_by_idx,
+            is_clear_by_idx=is_clear_by_idx,
         )
         self._update_object_voxel_cloud(
             scene_state,
             active_indices_all=active_indices_all,
             ids=ids_np,
             colors=colors,
+            centers=box_centers,
             dimensions=box_dimensions,
+            orientations=box_wxyz,
             is_clear_by_idx=is_clear_by_idx,
             visible_by_idx=is_visible_by_idx,
+            compound_boxes_by_idx=compound_boxes_by_idx,
         )
 
     def _object_box_dimensions_from_covariances(self, covariances: np.ndarray) -> np.ndarray:
@@ -2614,9 +3383,11 @@ class PipelineViserVisualizer:
             return np.zeros((0, 3), dtype=np.float32)
         diag = np.diagonal(covariances, axis1=1, axis2=2).astype(np.float32, copy=False)
         diag = np.clip(diag, 1.0e-4, None)
-        # A 5-sigma box is wide enough to read as an object extent without
-        # letting noisy covariance tails dominate the scene view.
-        dims = 5.0 * np.sqrt(diag)
+        # Saved covariances include multi-view depth tails. Five sigma makes
+        # presentation boxes visibly float across neighbouring objects; three
+        # sigma is still conservative while remaining spatially readable.
+        sigma_scale = 3.0 if self._presentation_mode else 5.0
+        dims = sigma_scale * np.sqrt(diag)
         return np.maximum(dims, 0.08).astype(np.float32, copy=False)
 
     def _update_image_poses(self, scene_state: dict) -> None:
@@ -3319,9 +4090,12 @@ class PipelineViserVisualizer:
         active_indices_all: np.ndarray,
         ids: np.ndarray,
         colors: np.ndarray,
+        centers: np.ndarray,
         dimensions: np.ndarray,
+        orientations: np.ndarray,
         is_clear_by_idx: list[bool],
         visible_by_idx: list[bool],
+        compound_boxes_by_idx: list[list[dict]] | None = None,
     ) -> None:
         if self._server is None:
             return
@@ -3337,10 +4111,19 @@ class PipelineViserVisualizer:
             _clear_voxel_handles()
             return
         arrays = self._object_voxel_arrays(scene_state)
-        if arrays is None:
+        consensus_rows = scene_state.get("object_geometry_consensus_points") or []
+        has_consensus = any(
+            _finite_consensus_points(row).shape[0] > 0 for row in consensus_rows
+        )
+        if arrays is None and not has_consensus:
             _clear_voxel_handles()
             return
-        flat, offsets, levels = arrays
+        if arrays is None:
+            flat = np.zeros((0,), dtype=np.int64)
+            offsets = np.zeros((0,), dtype=np.int64)
+            levels = np.zeros((0,), dtype=np.int64)
+        else:
+            flat, offsets, levels = arrays
 
         focus = self._focus_object_ids  # None => everything is "in focus"
 
@@ -3352,31 +4135,82 @@ class PipelineViserVisualizer:
         count = min(len(active_indices_all), len(ids), colors.shape[0], dimensions.shape[0])
         for idx in range(count):
             obj_idx = int(active_indices_all[idx])
-            if obj_idx + 1 >= offsets.shape[0] or obj_idx >= levels.shape[0]:
-                continue
             if idx < len(visible_by_idx) and not bool(visible_by_idx[idx]):
                 continue
             if idx < len(is_clear_by_idx) and self._hide_unclear_object_boxes and not bool(is_clear_by_idx[idx]):
                 continue
-            if self._object_dims_hidden_by_size(dimensions[idx]):
+            compound_boxes = (
+                compound_boxes_by_idx[idx]
+                if compound_boxes_by_idx is not None and idx < len(compound_boxes_by_idx)
+                else []
+            )
+            if compound_boxes:
+                if all(
+                    self._object_dims_hidden_by_size(np.asarray(box["dimensions_m"], dtype=np.float32))
+                    for box in compound_boxes
+                ):
+                    continue
+            elif self._object_dims_hidden_by_size(dimensions[idx]):
                 continue
 
             object_id = int(ids[idx])
             if focus is not None and object_id not in focus:
                 continue
 
-            start = int(offsets[obj_idx])
-            end = int(offsets[obj_idx + 1])
-            if start < 0 or end > flat.shape[0] or end <= start:
-                continue
-            points = self._sample_object_voxels(
-                flat,
-                obj_idx=obj_idx,
-                start=start,
-                end=end,
-                level=int(levels[obj_idx]),
-                object_id=object_id,
+            points = _finite_consensus_points(
+                self._row_value(consensus_rows, obj_idx, None)
             )
+            max_points = int(self._object_voxel_max_points_per_object)
+            if max_points > 0 and points.shape[0] > max_points:
+                rng = np.random.default_rng(object_id * 9176 + 13)
+                keep = rng.choice(points.shape[0], size=max_points, replace=False)
+                keep.sort()
+                points = points[keep]
+            if points.shape[0] == 0:
+                if obj_idx + 1 >= offsets.shape[0] or obj_idx >= levels.shape[0]:
+                    continue
+                start = int(offsets[obj_idx])
+                end = int(offsets[obj_idx + 1])
+                if start < 0 or end > flat.shape[0] or end <= start:
+                    continue
+                points = self._sample_object_voxels(
+                    flat,
+                    obj_idx=obj_idx,
+                    start=start,
+                    end=end,
+                    level=int(levels[obj_idx]),
+                    object_id=object_id,
+                )
+            if points.shape[0] == 0:
+                continue
+            if self._presentation_mode and idx < len(centers) and idx < len(orientations):
+                if compound_boxes:
+                    inside_any = np.zeros((points.shape[0],), dtype=bool)
+                    for box in compound_boxes:
+                        center = np.asarray(box["center_m"], dtype=np.float32)
+                        dims = np.asarray(box["dimensions_m"], dtype=np.float32)
+                        wxyz = np.asarray(box["wxyz"], dtype=np.float32)
+                        local = (points - center) @ _wxyz_to_matrix(wxyz)
+                        inside_any |= np.all(
+                            np.abs(local) <= 0.5 * np.maximum(dims, 0.08) + 0.025,
+                            axis=1,
+                        )
+                    points = points[inside_any]
+                else:
+                    center = np.asarray(centers[idx], dtype=np.float32)
+                    dims = np.asarray(dimensions[idx], dtype=np.float32)
+                    wxyz = np.asarray(orientations[idx], dtype=np.float32)
+                    if (
+                        center.shape == (3,)
+                        and dims.shape == (3,)
+                        and wxyz.shape == (4,)
+                        and np.isfinite(center).all()
+                        and np.isfinite(dims).all()
+                        and np.isfinite(wxyz).all()
+                    ):
+                        local = (points - center) @ _wxyz_to_matrix(wxyz)
+                        half = 0.5 * np.maximum(dims, 0.08) + 0.025
+                        points = points[np.all(np.abs(local) <= half, axis=1)]
             if points.shape[0] == 0:
                 continue
             keep_mask = self._view_depth_keep_mask(points)
@@ -3410,6 +4244,7 @@ class PipelineViserVisualizer:
         is_locked_by_idx: list[bool] | None = None,
         is_clear_by_idx: list[bool] | None = None,
         dimensions: np.ndarray | None = None,
+        orientations: np.ndarray | None = None,
         has_caption_by_idx: list[bool] | None = None,
         visible_by_idx: list[bool] | None = None,
     ) -> None:
@@ -3422,6 +4257,9 @@ class PipelineViserVisualizer:
         default_dimensions = np.array([0.5, 0.5, 0.5], dtype=np.float32)
         if dimensions is None or dimensions.shape != centers.shape:
             dimensions = np.tile(default_dimensions, (len(centers), 1))
+        default_orientation = np.asarray([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+        if orientations is None or orientations.shape != (len(centers), 4):
+            orientations = np.tile(default_orientation, (len(centers), 1))
         seen_ids: set[int] = set()
         if is_locked_by_idx is None:
             is_locked_by_idx = [False] * len(ids)
@@ -3447,6 +4285,11 @@ class PipelineViserVisualizer:
                         handle.remove()
                 continue
             dims = np.asarray(dimensions[idx], dtype=np.float32) if idx < len(dimensions) else default_dimensions
+            wxyz = np.asarray(orientations[idx], dtype=np.float32) if idx < len(orientations) else default_orientation
+            if wxyz.shape != (4,) or not np.isfinite(wxyz).all() or float(np.linalg.norm(wxyz)) <= 1.0e-6:
+                wxyz = default_orientation
+            else:
+                wxyz = wxyz / float(np.linalg.norm(wxyz))
             if dims.shape != (3,) or not np.all(np.isfinite(dims)):
                 dims = default_dimensions
             raw_dims = np.maximum(dims.astype(np.float32, copy=False), 0.0)
@@ -3513,7 +4356,10 @@ class PipelineViserVisualizer:
             has_caption = idx < len(has_caption_by_idx) and bool(has_caption_by_idx[idx])
             if is_locked:
                 rgb = np.clip((rgb.astype(np.float32) * 0.6 + 128 * 0.4), 0, 255).astype(np.uint8)
-            opacity = 0.8 if is_locked else (0.58 if has_caption else 0.30)
+            if self._presentation_mode:
+                opacity = 0.32 if has_caption else 0.16
+            else:
+                opacity = 0.8 if is_locked else (0.58 if has_caption else 0.30)
             # Query-role color coding: target #FFD45A, anchors #7FA8C6,
             # distractors #AA98BA.
             roles = self._query_roles if self._focus_object_ids is not None else None
@@ -3536,6 +4382,8 @@ class PipelineViserVisualizer:
                     handle.opacity = opacity
                     if hasattr(handle, "dimensions"):
                         handle.dimensions = dims
+                    if hasattr(handle, "wxyz"):
+                        handle.wxyz = wxyz
                     with contextlib.suppress(Exception):
                         handle.visible = True  # clear any earlier focus-hide
                     continue
@@ -3551,6 +4399,7 @@ class PipelineViserVisualizer:
                     name=box_name,
                     dimensions=dims,
                     position=center,
+                    wxyz=wxyz,
                     color=rgb,
                     opacity=opacity,
                     wireframe=False,
@@ -3574,9 +4423,183 @@ class PipelineViserVisualizer:
                 with contextlib.suppress(Exception):
                     handle.remove()
 
+    def _update_compound_cubes(
+        self,
+        *,
+        ids: np.ndarray,
+        colors: np.ndarray,
+        boxes_by_idx: list[list[dict]],
+        labels: list[str],
+        visible_by_idx: list[bool],
+        is_clear_by_idx: list[bool],
+    ) -> None:
+        """Render accepted compound geometry as children, never as one false OBB."""
+        if self._server is None:
+            return
+
+        for (object_id, _), handle in list(self._object_compound_cube_handles.items()):
+            if self._object_cube_handles.get(object_id) is handle:
+                self._object_cube_handles.pop(object_id, None)
+            with contextlib.suppress(Exception):
+                handle.remove()
+        self._object_compound_cube_handles.clear()
+        for handle in self._object_compound_label_handles.values():
+            with contextlib.suppress(Exception):
+                handle.remove()
+        self._object_compound_label_handles.clear()
+
+        count = min(len(ids), len(colors), len(boxes_by_idx))
+        for index in range(count):
+            children = boxes_by_idx[index]
+            if not children:
+                continue
+            object_id = int(ids[index])
+
+            # `_update_object_cubes` draws the legacy aggregate first. Remove it
+            # before adding children so a rejected union box can never reappear.
+            parent_handle = self._object_cube_handles.pop(object_id, None)
+            if parent_handle is not None:
+                with contextlib.suppress(Exception):
+                    parent_handle.remove()
+
+            if index >= len(visible_by_idx) or not bool(visible_by_idx[index]):
+                continue
+            if (
+                index < len(is_clear_by_idx)
+                and self._hide_unclear_object_boxes
+                and not bool(is_clear_by_idx[index])
+            ):
+                continue
+            if self._focus_object_ids is not None and object_id not in self._focus_object_ids:
+                continue
+
+            rgb = np.clip(colors[index], 0, 255).astype(np.uint8)
+            made: list[object] = []
+            for child_index, box in enumerate(children):
+                dimensions = np.asarray(box["dimensions_m"], dtype=np.float32)
+                center = np.asarray(box["center_m"], dtype=np.float32)
+                wxyz = np.asarray(box["wxyz"], dtype=np.float32)
+                if self._object_dims_hidden_by_size(dimensions):
+                    continue
+                if self._box_hidden_by_distance(center, dimensions):
+                    continue
+                if self._box_hidden_by_view_depth(center, dimensions):
+                    continue
+                try:
+                    handle = self._server.scene.add_box(
+                        name=f"/object_compounds/object_{object_id}/child_{child_index}",
+                        dimensions=np.clip(dimensions, 0.08, 6.0),
+                        position=center,
+                        wxyz=wxyz,
+                        color=rgb,
+                        opacity=0.30,
+                        wireframe=False,
+                    )
+
+                    @handle.on_click
+                    def _(_, captured_id=object_id):
+                        self._handle_object_click(captured_id)
+
+                    self._object_compound_cube_handles[(object_id, child_index)] = handle
+                    made.append(handle)
+                except Exception:
+                    continue
+
+            if not made:
+                continue
+            # Keep selection/query code compatible: the first child is the
+            # semantic parent object's interactive anchor.
+            self._object_cube_handles[object_id] = made[0]
+            # The selected-object label already identifies the compound.  A
+            # permanent label for every nearby compound overlaps at overview
+            # scale and makes the opening view harder to read.
+            if bool(getattr(self, "_presentation_mode", False)):
+                continue
+            label = re.sub(r"[*_`#]+", "", str(labels[index])).strip() or "object"
+            label_center = np.mean(
+                np.stack([np.asarray(box["center_m"], dtype=np.float32) for box in children]),
+                axis=0,
+            )
+            with contextlib.suppress(Exception):
+                self._object_compound_label_handles[object_id] = self._server.scene.add_label(
+                    name=f"/object_compounds/object_{object_id}/label",
+                    text=f"#{object_id}  {label}",
+                    position=label_center - np.asarray([0.0, 0.12, 0.0], dtype=np.float32),
+                    anchor="bottom-center",
+                    depth_test=False,
+                    font_screen_scale=0.9,
+                )
+
     # ------------------------------------------------------------------
     # Interaction Handling
     # ------------------------------------------------------------------
+    def _focus_selected_object(self) -> None:
+        """Isolate the selected object and fit its metric OBB in a stable view.
+
+        The orbit target is the OBB centre and the camera keeps the configured
+        world-up direction.  The viewing direction follows the user's current
+        horizontal bearing, so pressing the button does not unexpectedly jump
+        to the opposite side of the object.
+        """
+        if self._selected_object_id is None or self._latest_ids is None or self._server is None:
+            return
+        matches = np.where(self._latest_ids == int(self._selected_object_id))[0]
+        if matches.size == 0:
+            return
+        idx = int(matches[0])
+        if self._latest_box_centers is None or idx >= len(self._latest_box_centers):
+            return
+        if self._latest_box_dimensions is None or idx >= len(self._latest_box_dimensions):
+            return
+        center = np.asarray(self._latest_box_centers[idx], dtype=np.float32)
+        dimensions = np.asarray(self._latest_box_dimensions[idx], dtype=np.float32)
+        if center.shape != (3,) or dimensions.shape != (3,):
+            return
+        if not np.isfinite(center).all() or not np.isfinite(dimensions).all():
+            return
+
+        self._apply_focus({int(self._selected_object_id)})
+        compound_boxes = (
+            self._latest_compound_boxes[idx]
+            if self._latest_compound_boxes is not None and idx < len(self._latest_compound_boxes)
+            else []
+        )
+        if compound_boxes:
+            child_centers = np.stack(
+                [np.asarray(box["center_m"], dtype=np.float32) for box in compound_boxes]
+            )
+            center = child_centers.mean(axis=0)
+            radius = max(
+                0.35,
+                max(
+                    float(np.linalg.norm(child_center - center))
+                    + 0.5 * float(np.linalg.norm(np.asarray(box["dimensions_m"], dtype=np.float32)))
+                    for child_center, box in zip(child_centers, compound_boxes)
+                ),
+            )
+        else:
+            radius = max(0.35, 0.5 * float(np.linalg.norm(np.maximum(dimensions, 0.08))))
+        distance = max(2.0, 2.25 * radius)
+        clients: dict = {}
+        with contextlib.suppress(Exception):
+            clients = self._server.get_clients()
+        for client in clients.values():
+            current, _ = self._try_get_camera_state(client)
+            up = _normalise_world_up(
+                getattr(self, "_world_up", (0.0, -1.0, 0.0))
+            )
+            basis_first, _, _ = _ground_basis(up)
+            bearing = basis_first.astype(np.float32)
+            if current is not None:
+                candidate = np.asarray(current, dtype=np.float32) - center
+                candidate = candidate - float(np.dot(candidate, up)) * up
+                if np.isfinite(candidate).all() and float(np.linalg.norm(candidate)) > 1.0e-5:
+                    bearing = candidate
+            bearing = bearing / max(float(np.linalg.norm(bearing)), 1.0e-6)
+            horizontal_distance = distance * 0.94
+            position = center + bearing * horizontal_distance + up * (distance * 0.34)
+            self._try_set_camera(client, position=position, look_at=center)
+
     def _handle_object_click(self, obj_id: int) -> None:
         if self._latest_ids is None:
             return
@@ -3602,6 +4625,101 @@ class PipelineViserVisualizer:
         self._set_clicked_caption(obj_id, caption)
         self._set_clicked_image(img)
 
+        if self._presentation_mode and self._server is not None:
+            center = None
+            dims = None
+            wxyz = np.asarray([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+            compound_boxes = (
+                self._latest_compound_boxes[idx]
+                if self._latest_compound_boxes is not None and idx < len(self._latest_compound_boxes)
+                else []
+            )
+            if self._latest_box_centers is not None and idx < len(self._latest_box_centers):
+                center = np.asarray(self._latest_box_centers[idx], dtype=np.float32)
+            if self._latest_box_dimensions is not None and idx < len(self._latest_box_dimensions):
+                dims = np.asarray(self._latest_box_dimensions[idx], dtype=np.float32)
+            if self._latest_box_wxyz is not None and idx < len(self._latest_box_wxyz):
+                candidate = np.asarray(self._latest_box_wxyz[idx], dtype=np.float32)
+                if candidate.shape == (4,) and np.isfinite(candidate).all() and float(np.linalg.norm(candidate)) > 1.0e-6:
+                    wxyz = candidate / float(np.linalg.norm(candidate))
+
+            for handle in self._selected_highlight_box_handles:
+                with contextlib.suppress(Exception):
+                    handle.remove()
+            self._selected_highlight_box_handles = []
+            for attr in ("_selected_highlight_box_handle", "_selected_label_handle"):
+                handle = getattr(self, attr, None)
+                if handle is not None:
+                    with contextlib.suppress(Exception):
+                        handle.remove()
+                    setattr(self, attr, None)
+
+            selection_center = center
+            if compound_boxes:
+                selection_center = np.mean(
+                    np.stack([np.asarray(box["center_m"], dtype=np.float32) for box in compound_boxes]),
+                    axis=0,
+                )
+                for child_index, box in enumerate(compound_boxes):
+                    with contextlib.suppress(Exception):
+                        child_handle = self._server.scene.add_box(
+                            name=f"/selection/highlight_{child_index}",
+                            dimensions=np.clip(
+                                np.asarray(box["dimensions_m"], dtype=np.float32) * 1.05,
+                                0.10,
+                                6.2,
+                            ),
+                            position=np.asarray(box["center_m"], dtype=np.float32),
+                            wxyz=np.asarray(box["wxyz"], dtype=np.float32),
+                            color=(255, 190, 74),
+                            opacity=1.0,
+                            wireframe=True,
+                        )
+                        self._selected_highlight_box_handles.append(child_handle)
+            elif center is not None and dims is not None and np.isfinite(center).all() and np.isfinite(dims).all():
+                safe_dims = np.clip(dims * 1.08, 0.10, 6.2)
+                with contextlib.suppress(Exception):
+                    self._selected_highlight_box_handle = self._server.scene.add_box(
+                        name="/selection/highlight",
+                        dimensions=safe_dims,
+                        position=center,
+                        wxyz=wxyz,
+                        color=(255, 190, 74),
+                        opacity=1.0,
+                        wireframe=True,
+                    )
+
+            if selection_center is not None and np.isfinite(selection_center).all():
+                label_text = re.sub(r"[*_`#]+", "", str(caption).splitlines()[0]).strip()
+                with contextlib.suppress(Exception):
+                    self._selected_label_handle = self._server.scene.add_label(
+                        name="/selection/label",
+                        text=f"#{obj_id}  {label_text}",
+                        position=selection_center + 0.12 * np.asarray(
+                            getattr(self, "_world_up", (0.0, -1.0, 0.0)), dtype=np.float32
+                        ),
+                        anchor="bottom-center",
+                        depth_test=False,
+                        font_screen_scale=1.1,
+                    )
+                # Re-centre the orbit origin on the selected object without
+                # changing camera position. Rotation then feels predictable.
+                clients: dict = {}
+                with contextlib.suppress(Exception):
+                    clients = self._server.get_clients()
+                for client in clients.values():
+                    cam = getattr(client, "camera", None)
+                    if cam is None:
+                        continue
+                    with contextlib.suppress(Exception):
+                        cam.look_at = selection_center
+                    if self._presentation_mode or getattr(self, "_world_up_explicit", False):
+                        with contextlib.suppress(Exception):
+                            cam.up_direction = np.asarray(
+                                getattr(self, "_world_up", (0.0, -1.0, 0.0)),
+                                dtype=np.float32,
+                            ).copy()
+
         # Track selected object for editing
         self._selected_object_id = obj_id
         if self._edit_caption_input is not None:
@@ -3624,7 +4742,15 @@ class PipelineViserVisualizer:
 
     def _set_clicked_caption(self, obj_id: int, caption: str) -> None:
         safe_caption = caption if caption else "N/A"
-        text = f"**Object {obj_id}:** {safe_caption}"
+        if self._presentation_mode and safe_caption != "N/A":
+            lines = safe_caption.splitlines()
+            name = lines[0].lstrip("#").strip() if lines else "object"
+            remainder = "\n".join(lines[1:]).lstrip()
+            text = f"## Object #{obj_id} · {name}"
+            if remainder:
+                text += f"\n\n{remainder}"
+        else:
+            text = f"**Object {obj_id}:** {safe_caption}"
         self._set_caption_text(text)
 
     def _set_caption_text(self, text: str) -> None:

@@ -4,8 +4,8 @@ services:
       context: ..
       dockerfile: docker/Dockerfile
       args:
-        UID: ${UID:-1000}
-        GID: ${GID:-1000}
+        UID: ${FARM_UID:-1000}
+        GID: ${FARM_GID:-1000}
     image: scene_graph:latest
     container_name: scene_graph
     network_mode: host

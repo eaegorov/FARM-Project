@@ -1,0 +1,84 @@
+schema_version: farm.scene.v1
+scene_id: factory
+
+# Paths are resolved relative to this file.
+inputs:
+  colmap_model: ../../../data/factory_pinhole_multi/sparse/0
+  image_root: ../../../data/factory_pinhole_multi/images
+  gaussian_ply: ../../../data/factory_scene_last.ply
+output_root: ../../../output/farm_pipeline
+
+camera:
+  accepted_models: [PINHOLE]
+  require_virtual_pinhole: true
+
+camera_grouping:
+  mode: regex
+  pattern: '(?:^|/)(?P<camera>cam[0-9]+)_(?P<timestamp>[0-9]+)_(?P<view>center|yaw_left|yaw_right|pitch_up|pitch_down)[.](?:png|jpg|jpeg)$'
+  timestamp_group: timestamp
+  member_group: camera
+  view_group: view
+  required_members: [cam00, cam01]
+  # Validate the full five-view conversion, while selection.output_views keeps
+  # the proven temporally connected centre-view backbone for mapping.
+  required_views: [center, yaw_left, yaw_right, pitch_up, pitch_down]
+
+selection:
+  # Start below the final budget so the geometric repair pass can spend the
+  # remaining slots only on weak rotation/track-connectivity transitions.
+  # On this sequence it converges to 174 timestamps / 348 views / 0 bad edges.
+  target_timestamps: 160
+  max_timestamps: 175
+  rotation_weight_m_per_rad: 0.5
+  max_motion_gap: 1.35
+  min_shared_tracks: 20
+  min_overlap_ratio: 0.015
+  output_views: [center]
+
+resources:
+  profile: auto
+  gpu: "0"
+  model_manifest: ../models/farm_models.v1.json
+  secrets_file: ../../../secrets.json
+  render_resolution: 896
+  depth_batch_size: 1
+  mapping_batch_size: 2
+
+models:
+  segmentation: yoloe-v8l
+  visual_features: dinov3-vits16plus
+  caption: Qwen/Qwen3-VL-8B-Instruct
+  offline: true
+
+metric_scale:
+  required: true
+  source: rig_baseline
+  expected_baseline_m: 0.0295
+  baseline_tolerance_m: 0.001
+  baseline_members: [cam00, cam01]
+  baseline_view: center
+
+gravity:
+  required: true
+  # The rig traverses long loops with large roll/pitch changes, so camera-pose
+  # consensus is intentionally not used as a gravity sensor. This direction
+  # is the calibrated world-up of the COLMAP/3DGS coordinate frame and matches
+  # the previously validated factory viewer.
+  mode: vector
+  vector: [0.0, -1.0, 0.0]
+
+viewer:
+  host: 0.0.0.0
+  port: 8081
+  scene_point_size_m: 0.004
+  max_context_points: 1500000
+
+preflight:
+  image_check: all
+  require_3dgs_schema: true
+  min_registered_images: 2
+  min_sparse_points: 10
+  min_gaussians: 10
+  alignment:
+    sample_points: 65536
+    nearest_neighbor_points: 4096
