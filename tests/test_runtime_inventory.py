@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import ast
+import importlib
+import sys
 from pathlib import Path
 
 import pytest
@@ -15,6 +18,24 @@ from scripts.farm_runtime_inventory import (
 
 
 ROOT = Path(__file__).resolve().parents[1]
+CONTROL_PLANE_EXECUTION_FILES = (
+    ROOT / "scripts/farm_standard_stage.py",
+    ROOT / "scripts/farm_preflight.py",
+    ROOT / "src/farm_pipeline/preflight.py",
+    ROOT / "src/farm_pipeline/scene_config.py",
+    ROOT / "scripts/select_colmap_keyframes.py",
+    ROOT / "scripts/build_farm_run_report.py",
+)
+CONTROL_IMPORT_DISTRIBUTIONS = {
+    "PIL": "pillow",
+    "cv2": "opencv-python",
+    "matplotlib": "matplotlib",
+    "numpy": "numpy",
+    "pycolmap": "pycolmap",
+    "scipy": "scipy",
+    "torch": "torch",
+    "yaml": "pyyaml",
+}
 
 
 def test_parse_inventory_accepts_comments_and_index_directive(tmp_path: Path) -> None:
@@ -60,8 +81,14 @@ def test_committed_runtime_profiles_are_exact_and_prep_closure_is_present() -> N
     main = parse_inventory(ROOT / "requirements/main-runtime.observed.txt")
     assert control == {
         "huggingface-hub": "1.26.0",
+        "matplotlib": "3.10.9",
+        "numpy": "2.4.6",
+        "opencv-python": "4.11.0.86",
         "pillow": "11.0.0",
+        "pycolmap": "3.11.1",
         "pyyaml": "6.0.2",
+        "scipy": "1.15.1",
+        "torch": "2.12.0",
     }
     assert bridge_control == {
         "numpy": "1.26.0",
@@ -74,6 +101,28 @@ def test_committed_runtime_profiles_are_exact_and_prep_closure_is_present() -> N
         "opencv-python", "pillow", "pyyaml", "scipy", "matplotlib",
     } <= set(prep)
     assert {"torch", "numpy", "transformers", "ultralytics", "viser"} <= set(main)
+
+
+def test_control_plane_lock_covers_static_host_execution_imports() -> None:
+    roots: set[str] = set()
+    for path in CONTROL_PLANE_EXECUTION_FILES:
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                roots.update(alias.name.split(".", 1)[0] for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                roots.add(node.module.split(".", 1)[0])
+    third_party = roots - set(sys.stdlib_module_names) - {
+        "__future__", "farm_pipeline", "farm_runtime",
+    }
+    assert third_party == set(CONTROL_IMPORT_DISTRIBUTIONS)
+    control = parse_inventory(ROOT / "requirements/control-plane.lock.txt")
+    assert set(CONTROL_IMPORT_DISTRIBUTIONS.values()) <= set(control)
+
+
+@pytest.mark.parametrize("module_name", sorted(CONTROL_IMPORT_DISTRIBUTIONS))
+def test_control_plane_host_execution_import_smoke(module_name: str) -> None:
+    assert importlib.import_module(module_name) is not None
 
 
 def test_docker_contract_has_no_machine_specific_paths_or_viewer_port() -> None:

@@ -2,6 +2,8 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .venv/
+/.venv-control/
+/.venv-bridge-control/
 .pytest_cache/
 
 # Local-only env files (API keys, etc.)

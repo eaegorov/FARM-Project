@@ -18,18 +18,21 @@ is not the local image-ID contract used here.
 ## 1. Host control plane
 
 The host needs Docker/Compose, the NVIDIA container runtime, Git and Python
-3.10+. It does not need Torch, CUDA Python packages or the FARM ML stack:
+3.11+. Its pinned CPU control environment includes Torch and scientific
+packages used by host validation/orchestration; it is not a CUDA inference
+runtime:
 
 ```bash
-python3 -m venv .venv-control
+python3.11 -m venv .venv-control
 .venv-control/bin/python -m pip install \
   --requirement requirements/control-plane.lock.txt
 export FARM_PY="$PWD/.venv-control/bin/python"
 ```
 
-The lock contains only the packages required to parse plans/manifests,
-provision pinned Hugging Face artifacts and decode canonical images before
-Docker-stage acceptance.
+The lock contains the exact CPU-side execution closure for plan/manifest
+parsing, preflight, selection, catalog/report generation, trusted scene-state
+inspection, pinned model provisioning and canonical-image validation. GPU
+inference remains in the pinned images.
 
 ## 2. Build both configured tags
 

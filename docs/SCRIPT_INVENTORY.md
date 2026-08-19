@@ -38,9 +38,10 @@ ShapeR runtime manager, verified-instance input builder, pinned inference
 runner, Docker-wrapped `run_bridge_stage.py prepare/assemble` host control,
 and metric-scene assembler. These are downstream products with their own
 release markers; they do not mutate the FARM run or source PLY. The
-prepare/assemble wrapper runs from the minimal control venv; runtime management
-and inference use the optional exact `bridge-control.lock.txt` launcher
-environment while computation remains in pinned images.
+prepare/assemble wrapper runs from the pinned control venv; runtime management
+uses the separate exact `bridge-control.lock.txt` launcher because its direct
+NumPy/SciPy pins conflict with the control-plane closure. Inference computation
+remains in pinned images.
 
 ## Upstream research/evaluation utilities
 

@@ -34,7 +34,7 @@ actual wall time, RSS and VRAM evidence per stage.
 
 ## 1. Clone and host control plane
 
-Required host components are Git, Python 3.10+, Docker with Compose, an NVIDIA
+Required host components are Git, Python 3.11+, Docker with Compose, an NVIDIA
 driver/runtime compatible with the selected images, and enough disk for model
 snapshots and immutable run outputs.
 
@@ -45,14 +45,15 @@ submodule.
 git clone --recursive <FARM_REPOSITORY_URL> FARM-Project
 cd FARM-Project
 
-python3 -m venv .venv-control
+python3.11 -m venv .venv-control
 .venv-control/bin/python -m pip install --requirement requirements/control-plane.lock.txt
 export FARM_PY="$PWD/.venv-control/bin/python"
 ```
 
-The host environment is intentionally small: PyYAML, Hugging Face Hub,
-Pillow for pre-Docker canonical-image validation, plan orchestration and
-Docker lifecycle only. ML/CUDA stages run in pinned images.
+The pinned host CPU environment contains the exact dependencies for preflight,
+selection, catalog/report generation, trusted scene-state inspection, plan
+orchestration, model provisioning and Docker lifecycle. GPU inference stages
+run in pinned images.
 
 If the repository was cloned without submodules:
 
@@ -379,12 +380,10 @@ held-out-failing Gaussians deliberately remain `-1`.
 ## 7. Optional ShapeR hypotheses
 
 ShapeR is downstream of verified CSR membership and never changes lift labels.
-ShapeR inference runs in its pinned Docker image. The current host-side runtime
-manager and inference launcher still import NumPy, OpenCV and SciPy for their
-metadata validators, so do not run them from the minimal `$FARM_PY`
-environment. SciPy 1.16.3 requires Python 3.11 or newer, so create this
-optional exact direct-package launcher environment with an explicit 3.11+
-interpreter:
+ShapeR inference runs in its pinned Docker image. The host runtime manager and
+launcher use a separate exact NumPy/OpenCV/SciPy closure whose pins conflict
+with `$FARM_PY`. SciPy 1.16.3 requires Python 3.11 or newer, so create the
+bridge launcher environment with an explicit 3.11+ interpreter:
 
 ```bash
 python3.11 -m venv .venv-bridge-control
@@ -394,9 +393,9 @@ export FARM_BRIDGE_PY="$PWD/.venv-bridge-control/bin/python"
 ```
 
 `$FARM_BRIDGE_PY` validates assets and launches Docker; it does not execute
-ShapeR inference on the host. Prepare and assembly instead use the lightweight
-`$FARM_PY` Docker wrapper. This split is intentional and should not be
-collapsed into an unpinned system Python.
+ShapeR inference on the host. Prepare and assembly use the pinned `$FARM_PY`
+Docker wrapper. Keep the venvs separate because their exact direct-package
+pins conflict; never collapse them into an unpinned system Python.
 
 The ShapeR Docker recipe is functionally, not bit, reproducible. After the
 exact external repo, checkpoints and HF cache named by
