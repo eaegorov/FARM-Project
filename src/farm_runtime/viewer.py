@@ -7,14 +7,14 @@ import os
 import re
 import shutil
 import signal
-import stat
 import sys
 import time
 from pathlib import Path
 from typing import Any, Mapping
 
-from .config import canonical_json, render_template, resolve_plan_path
+from .config import render_template, resolve_plan_path
 from .process import atomic_write_json, open_detached_process, port_is_available, process_identity_matches, process_start_token, utc_now, wait_for_http
+from .source_snapshot import SourceSnapshotIntegrityError, validated_source_snapshot_project_root
 
 
 class ViewerError(RuntimeError):
@@ -23,7 +23,6 @@ class ViewerError(RuntimeError):
 
 _IMAGE_ID_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
-_SOURCE_SNAPSHOT_TREE_SCHEMA = "farm.source-snapshot-tree.v1"
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -44,144 +43,13 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _source_snapshot_tree_sha256(files: list[dict[str, Any]]) -> str:
-    records = [dict(record) for record in sorted(files, key=lambda row: str(row["path"]))]
-    payload = {"schema": _SOURCE_SNAPSHOT_TREE_SCHEMA, "files": records}
-    return hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
-
-
-def _run_relative_path(run_dir: Path, value: object, label: str) -> Path:
-    if not isinstance(value, str) or not value or Path(value).is_absolute():
-        raise ViewerError(f"Source snapshot {label} must be a relative path")
-    unresolved = run_dir / value
-    if unresolved.is_symlink():
-        raise ViewerError(f"Source snapshot {label} must not be a symlink")
-    try:
-        resolved = unresolved.resolve(strict=True)
-        resolved.relative_to(run_dir.resolve())
-    except (FileNotFoundError, OSError, ValueError) as exc:
-        raise ViewerError(
-            f"Source snapshot {label} is missing or escapes the run: {value}"
-        ) from exc
-    return resolved
-
-
 def _validated_snapshot_project_root(
     run_dir: Path, run_manifest: Mapping[str, Any]
 ) -> Path | None:
-    """Return a cryptographically validated snapshot, or None for old runs."""
-
-    reference = run_manifest.get("source_snapshot")
-    if reference is None:
-        return None
-    if not isinstance(reference, Mapping):
-        raise ViewerError("Run source_snapshot metadata must be a mapping")
-    if reference.get("schema") != "farm.source-snapshot.v1":
-        raise ViewerError("Unsupported run source_snapshot metadata schema")
-    snapshot_root = _run_relative_path(
-        run_dir, reference.get("relative_path"), "relative_path"
-    )
-    if not snapshot_root.is_dir():
-        raise ViewerError("Source snapshot project root is not a directory")
-    snapshot_manifest_path = _run_relative_path(
-        run_dir,
-        reference.get("manifest_relative_path"),
-        "manifest_relative_path",
-    )
-    snapshot = _load_json(snapshot_manifest_path)
-    if snapshot.get("schema") != "farm.source-snapshot.v1":
-        raise ViewerError("Unsupported source snapshot manifest schema")
-    if (
-        snapshot.get("project_relative_path") != "FARM-Project"
-        or snapshot.get("tree_schema") != _SOURCE_SNAPSHOT_TREE_SCHEMA
-    ):
-        raise ViewerError("Source snapshot manifest contract mismatch")
-    raw_files = snapshot.get("files")
-    if not isinstance(raw_files, list) or not all(
-        isinstance(record, Mapping) for record in raw_files
-    ):
-        raise ViewerError("Source snapshot manifest files must be a list")
-
-    expected_paths: set[str] = set()
-    actual_records: list[dict[str, Any]] = []
-    for raw_record in raw_files:
-        record = dict(raw_record)
-        relative = record.get("path")
-        expected_sha256 = str(record.get("sha256") or "").lower()
-        if (
-            not isinstance(relative, str)
-            or not relative
-            or Path(relative).is_absolute()
-            or relative in expected_paths
-            or not _SHA256_RE.fullmatch(expected_sha256)
-            or not isinstance(record.get("executable"), bool)
-        ):
-            raise ViewerError("Invalid source snapshot file record")
-        expected_paths.add(relative)
-        unresolved = snapshot_root / relative
-        if unresolved.is_symlink():
-            raise ViewerError(f"Source snapshot contains a symlink: {relative}")
-        try:
-            path = unresolved.resolve(strict=True)
-            path.relative_to(snapshot_root)
-        except (FileNotFoundError, OSError, ValueError) as exc:
-            raise ViewerError(
-                f"Source snapshot file is missing or escapes its root: {relative}"
-            ) from exc
-        if not path.is_file():
-            raise ViewerError(f"Source snapshot entry is not a file: {relative}")
-        path_stat = path.stat(follow_symlinks=False)
-        try:
-            expected_size = int(record["size"])
-            expected_mode = int(record["mode"])
-        except (KeyError, TypeError, ValueError) as exc:
-            raise ViewerError("Invalid source snapshot size/mode metadata") from exc
-        mode = int(stat.S_IMODE(path_stat.st_mode))
-        executable = bool(path_stat.st_mode & 0o111)
-        sha256 = _sha256_file(path)
-        if (
-            int(path_stat.st_size) != expected_size
-            or mode != expected_mode
-            or executable is not record["executable"]
-            or sha256 != expected_sha256
-        ):
-            raise ViewerError(f"Source snapshot file integrity mismatch: {relative}")
-        actual_records.append({
-            "path": relative,
-            "size": int(path_stat.st_size),
-            "mode": mode,
-            "executable": executable,
-            "sha256": sha256,
-        })
-
-    actual_paths: set[str] = set()
-    for path in snapshot_root.rglob("*"):
-        relative = path.relative_to(snapshot_root).as_posix()
-        if path.is_symlink():
-            raise ViewerError(f"Source snapshot contains a symlink: {relative}")
-        if path.is_file():
-            actual_paths.add(relative)
-        elif not path.is_dir():
-            raise ViewerError(f"Source snapshot contains a special file: {relative}")
-    if actual_paths != expected_paths:
-        raise ViewerError("Source snapshot file set does not match its manifest")
-
-    tree_sha256 = _source_snapshot_tree_sha256(actual_records)
-    manifest_tree = str(snapshot.get("tree_sha256") or "").lower()
-    reference_tree = str(reference.get("tree_sha256") or "").lower()
     try:
-        manifest_count = int(snapshot.get("file_count"))
-        reference_count = int(reference.get("file_count"))
-    except (TypeError, ValueError) as exc:
-        raise ViewerError("Invalid source snapshot file count metadata") from exc
-    if (
-        tree_sha256 != manifest_tree
-        or tree_sha256 != reference_tree
-        or len(actual_records) != manifest_count
-        or len(actual_records) != reference_count
-    ):
-        raise ViewerError("Source snapshot manifest/root metadata mismatch")
-    return snapshot_root
+        return validated_source_snapshot_project_root(run_dir, run_manifest)
+    except SourceSnapshotIntegrityError as exc:
+        raise ViewerError(str(exc)) from exc
 
 
 def viewer_runtime_dir(run_dir: Path) -> Path:

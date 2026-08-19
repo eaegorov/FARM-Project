@@ -37,7 +37,7 @@ from PIL import Image as PILImage
 from tqdm import tqdm
 
 
-TOOL_VERSION = "1.0.0"
+TOOL_VERSION = "1.0.1"
 MANIFEST_SCHEMA = "farm.kb4-to-pinhole.v1"
 SUPPORTED_FISHEYE_MODELS = {"KANNALABRANDT4", "OPENCV_FISHEYE"}
 
@@ -514,8 +514,10 @@ def _solve_kb4_theta(radius: float, coeffs: Sequence[float], iterations: int = 1
 
 def kb4_conservative_half_fov(camera: Camera) -> float:
     fx, fy, cx, cy, k1, k2, k3, k4 = camera.kb4_params()
-    radii = [cx / fx, (camera.width - 1.0 - cx) / fx,
-             cy / fy, (camera.height - 1.0 - cy) / fy]
+    # COLMAP coordinates are corner-origin, so the extreme source pixel
+    # centres are 0.5 and size-0.5 rather than OpenCV indices 0 and size-1.
+    radii = [(cx - 0.5) / fx, (camera.width - 0.5 - cx) / fx,
+             (cy - 0.5) / fy, (camera.height - 0.5 - cy) / fy]
     positive = [r for r in radii if r > 0.0]
     if not positive:
         raise ValueError(f"camera {camera.camera_id}: principal point is outside image")
@@ -530,8 +532,11 @@ def build_kb4_remap(camera: Camera, intrinsics: np.ndarray, width: int, height: 
     fx, fy, cx, cy, k1, k2, k3, k4 = camera.kb4_params()
     out_fx, out_fy = float(intrinsics[0, 0]), float(intrinsics[1, 1])
     out_cx, out_cy = float(intrinsics[0, 2]), float(intrinsics[1, 2])
-    x = (np.arange(width, dtype=np.float64) - out_cx) / out_fx
-    y = (np.arange(height, dtype=np.float64) - out_cy) / out_fy
+    # COLMAP image coordinates are corner-origin: the top-left pixel center is
+    # (0.5, 0.5), not (0, 0). Build rays through those pixel centers so the
+    # remapped RGB agrees with the output PINHOLE intrinsics and POINTS2D.
+    x = (np.arange(width, dtype=np.float64) + 0.5 - out_cx) / out_fx
+    y = (np.arange(height, dtype=np.float64) + 0.5 - out_cy) / out_fy
     xx, yy = np.meshgrid(x, y)
     rays = np.stack((xx, yy, np.ones_like(xx)), axis=-1)
     rotation = virtual_rotation(view)
@@ -543,8 +548,13 @@ def build_kb4_remap(camera: Camera, intrinsics: np.ndarray, width: int, height: 
     scale = np.ones_like(theta_d)
     nonzero = rho > 1e-12
     scale[nonzero] = theta_d[nonzero] / rho[nonzero]
-    map_x = fx * fish[..., 0] * scale + cx
-    map_y = fy * fish[..., 1] * scale + cy
+    source_colmap_x = fx * fish[..., 0] * scale + cx
+    source_colmap_y = fy * fish[..., 1] * scale + cy
+    # cv2.remap uses array-index coordinates where the top-left pixel centre
+    # is (0, 0). Convert the projected COLMAP coordinates, whose top-left
+    # centre is (0.5, 0.5), before sampling RGB.
+    map_x = source_colmap_x - 0.5
+    map_y = source_colmap_y - 0.5
     max_theta = kb4_conservative_half_fov(camera)
     valid = (
         np.isfinite(map_x) & np.isfinite(map_y) & (theta <= max_theta + 1e-10)
@@ -780,7 +790,10 @@ def build_virtual_geometry(model: ColmapModel, views: Sequence[ViewSpec], intrin
             v = np.full(z.shape, np.nan, dtype=np.float64)
             u[in_front] = intrinsics[0, 0] * points_virtual[in_front, 0] / z[in_front] + intrinsics[0, 2]
             v[in_front] = intrinsics[1, 1] * points_virtual[in_front, 1] / z[in_front] + intrinsics[1, 2]
-            inside = in_front & (u >= 0.0) & (u <= width - 1.0) & (v >= 0.0) & (v <= height - 1.0)
+            # COLMAP coordinates span the continuous image domain [0, width)
+            # x [0, height). Do not discard the right/bottom half-pixel strip
+            # by limiting projected observations to the last pixel center.
+            inside = in_front & (u >= 0.0) & (u < width) & (v >= 0.0) & (v < height)
             visible_any |= inside
             output.append(VirtualImage(
                 next_image_id, source_id, 1, names[(source_id, view.name)], qvec, tvec,

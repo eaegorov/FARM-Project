@@ -19,6 +19,12 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+# The wrapper itself lives inside the signed execution snapshot.  Disable
+# bytecode before importing any first-party module so neither this process nor
+# inherited host-side Python children can add __pycache__ entries to that tree.
+os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
+sys.dont_write_bytecode = True
+
 from PIL import Image
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -29,6 +35,7 @@ sys.path.insert(0, str(SRC))
 from farm_pipeline.resources import load_model_manifest  # noqa: E402
 from farm_pipeline.scene_config import load_scene_config  # noqa: E402
 from farm_runtime.process import atomic_write_json, atomic_write_text, utc_now  # noqa: E402
+from farm_runtime.source_snapshot import validated_source_snapshot_project_root  # noqa: E402
 from farm_runtime.standard import STANDARD_STAGE_IDS  # noqa: E402
 
 RESULT_PATHS = {
@@ -159,10 +166,31 @@ def _scope_for_run(config: Any, run_dir: Path) -> tuple[Path, str]:
     return resolved, "r" + digest[:24]
 
 
+def _validate_execution_contract(config_path: Path, run_dir: Path) -> Path:
+    """Bind this process to the run's signed source tree and config bytes."""
+
+    resolved_run = run_dir.resolve(strict=True)
+    manifest = load_json(resolved_run / "manifest.json")
+    expected_config_sha256 = str(manifest.get("config_sha256") or "").lower()
+    actual_config_sha256 = hashlib.sha256(config_path.read_bytes()).hexdigest()
+    if actual_config_sha256 != expected_config_sha256:
+        raise RuntimeError("scene config SHA-256 does not match run manifest")
+    snapshot_root = validated_source_snapshot_project_root(
+        resolved_run, manifest, required=True
+    )
+    if snapshot_root is None or ROOT.resolve(strict=True) != snapshot_root:
+        raise RuntimeError(
+            "standard stage must execute from the run's validated source snapshot"
+        )
+    return resolved_run
+
+
 def cleanup_scope(config_path: Path, run_dir: Path) -> None:
     """Stop only the exact run scope without loading model files/manifest."""
 
-    config = load_scene_config(config_path.resolve(strict=True))
+    config_path = config_path.resolve(strict=True)
+    _validate_execution_contract(config_path, run_dir)
+    config = load_scene_config(config_path)
     resolved, scope = _scope_for_run(config, run_dir)
     manifest_path = config.resources.model_manifest or ROOT / "configs/models/farm_models.v1.json"
     subprocess.run(
@@ -187,11 +215,13 @@ def cleanup_scope(config_path: Path, run_dir: Path) -> None:
         runtime_dir.rmdir()
     except OSError:
         pass
+    _validate_execution_contract(config_path, run_dir)
 
 
 class Context:
     def __init__(self, config_path: Path, run_dir: Path, stage: str | None) -> None:
         self.config_path = config_path.resolve(strict=True)
+        _validate_execution_contract(self.config_path, run_dir)
         self.config = load_scene_config(self.config_path)
         self.run_dir, self.scope = _scope_for_run(self.config, run_dir)
         self.stage = stage
@@ -932,6 +962,7 @@ class Context:
             "--scene-state", "/farm-run/.stage_work/finalize/scene_state_tiered.pt",
             "--dedup-audit", "/farm-run/qa/dedup/audit.json",
             "--semantic-catalog", "/farm-run/qa/semantics/consensus/semantic_consensus_catalog.json",
+            "--assembly-review", "/farm-run/qa/assemblies/review/reviewed_robust_objects.json",
             "--mask-root", "/farm-run/mapping/masks",
             "--mask-root", "/farm-run/qa/assemblies/masks",
             "--output-state", "/farm-run/.stage_work/finalize/scene_state_accepted.pt",
@@ -1132,6 +1163,7 @@ class Context:
             "--scene-state", "/farm-run/final/scene_state.pt",
             "--dedup-audit", "/farm-run/qa/dedup/audit.json",
             "--semantic-catalog", "/farm-run/qa/semantics/consensus/semantic_consensus_catalog.json",
+            "--assembly-review", "/farm-run/qa/assemblies/review/reviewed_robust_objects.json",
             "--mask-root", "/farm-run/mapping/masks",
             "--mask-root", "/farm-run/qa/assemblies/masks",
             "--output-state", "/farm-run/.stage_work/qa_bundle/acceptance_verify/scene_state.pt",

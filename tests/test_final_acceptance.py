@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import random
 import sys
 from pathlib import Path
@@ -24,7 +25,9 @@ from farm_pipeline.final_acceptance import (  # noqa: E402
     refresh_runtime_status,
     run_acceptance_policy,
     runtime_budget_seconds,
+    validated_assembly_semantic_row,
 )
+from scripts.build_farm_tiered_state import main as build_tiered_state
 
 
 def _state(ids: list[int], categories: list[str] | None = None) -> dict:
@@ -92,6 +95,178 @@ def _semantic(object_id: int, category: str = "fixture", tier: str = "probable")
             "confirmation_eligible": True,
         }],
     }
+
+
+def _assembly_review(object_id: int = 402) -> dict:
+    contract = {
+        "schema": "farm.open-vocabulary-object-label.v1",
+        "contract_valid": True,
+        "reason_codes": [],
+        "category": "cabinet",
+        "category_role": "whole_object",
+        "form_hypernym": "machine",
+        "primitive_form": "rectangular box",
+        "head_noun_is_primitive": False,
+        "specificity": "object_kind",
+        "topology": "standalone_whole",
+        "complete_bounded": True,
+        "carrier_category": "unknown",
+        "payload_categories": [],
+        "shape_profile": "compact_volumetric",
+        "identity_basis": "stable_appearance",
+        "diagnostic_parts": ["doors", "handles"],
+        "diagnostic_view_count": 3,
+        "description": "bounded cabinet seen in three views",
+        "attributes": ["white", "metal"],
+        "confidence": 0.95,
+        "decision": "keep",
+    }
+    event = {
+        "source": "initial_blind_review",
+        "event_id": f"object:{object_id}:initial_blind_review",
+        "category": "cabinet",
+        "description": "free text is not the authority",
+        "attributes": ["white"],
+        "confidence": 0.95,
+        "decision": "keep",
+        "confirmation_eligible": True,
+        "label_contract": contract,
+        "evidence_contract_schema": "farm.semantic-view-evidence.v1",
+        "evidence_object_id": object_id,
+        "crop_image_ids": [91, 212, 222],
+        "crop_image_ids_complete": True,
+        "evidence_fingerprint_sha256": "a" * 64,
+    }
+    return {
+        "id": object_id,
+        "member_object_ids": [141, 295],
+        "review_category": "cabinet",
+        "review_description": "different free text",
+        "review_attributes": ["ignored"],
+        "review_confidence": 0.95,
+        "review_decision": "keep",
+        "review_gate_reason": "multi_view_identity_supported",
+        "review_label_contract": contract,
+        "semantic_evidence": [event],
+    }
+
+
+def _assembly_state() -> dict:
+    state = _state([402], ["legacy"])
+    state["object_geometry_status"] = ["assembly_geometry_pass"]
+    state["object_assembly_member_ids"] = [[141, 295]]
+    return state
+
+
+def test_validated_single_event_assembly_is_probable_and_accepted() -> None:
+    state = _assembly_state()
+    row, reason = validated_assembly_semantic_row(state, _assembly_review())
+
+    assert reason == "eligible"
+    assert row is not None
+    assert row["semantic_tier"] == "probable"
+    assert row["semantic_confirmation_eligible"] is False
+    assert row["semantic_independent_group_count"] == 1
+    assert row["semantic_unique_view_count"] == 3
+    assert row["description"] == "bounded cabinet seen in three views"
+
+    state["object_category"] = [row["category"]]
+    state["object_semantic_tier"] = [row["semantic_tier"]]
+    _, report, _, labels = run_acceptance_policy(
+        state,
+        {},
+        [row],
+        scene_id="assembly-fixture",
+        decodable_crop_counts={402: 3},
+    )
+    assert report["status"] != "FAIL"
+    assert labels[0]["hard_error_codes"] == []
+
+
+def test_assembly_semantics_fail_closed_without_structured_provenance() -> None:
+    state = _assembly_state()
+    free_text_only = _assembly_review()
+    free_text_only.pop("review_label_contract")
+    row, reason = validated_assembly_semantic_row(state, free_text_only)
+    assert row is None
+    assert reason == "label_contract_missing"
+
+    repeated_event = _assembly_review()
+    repeated_event["semantic_evidence"].append(
+        copy.deepcopy(repeated_event["semantic_evidence"][0])
+    )
+    row, reason = validated_assembly_semantic_row(state, repeated_event)
+    assert row is None
+    assert reason == "assembly_initial_event_count_not_one"
+
+    zero_confidence_event = _assembly_review()
+    zero_confidence_event["semantic_evidence"][0]["confidence"] = 0.0
+    row, reason = validated_assembly_semantic_row(state, zero_confidence_event)
+    assert row is None
+    assert reason == "assembly_event_confidence_mismatch"
+
+    duplicate_members = _assembly_review()
+    duplicate_members["member_object_ids"] = [141, 141, 295]
+    row, reason = validated_assembly_semantic_row(state, duplicate_members)
+    assert row is None
+    assert reason == "member_provenance_mismatch"
+
+
+def test_assembly_semantics_accepts_canonical_safe_hypernym_downgrade() -> None:
+    state = _assembly_state()
+    review = _assembly_review()
+    contract = review["review_label_contract"]
+    contract["diagnostic_parts"] = []
+    contract["identity_basis"] = "context_only"
+    contract["form_hypernym"] = "enclosure"
+    review["review_category"] = "enclosure"
+    review["review_description"] = "bounded visible enclosure"
+    review["review_attributes"] = []
+    event = review["semantic_evidence"][0]
+    event["category"] = "enclosure"
+    event["description"] = "bounded visible enclosure"
+    event["attributes"] = []
+
+    row, reason = validated_assembly_semantic_row(state, review)
+
+    assert reason == "eligible"
+    assert row is not None
+    assert row["category"] == "enclosure"
+    assert row["description"] == "bounded visible enclosure"
+    assert row["attributes"] == []
+    assert row["semantic_tier"] == "probable"
+
+
+def test_tiered_state_never_promotes_single_event_assembly_to_confirmed(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    assembled = tmp_path / "assembled.pt"
+    direct = tmp_path / "direct.json"
+    review = tmp_path / "review.json"
+    output = tmp_path / "tiered.pt"
+    torch.save({"state": _assembly_state()}, assembled)
+    direct.write_text("[]\n", encoding="utf-8")
+    review.write_text(json.dumps({
+        "schema": "farm.open-vocabulary-crop-review.v2",
+        "min_confidence": 0.65,
+        "objects": [_assembly_review()],
+    }), encoding="utf-8")
+    monkeypatch.setattr(sys, "argv", [
+        "build_farm_tiered_state.py",
+        "--assembled-state", str(assembled),
+        "--direct-catalog", str(direct),
+        "--assembly-review", str(review),
+        "--output", str(output),
+    ])
+
+    assert build_tiered_state() == 0
+    state = torch.load(output, map_location="cpu", weights_only=False)["state"]
+    assert state["active"].tolist() == [True]
+    assert state["object_category"] == ["cabinet"]
+    assert state["object_semantic_tier"] == ["probable"]
+    assert state["object_semantic_status"] == [
+        "validated_assembly_review_probable"
+    ]
 
 
 def test_pair_union_and_three_auto_rules_are_order_invariant() -> None:

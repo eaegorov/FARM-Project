@@ -141,6 +141,15 @@ def test_main_runtime_uses_declared_non_root_uid_and_host_gid() -> None:
     assert "snapshot_root in path.parents" in mount_source
 
 
+def test_standard_wrapper_validates_snapshot_before_loading_scene_config() -> None:
+    init_source = inspect.getsource(Context.__init__)
+    assert init_source.index("_validate_execution_contract") < init_source.index(
+        "load_scene_config"
+    )
+    for method in (Context.post, Context.prep_post, Context.rgbd, Context.mapping):
+        assert 'f"{ROOT}:' in inspect.getsource(method)
+
+
 def test_factory_manifest_pins_mobileclip_required_by_yoloe() -> None:
     manifest = load_model_manifest(
         Path(__file__).resolve().parents[1] / "configs/models/farm_models.v1.json"
@@ -241,6 +250,10 @@ def test_finalization_uses_last_cross_pass_semantic_consensus() -> None:
     )
     assert '"/farm-run/qa/semantics/ensemble/semantic_tiered_catalog.json"' not in source
     assert 'self.post("build_farm_final_acceptance.py"' in source
+    assert (
+        '"--assembly-review", "/farm-run/qa/assemblies/review/reviewed_robust_objects.json"'
+        in source
+    )
     assert '"--mode", "apply"' in source
     assert "atomic_copy(accepted" in source
     assert "replace_directory(acceptance_work" in source

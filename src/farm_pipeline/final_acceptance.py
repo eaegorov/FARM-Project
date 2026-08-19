@@ -18,7 +18,8 @@ from typing import Any, Iterable, Mapping, Sequence
 
 import torch
 
-from scene_graph.captioning.evidence import evidence_event_id
+from scene_graph.captioning.evidence import evidence_event_id, evidence_view_ids
+from scene_graph.captioning.label_contract import assess_open_vocabulary_label
 
 
 PAIR_SOURCES = (
@@ -37,6 +38,8 @@ PRESENTATION_MUTABLE_KEYS = frozenset(
 _UNRESOLVED_SENTINELS = frozenset({"", "unknown", "unresolved", "unresolved object"})
 _STRUCTURED_FALLBACK_SOURCES = frozenset({"neutral_form_fallback"})
 _SHARED_FORM_HYPERNYM_SOURCE = "explicit_shared_form_hypernym_consensus"
+_OPEN_VOCABULARY_LABEL_SCHEMA = "farm.open-vocabulary-object-label.v1"
+_SEMANTIC_VIEW_EVIDENCE_SCHEMA = "farm.semantic-view-evidence.v1"
 _VERIFIED_DISTINCT_DISPOSITIONS = frozenset(
     {"verified_distinct", "manually_verified_distinct"}
 )
@@ -58,6 +61,20 @@ class AcceptancePolicy:
 
 
 DEFAULT_POLICY = AcceptancePolicy()
+
+
+def _canonical_member_tuple(value: object) -> tuple[int, ...]:
+    if value is None or isinstance(value, (str, bytes)):
+        return ()
+    if isinstance(value, torch.Tensor):
+        value = value.detach().cpu().reshape(-1).tolist()
+    try:
+        members = tuple(int(member) for member in value)
+    except (TypeError, ValueError):
+        return ()
+    if len(set(members)) != len(members):
+        return ()
+    return tuple(sorted(members))
 
 
 def _normalise_category(value: object) -> str:
@@ -312,6 +329,158 @@ def _state_object_maps(
         if len(values) == 3 and all(math.isfinite(value) and value > 0.0 for value in values):
             diagonal_by_id[object_id] = math.sqrt(sum(value * value for value in values))
     return index_by_id, category_by_id, diagonal_by_id, sorted(set(errors))
+
+
+def validated_assembly_semantic_row(
+    state: Mapping[str, Any],
+    review_row: Mapping[str, Any],
+    *,
+    minimum_confidence: float = 0.65,
+) -> tuple[dict[str, Any] | None, str]:
+    """Translate one geometry-valid assembly review into probable evidence.
+
+    Assembly review is a single blind semantic event, so it may support a
+    probable presentation label but can never satisfy confirmed independence.
+    The returned category/description come from the validated label contract,
+    never from the review's free-text convenience fields.
+    """
+    if isinstance(review_row.get("id"), bool):
+        return None, "review_id_invalid"
+    try:
+        object_id = int(review_row["id"])
+    except (KeyError, TypeError, ValueError):
+        return None, "review_id_invalid"
+
+    index_by_id, _, _, state_errors = _state_object_maps(state)
+    if state_errors:
+        return None, "scene_state_contract_invalid"
+    index = index_by_id.get(object_id)
+    if index is None:
+        return None, "review_id_not_in_state"
+
+    size = len(index_by_id)
+    active = _as_list(state.get("active"))
+    statuses = _as_list(state.get("object_geometry_status"))
+    member_rows = _as_list(state.get("object_assembly_member_ids"))
+    if any(len(values) != size for values in (active, statuses, member_rows)):
+        return None, "assembly_state_not_row_aligned"
+    state_members = _canonical_member_tuple(member_rows[index])
+    review_members = _canonical_member_tuple(review_row.get("member_object_ids"))
+    if not bool(active[index]):
+        return None, "geometry_inactive"
+    if str(statuses[index]) != "assembly_geometry_pass":
+        return None, "geometry_status_not_pass"
+    if not state_members or state_members != review_members:
+        return None, "member_provenance_mismatch"
+    if str(review_row.get("review_decision") or "").strip().lower() != "keep":
+        return None, "review_decision_not_keep"
+    if str(review_row.get("review_gate_reason") or "") not in {
+        "multi_view_identity_supported",
+        "candidate_conditioned_verification_agrees",
+    }:
+        return None, "review_gate_not_validated"
+
+    contract = review_row.get("review_label_contract")
+    if not isinstance(contract, Mapping):
+        return None, "label_contract_missing"
+    if (
+        str(contract.get("schema") or "") != _OPEN_VOCABULARY_LABEL_SCHEMA
+        or contract.get("contract_valid") is not True
+        or bool(contract.get("reason_codes") or [])
+        or str(contract.get("decision") or "").strip().lower() != "keep"
+    ):
+        return None, "label_contract_invalid"
+    threshold = _finite_float(minimum_confidence)
+    if threshold is None or not 0.0 <= threshold <= 1.0:
+        return None, "review_confidence_threshold_invalid"
+    assessment = assess_open_vocabulary_label(
+        contract, minimum_confidence=threshold
+    )
+    if assessment.get("usable") is not True:
+        return None, "label_contract_not_presentation_safe"
+    category = _normalise_category(assessment.get("category"))
+    if category in _UNRESOLVED_SENTINELS:
+        return None, "semantic_category_unresolved"
+    if _normalise_category(review_row.get("review_category")) != category:
+        return None, "review_category_contract_mismatch"
+    review_confidence = _finite_float(review_row.get("review_confidence"))
+    contract_confidence = _finite_float(assessment.get("confidence"))
+    if (
+        review_confidence is None
+        or contract_confidence is None
+        or review_confidence < threshold
+        or contract_confidence < threshold
+    ):
+        return None, "review_confidence_below_threshold"
+
+    initial_events = [
+        event
+        for event in (review_row.get("semantic_evidence") or [])
+        if isinstance(event, Mapping)
+        and str(event.get("source") or "").strip().lower() == "initial_blind_review"
+    ]
+    if len(initial_events) != 1:
+        return None, "assembly_initial_event_count_not_one"
+    event = initial_events[0]
+    event_confidence = _finite_float(event.get("confidence"))
+    if (
+        event_confidence is None
+        or event_confidence < threshold
+        or not math.isclose(event_confidence, review_confidence, abs_tol=1e-6)
+        or not math.isclose(event_confidence, contract_confidence, abs_tol=1e-6)
+    ):
+        return None, "assembly_event_confidence_mismatch"
+    view_ids = evidence_view_ids(event)
+    if (
+        str(event.get("evidence_contract_schema") or "")
+        != _SEMANTIC_VIEW_EVIDENCE_SCHEMA
+        or event.get("evidence_object_id") != object_id
+        or event.get("confirmation_eligible") is not True
+        or str(event.get("decision") or "").strip().lower() != "keep"
+        or _normalise_category(event.get("category")) != category
+        or not evidence_event_id(event)
+        or view_ids is None
+        or len(view_ids) < 3
+        or event.get("label_contract") != contract
+    ):
+        return None, "assembly_initial_event_invalid"
+
+    event_id = evidence_event_id(event)
+    description = str(assessment.get("description") or "").strip()
+    attributes = [
+        str(value).strip()
+        for value in (assessment.get("attributes") or [])
+        if str(value).strip()
+    ]
+    return {
+        "id": object_id,
+        "category": category,
+        "description": description,
+        "attributes": attributes,
+        "semantic_tier": "probable",
+        "semantic_status": "validated_assembly_review_probable",
+        "review_decision": "keep",
+        "review_confidence": min(review_confidence, contract_confidence),
+        "semantic_evidence": [dict(event)],
+        "candidates": [dict(event)],
+        "semantic_evidence_count": 1,
+        "semantic_evidence_event_ids": [event_id],
+        "semantic_independent_group_count": 1,
+        "semantic_unique_view_count": len(view_ids),
+        "semantic_max_support_overlap": None,
+        "semantic_confirmation_eligible": False,
+        "semantic_ineligibility_reasons": [
+            "assembly_single_blind_event_max_probable"
+        ],
+        "assembly_member_ids": list(state_members),
+        "assembly_review_contract": {
+            "schema": "farm.validated-assembly-review.v1",
+            "review_gate_reason": str(review_row.get("review_gate_reason")),
+            "label_contract_schema": str(contract.get("schema")),
+            "initial_event_id": event_id,
+            "unique_image_ids": list(view_ids),
+        },
+    }, "eligible"
 
 
 def classify_pair_records(

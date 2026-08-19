@@ -7,12 +7,19 @@ import stat
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
 
 from farm_runtime.config import PlanError, load_plan
-from farm_runtime.orchestrator import PipelineRunError, RunOrchestrator, selected_device_telemetry
+from farm_runtime.orchestrator import (
+    PipelineRunError,
+    RunOrchestrator,
+    _create_source_snapshot,
+    selected_device_telemetry,
+)
+from farm_runtime.source_snapshot import validated_source_snapshot_project_root
 from farm_runtime.standard import (
     STANDARD_SHARED_CODE_INPUTS,
     STANDARD_STAGE_CODE_INPUTS,
@@ -386,6 +393,225 @@ def _advanced_config(tmp_path: Path, stages: list[dict], artifacts: dict[str, st
     return path
 
 
+def _standard_config(tmp_path: Path, scene_id: str = "snapshot_scene") -> Path:
+    (tmp_path / "data/sparse/0").mkdir(parents=True)
+    (tmp_path / "data/images").mkdir(parents=True)
+    (tmp_path / "data/scene.ply").write_text("ply", encoding="utf-8")
+    (tmp_path / "scripts").mkdir(exist_ok=True)
+    (tmp_path / "scripts/farm_standard_stage.py").write_text(
+        "# frozen standard wrapper\n", encoding="utf-8"
+    )
+    path = tmp_path / "scene.yaml"
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "schema_version": "farm.scene.v1",
+                "scene_id": scene_id,
+                "inputs": {
+                    "colmap_model": "data/sparse/0",
+                    "image_root": "data/images",
+                    "gaussian_ply": "data/scene.ply",
+                },
+                "output_root": "results",
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def _initialized_standard_run(
+    tmp_path: Path, run_id: str = "standard-snapshot"
+) -> tuple[RunOrchestrator, Path]:
+    runner = RunOrchestrator(load_plan(_standard_config(tmp_path), project_root=tmp_path))
+    run_dir = runner._new_run_dir(run_id)
+    runner._initialize_run(run_dir)
+    return runner, run_dir
+
+
+def test_standard_plan_routes_all_first_party_execution_to_snapshot(
+    tmp_path: Path,
+) -> None:
+    runner, run_dir = _initialized_standard_run(tmp_path)
+    snapshot_root = run_dir / "config/source_snapshot/FARM-Project"
+    for stage_id in STANDARD_STAGE_IDS:
+        resolved = runner._resolve_stage(runner.plan.stages_by_id[stage_id], run_dir)
+        assert resolved.command[1] == str(snapshot_root / "scripts/farm_standard_stage.py")
+        assert resolved.cwd == snapshot_root
+        assert resolved.stage.env["PYTHONDONTWRITEBYTECODE"] == "1"
+        expected_code = {
+            snapshot_root / relative
+            for relative in (
+                *STANDARD_SHARED_CODE_INPUTS,
+                *STANDARD_STAGE_CODE_INPUTS[stage_id],
+            )
+        }
+        assert expected_code <= set(resolved.fingerprint_inputs)
+        assert runner.plan.source_path in resolved.fingerprint_inputs
+        assert all(path == run_dir or run_dir in path.parents for path in resolved.outputs)
+
+    preflight = runner._resolve_stage(runner.plan.stages_by_id["preflight"], run_dir)
+    assert (tmp_path / "data/scene.ply").resolve() in preflight.fingerprint_inputs
+    assert (tmp_path / "data/sparse/0").resolve() in preflight.fingerprint_inputs
+    assert (tmp_path / "data/images").resolve() in preflight.fingerprint_inputs
+    public_plan = json.loads((run_dir / "config/resolved-plan.json").read_text())
+    assert all(row["cwd"] == str(snapshot_root) for row in public_plan["stages"])
+    assert all(
+        row["command"][1] == str(snapshot_root / "scripts/farm_standard_stage.py")
+        for row in public_plan["stages"]
+    )
+    context = runner._context(run_dir)
+    finalizer = runner.plan.finalizers[0]
+    assert finalizer.command[1] == "${execution_project_root}/scripts/farm_standard_stage.py"
+    assert finalizer.env["PYTHONDONTWRITEBYTECODE"] == "1"
+    assert context["execution_project_root"] == str(snapshot_root)
+
+
+def test_standard_live_source_changes_do_not_change_frozen_stage(
+    tmp_path: Path,
+) -> None:
+    runner, run_dir = _initialized_standard_run(tmp_path)
+    stage = runner.plan.stages_by_id["preflight"]
+    before_resolved = runner._resolve_stage(stage, run_dir)
+    before, _ = runner._stage_fingerprint(before_resolved, {})
+    live_wrapper = tmp_path / "scripts/farm_standard_stage.py"
+    live_wrapper.write_text("# changed live wrapper\n", encoding="utf-8")
+    after_resolved = runner._resolve_stage(stage, run_dir)
+    after, _ = runner._stage_fingerprint(after_resolved, {})
+    assert after_resolved.command == before_resolved.command
+    assert after == before
+    assert (
+        run_dir / "config/source_snapshot/FARM-Project/scripts/farm_standard_stage.py"
+    ).read_text(encoding="utf-8") == "# frozen standard wrapper\n"
+
+
+@pytest.mark.parametrize("tamper", ["content", "mode", "extra", "symlink"])
+def test_standard_snapshot_tamper_blocks_resolution(
+    tmp_path: Path, tamper: str
+) -> None:
+    runner, run_dir = _initialized_standard_run(tmp_path)
+    snapshot_root = run_dir / "config/source_snapshot/FARM-Project"
+    wrapper = snapshot_root / "scripts/farm_standard_stage.py"
+    if tamper == "content":
+        wrapper.write_text("# tampered\n", encoding="utf-8")
+    elif tamper == "mode":
+        os.chmod(wrapper, stat.S_IMODE(wrapper.stat().st_mode) | stat.S_IXUSR)
+    elif tamper == "extra":
+        (snapshot_root / "scripts/unexpected.py").write_text("pass\n", encoding="utf-8")
+    else:
+        (snapshot_root / "scripts/unexpected-link.py").symlink_to(wrapper)
+    with pytest.raises(PipelineRunError, match="snapshot integrity"):
+        runner._resolve_stage(runner.plan.stages_by_id["preflight"], run_dir)
+
+
+def test_standard_snapshot_tamper_blocks_resume_before_manifest_mutation(
+    tmp_path: Path,
+) -> None:
+    runner, run_dir = _initialized_standard_run(tmp_path, "tampered-resume")
+    failed = run_dir / "_FAILED.json"
+    failed.write_text('{"status":"failed"}\n', encoding="utf-8")
+    manifest_before = (run_dir / "manifest.json").read_bytes()
+    (run_dir / "config/source_snapshot/FARM-Project/scripts/farm_standard_stage.py").write_text(
+        "# tampered\n", encoding="utf-8"
+    )
+    with pytest.raises(PipelineRunError, match="snapshot integrity"):
+        runner.run(resume=True, run_id="tampered-resume")
+    assert (run_dir / "manifest.json").read_bytes() == manifest_before
+    assert failed.is_file()
+    assert not (run_dir / "_SUCCESS.json").exists()
+
+
+def test_standard_snapshot_tamper_during_child_cannot_publish_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner, run_dir = _initialized_standard_run(tmp_path, "mid-child-tamper")
+    resolved = runner._resolve_stage(runner.plan.stages_by_id["preflight"], run_dir)
+    fingerprint, inputs = runner._stage_fingerprint(resolved, {})
+    wrapper = run_dir / "config/source_snapshot/FARM-Project/scripts/farm_standard_stage.py"
+
+    def fake_process(*args, **kwargs):
+        for output in resolved.outputs:
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text('{"status":"PASS"}\n', encoding="utf-8")
+        wrapper.write_text("# tampered while child ran\n", encoding="utf-8")
+        return SimpleNamespace(returncode=0, timed_out=False, interrupted=False)
+
+    monkeypatch.setattr("farm_runtime.orchestrator.run_monitored_process", fake_process)
+    with pytest.raises(PipelineRunError, match="snapshot integrity"):
+        runner._run_stage(resolved, run_dir, fingerprint, inputs)
+    assert (run_dir / "stages/preflight/_FAILED.json").is_file()
+    assert not (run_dir / "stages/preflight/_SUCCESS.json").exists()
+
+
+def test_standard_finalizer_and_report_execute_from_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner, run_dir = _initialized_standard_run(tmp_path, "snapshot-report")
+    snapshot_root = run_dir / "config/source_snapshot/FARM-Project"
+    calls: list[tuple[tuple[str, ...], Path]] = []
+
+    def fake_process(command, *, cwd, **kwargs):
+        calls.append((tuple(map(str, command)), Path(cwd)))
+        if any(Path(token).name == "build_farm_run_report.py" for token in command):
+            (run_dir / "REPORT.md").write_text("report\n", encoding="utf-8")
+            (run_dir / "visuals/scene_summary.mp4").write_bytes(b"video")
+        return SimpleNamespace(
+            returncode=0, timed_out=False, interrupted=False, duration_seconds=0.01
+        )
+
+    monkeypatch.setattr("farm_runtime.orchestrator.run_monitored_process", fake_process)
+    runner._run_finalizers(run_dir)
+    report = runner._write_standard_report(run_dir)
+    assert report is not None
+    assert calls[0][0][1] == str(snapshot_root / "scripts/farm_standard_stage.py")
+    assert calls[0][1] == snapshot_root
+    assert calls[1][0][2] == str(snapshot_root / "scripts/build_farm_run_report.py")
+    assert calls[1][1] == snapshot_root
+
+
+def test_standard_config_mutation_fails_closed_before_resolution(tmp_path: Path) -> None:
+    runner, run_dir = _initialized_standard_run(tmp_path, "config-tamper")
+    runner.plan.source_path.write_text(
+        runner.plan.source_path.read_text(encoding="utf-8") + "# tampered\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(PipelineRunError, match="source config changed"):
+        runner._resolve_stage(runner.plan.stages_by_id["preflight"], run_dir)
+
+
+def test_standard_wrapper_import_does_not_mutate_signed_snapshot(
+    tmp_path: Path,
+) -> None:
+    run_dir = tmp_path / "real-wrapper-run"
+    run_dir.mkdir()
+    reference = _create_source_snapshot(
+        ROOT,
+        run_dir,
+        source_config_path=ROOT / "configs/scenes/factory_3dgs_colmap.yaml",
+    )
+    (run_dir / "manifest.json").write_text(
+        json.dumps({"source_snapshot": reference}), encoding="utf-8"
+    )
+    snapshot_root = run_dir / "config/source_snapshot/FARM-Project"
+    env = dict(os.environ)
+    env.pop("PYTHONDONTWRITEBYTECODE", None)
+
+    subprocess.run(
+        [sys.executable, str(snapshot_root / "scripts/farm_standard_stage.py"), "--help"],
+        cwd=snapshot_root,
+        env=env,
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+    assert validated_source_snapshot_project_root(run_dir, required=True) == snapshot_root
+    assert not any(path.name == "__pycache__" for path in snapshot_root.rglob("*"))
+    assert not any(path.suffix == ".pyc" for path in snapshot_root.rglob("*"))
+
+
 def test_advanced_run_is_atomic_self_contained_and_resumable(tmp_path: Path) -> None:
     helper = tmp_path / "copy.py"
     _helper(helper)
@@ -508,16 +734,18 @@ def test_scene_contract_compiles_full_standard_dag(tmp_path: Path) -> None:
     assert "${run_dir}/viewer/launch.sh" in plan.stages_by_id["qa_bundle"].outputs
     assert "${run_dir}/qa/acceptance/result.json" in plan.stages_by_id["finalize"].outputs
     runner = RunOrchestrator(plan)
+    run_dir = runner._new_run_dir("portable-scene-fingerprint")
+    runner._initialize_run(run_dir)
     stage = plan.stages_by_id["preflight"]
-    resolved = runner._resolve_stage(stage, tmp_path / "synthetic-run")
+    resolved = runner._resolve_stage(stage, run_dir)
     first, _ = runner._stage_fingerprint(resolved, {})
     ply.write_text("ply-v2-changed", encoding="utf-8")
-    resolved = runner._resolve_stage(stage, tmp_path / "synthetic-run")
+    resolved = runner._resolve_stage(stage, run_dir)
     second, _ = runner._stage_fingerprint(resolved, {})
     assert first != second
 
 
-def test_standard_stage_code_change_invalidates_stage_and_downstream(tmp_path: Path) -> None:
+def test_standard_stage_code_is_frozen_after_run_initialization(tmp_path: Path) -> None:
     colmap = tmp_path / "data/sparse/0"
     images = tmp_path / "data/images"
     colmap.mkdir(parents=True)
@@ -542,17 +770,24 @@ def test_standard_stage_code_change_invalidates_stage_and_downstream(tmp_path: P
     )
     plan = load_plan(scene_path, project_root=tmp_path)
     runner = RunOrchestrator(plan)
-    run_dir = tmp_path / "synthetic-run"
-    geometry = runner._resolve_stage(plan.stages_by_id["geometry"], run_dir)
     target = tmp_path / "scripts/refine_farm_object_geometry.py"
-    assert target in geometry.fingerprint_inputs
-    before, _ = runner._stage_fingerprint(geometry, {})
-
     target.parent.mkdir(parents=True)
+    target.write_text("# geometry implementation v1\n", encoding="utf-8")
+    semantic_contract = tmp_path / "src/scene_graph/captioning/label_contract.py"
+    semantic_contract.parent.mkdir(parents=True)
+    semantic_contract.write_text("# label contract v1\n", encoding="utf-8")
+    run_dir = runner._new_run_dir("frozen-code-fingerprint")
+    runner._initialize_run(run_dir)
+    snapshot_root = run_dir / "config/source_snapshot/FARM-Project"
+
+    geometry = runner._resolve_stage(plan.stages_by_id["geometry"], run_dir)
+    snapshot_target = snapshot_root / "scripts/refine_farm_object_geometry.py"
+    assert snapshot_target in geometry.fingerprint_inputs
+    before, _ = runner._stage_fingerprint(geometry, {})
     target.write_text("# changed geometry implementation\n", encoding="utf-8")
     geometry = runner._resolve_stage(plan.stages_by_id["geometry"], run_dir)
     after, _ = runner._stage_fingerprint(geometry, {})
-    assert before != after
+    assert before == after
 
     downstream = runner._resolve_stage(plan.stages_by_id["visual_consistency"], run_dir)
     downstream_before, _ = runner._stage_fingerprint(
@@ -561,17 +796,18 @@ def test_standard_stage_code_change_invalidates_stage_and_downstream(tmp_path: P
     downstream_after, _ = runner._stage_fingerprint(
         downstream, {"geometry": after}
     )
-    assert downstream_before != downstream_after
+    assert downstream_before == downstream_after
 
     semantics = runner._resolve_stage(plan.stages_by_id["semantics"], run_dir)
-    semantic_contract = tmp_path / "src/scene_graph/captioning/label_contract.py"
-    assert semantic_contract in semantics.fingerprint_inputs
+    snapshot_semantic_contract = (
+        snapshot_root / "src/scene_graph/captioning/label_contract.py"
+    )
+    assert snapshot_semantic_contract in semantics.fingerprint_inputs
     semantic_before, _ = runner._stage_fingerprint(semantics, {})
-    semantic_contract.parent.mkdir(parents=True)
     semantic_contract.write_text("# changed label contract\n", encoding="utf-8")
     semantics = runner._resolve_stage(plan.stages_by_id["semantics"], run_dir)
     semantic_after, _ = runner._stage_fingerprint(semantics, {})
-    assert semantic_before != semantic_after
+    assert semantic_before == semantic_after
 
     part_whole = runner._resolve_stage(plan.stages_by_id["part_whole"], run_dir)
     part_whole_before, _ = runner._stage_fingerprint(
@@ -580,7 +816,7 @@ def test_standard_stage_code_change_invalidates_stage_and_downstream(tmp_path: P
     part_whole_after, _ = runner._stage_fingerprint(
         part_whole, {"semantics": semantic_after}
     )
-    assert part_whole_before != part_whole_after
+    assert part_whole_before == part_whole_after
 
 
 def test_each_standard_stage_declares_target_code_dependencies() -> None:

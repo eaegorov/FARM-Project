@@ -27,6 +27,7 @@ from farm_pipeline.final_acceptance import (  # noqa: E402
     presentation_ids,
     refresh_runtime_status,
     run_acceptance_policy,
+    validated_assembly_semantic_row,
 )
 
 
@@ -146,6 +147,7 @@ def main() -> int:
     parser.add_argument("--scene-state", type=Path, required=True)
     parser.add_argument("--dedup-audit", type=Path, required=True)
     parser.add_argument("--semantic-catalog", type=Path, required=True)
+    parser.add_argument("--assembly-review", type=Path, required=True)
     parser.add_argument("--mask-root", type=Path, action="append", required=True)
     parser.add_argument("--output-state", type=Path, required=True)
     parser.add_argument("--output-report", type=Path, required=True)
@@ -160,6 +162,7 @@ def main() -> int:
     state_path = args.scene_state.expanduser().resolve(strict=True)
     audit_path = args.dedup_audit.expanduser().resolve(strict=True)
     semantic_path = args.semantic_catalog.expanduser().resolve(strict=True)
+    assembly_path = args.assembly_review.expanduser().resolve(strict=True)
     output_state_path = args.output_state.expanduser().resolve()
     if output_state_path == state_path:
         raise ValueError("output-state must differ from the immutable input scene-state")
@@ -167,10 +170,45 @@ def main() -> int:
     payload, state = _load_state(state_path)
     audit = _load_json(audit_path)
     semantic = _load_json(semantic_path)
+    assembly = _load_json(assembly_path)
     if not isinstance(audit, dict):
         raise TypeError("dedup audit must be a JSON object")
     if not isinstance(semantic, list):
         raise TypeError("semantic catalog must be a JSON array")
+    if (
+        not isinstance(assembly, dict)
+        or assembly.get("schema") != "farm.open-vocabulary-crop-review.v2"
+        or not isinstance(assembly.get("objects"), list)
+    ):
+        raise TypeError("assembly review must use farm.open-vocabulary-crop-review.v2")
+    semantic = list(semantic)
+    direct_ids = {
+        int(row["id"])
+        for row in semantic
+        if isinstance(row, Mapping) and row.get("id") is not None
+    }
+    accepted_assembly_ids: list[int] = []
+    rejected_assembly_rows: list[dict[str, Any]] = []
+    for row in assembly["objects"]:
+        if not isinstance(row, Mapping):
+            rejected_assembly_rows.append({"id": None, "reason": "invalid_review_row"})
+            continue
+        semantic_row, reason = validated_assembly_semantic_row(
+            state,
+            row,
+            minimum_confidence=assembly.get("min_confidence", 0.65),
+        )
+        if semantic_row is None:
+            rejected_assembly_rows.append({"id": row.get("id"), "reason": reason})
+            continue
+        object_id = int(semantic_row["id"])
+        if object_id in direct_ids:
+            raise ValueError(
+                f"object {object_id} appears in direct and assembly semantic catalogs"
+            )
+        direct_ids.add(object_id)
+        accepted_assembly_ids.append(object_id)
+        semantic.append(semantic_row)
     visible, _ = presentation_ids(state)
     crop_counts = _decodable_crop_counts(state, visible, roots)
     output_state, report, clusters, labels = run_acceptance_policy(
@@ -183,10 +221,16 @@ def main() -> int:
         apply_holdouts=args.mode == "apply",
     )
     report["mode"] = args.mode
+    report["assembly_semantics"] = {
+        "tier_cap": "probable",
+        "accepted_ids": sorted(accepted_assembly_ids),
+        "rejected_rows": rejected_assembly_rows,
+    }
     report["sources"] = {
         "scene_state": {"path": str(state_path), "sha256": _sha256(state_path)},
         "dedup_audit": {"path": str(audit_path), "sha256": _sha256(audit_path)},
         "semantic_catalog": {"path": str(semantic_path), "sha256": _sha256(semantic_path)},
+        "assembly_review": {"path": str(assembly_path), "sha256": _sha256(assembly_path)},
         "mask_roots": [str(path) for path in roots],
     }
     output_payload = dict(payload)

@@ -11,7 +11,11 @@ if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
 from convert_colmap_kb4_to_pinhole import (  # noqa: E402
+    ColmapModel,
+    PointTable,
+    RegisteredImage,
     ViewSpec,
+    build_virtual_geometry,
     build_kb4_remap,
     camera_center,
     main,
@@ -110,6 +114,158 @@ def test_kb4_remap_has_expected_axis_and_coverage():
     assert stats["valid_ratio"] > 0.99
     expected_axis = np.asarray([np.sin(np.deg2rad(35)), 0, np.cos(np.deg2rad(35))])
     assert np.allclose([stats["axis_x"], stats["axis_y"], stats["axis_z"]], expected_axis)
+
+
+def test_kb4_remap_uses_colmap_half_pixel_centers():
+    camera = Camera(
+        1,
+        "KANNALABRANDT4",
+        128,
+        128,
+        np.asarray([36, 36, 64, 64, 0.01, 0.001, 0, 0], dtype=np.float64),
+    )
+    intrinsics = pinhole_intrinsics(64, 64, 80, 80)
+    map_x, map_y, stats = build_kb4_remap(
+        camera, intrinsics, 64, 64, ViewSpec("center", 0, 0)
+    )
+
+    # COLMAP's origin is the image corner, so the four middle pixel centers of
+    # an even-sized image surround the optical axis symmetrically at +/-0.5 px.
+    middle = np.s_[31:33, 31:33]
+    assert np.isclose(float(map_x[middle].mean()), 63.5, atol=1e-6)
+    assert np.isclose(float(map_y[middle].mean()), 63.5, atol=1e-6)
+    assert np.isclose(float(map_x[31, 31] + map_x[32, 32]), 127.0, atol=1e-5)
+    assert np.isclose(float(map_y[31, 31] + map_y[32, 32]), 127.0, atol=1e-5)
+
+    fx, fy, cx, cy = (
+        float(intrinsics[0, 0]),
+        float(intrinsics[1, 1]),
+        float(intrinsics[0, 2]),
+        float(intrinsics[1, 2]),
+    )
+    corner_x = (0.5 - cx) / fx
+    corner_y = (0.5 - cy) / fy
+    expected_theta_max = np.degrees(np.arctan2(np.hypot(corner_x, corner_y), 1.0))
+    assert np.isclose(stats["theta_max_deg"], expected_theta_max, atol=1e-10)
+
+
+def test_kb4_remap_converts_colmap_coordinates_to_opencv_indices():
+    width = height = 32
+    source_width = source_height = 64
+    focal = 10_000.0
+    # tan(theta) series makes this KB4 camera numerically pinhole over the tiny
+    # test FOV, while still exercising the real KB4 projection and cv2.remap.
+    camera = Camera(
+        1,
+        "KANNALABRANDT4",
+        source_width,
+        source_height,
+        np.asarray(
+            [
+                focal,
+                focal,
+                source_width / 2.0,
+                source_height / 2.0,
+                1.0 / 3.0,
+                2.0 / 15.0,
+                17.0 / 315.0,
+                62.0 / 2835.0,
+            ],
+            dtype=np.float64,
+        ),
+    )
+    intrinsics = np.asarray(
+        [
+            [focal, 0.0, width / 2.0],
+            [0.0, focal, height / 2.0],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+    map_x, map_y, stats = build_kb4_remap(
+        camera, intrinsics, width, height, ViewSpec("center", 0, 0)
+    )
+    source = np.arange(
+        source_width * source_height, dtype=np.uint16
+    ).reshape(source_height, source_width)
+    remapped = cv2.remap(
+        source,
+        map_x,
+        map_y,
+        cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=0,
+    )
+
+    assert stats["valid_ratio"] == 1.0
+    offset_x = (source_width - width) // 2
+    offset_y = (source_height - height) // 2
+    assert np.allclose(map_x, np.arange(width)[None, :] + offset_x, atol=1e-6)
+    assert np.allclose(map_y, np.arange(height)[:, None] + offset_y, atol=1e-6)
+    assert np.array_equal(
+        remapped,
+        source[offset_y : offset_y + height, offset_x : offset_x + width],
+    )
+
+
+def test_virtual_geometry_keeps_full_colmap_continuous_image_domain():
+    point_ids = np.asarray([10, 11, 12, 13], dtype=np.int64)
+    points = PointTable(
+        ids=point_ids,
+        xyz=np.asarray(
+            [
+                [-2.0, 0.0, 1.0],   # u = 0: left image boundary, included
+                [1.5, 0.0, 1.0],    # u = 3.5: rightmost pixel center, included
+                [1.999, 0.0, 1.0],  # u = 3.999: inside the right half-pixel strip
+                [2.0, 0.0, 1.0],    # u = 4: right image boundary, excluded
+            ],
+            dtype=np.float64,
+        ),
+        rgb=np.zeros((4, 3), dtype=np.uint8),
+        error=np.zeros(4, dtype=np.float64),
+    )
+    source = RegisteredImage(
+        image_id=1,
+        qvec=np.asarray([1.0, 0.0, 0.0, 0.0]),
+        tvec=np.zeros(3, dtype=np.float64),
+        camera_id=1,
+        name="00/000001.png",
+        xys=np.zeros((4, 2), dtype=np.float64),
+        point3d_ids=point_ids,
+    )
+    model = ColmapModel(
+        cameras={
+            1: Camera(
+                1,
+                "KANNALABRANDT4",
+                4,
+                4,
+                np.asarray([1, 1, 2, 2, 0, 0, 0, 0], dtype=np.float64),
+            )
+        },
+        images={1: source},
+        points=points,
+        source_format="text",
+        source_files=(),
+    )
+    intrinsics = np.asarray(
+        [[1.0, 0.0, 2.0], [0.0, 1.0, 2.0], [0.0, 0.0, 1.0]], dtype=np.float64
+    )
+    images, tracks, _ = build_virtual_geometry(
+        model,
+        [ViewSpec("center", 0, 0)],
+        intrinsics,
+        4,
+        4,
+        {(1, "center"): "cam00_000001_center.png"},
+        min_source_observations=1,
+    )
+
+    assert images[0].point_indices.tolist() == [0, 1, 2]
+    assert np.allclose(images[0].xys[:, 0], [0.0, 3.5, 3.999])
+    assert tracks.kept_point_indices.tolist() == [0, 1, 2]
+    assert tracks.image_ids.tolist() == [1, 1, 1]
+    assert tracks.point2d_indices.tolist() == [0, 1, 2]
 
 
 def test_end_to_end_writes_standard_text_and_binary_and_is_idempotent(tmp_path):

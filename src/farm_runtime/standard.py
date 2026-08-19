@@ -38,6 +38,7 @@ STANDARD_SHARED_CODE_INPUTS = (
     "src/farm_pipeline/resources.py",
     "src/farm_pipeline/scene_config.py",
     "src/farm_runtime/process.py",
+    "src/farm_runtime/source_snapshot.py",
     "src/farm_runtime/standard.py",
 )
 
@@ -148,9 +149,9 @@ def _project_root(config_path: Path, override: str | Path | None) -> Path:
 
 
 def _stage(stage_id: str, needs: list[str], outputs: list[str], result: str) -> dict[str, Any]:
-    wrapper = "${project_root}/scripts/farm_standard_stage.py"
+    wrapper = "${execution_project_root}/scripts/farm_standard_stage.py"
     code_inputs = [
-        f"${{project_root}}/{relative_path}"
+        f"${{execution_project_root}}/{relative_path}"
         for relative_path in (
             *STANDARD_SHARED_CODE_INPUTS,
             *STANDARD_STAGE_CODE_INPUTS[stage_id],
@@ -170,7 +171,8 @@ def _stage(stage_id: str, needs: list[str], outputs: list[str], result: str) -> 
             "--stage",
             stage_id,
         ],
-        "cwd": "${project_root}",
+        "cwd": "${execution_project_root}",
+        "env": {"PYTHONDONTWRITEBYTECODE": "1"},
         "inputs": [wrapper],
         "outputs": outputs,
         "pass_json": [result],
@@ -279,14 +281,15 @@ def compile_standard_scene(
                 {
                     "command": [
                         "${python_executable}",
-                        "${project_root}/scripts/farm_standard_stage.py",
+                        "${execution_project_root}/scripts/farm_standard_stage.py",
                         "--config",
                         "${config_path}",
                         "--run-dir",
                         "${run_dir}",
                         "--cleanup",
                     ],
-                    "cwd": "${project_root}",
+                    "cwd": "${execution_project_root}",
+                    "env": {"PYTHONDONTWRITEBYTECODE": "1"},
                     "timeout_seconds": 90.0,
                 }
             ],

@@ -5,11 +5,22 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 import time
 from collections import Counter
 from pathlib import Path
 
 import torch
+
+
+ROOT = Path(__file__).resolve().parents[1]
+SRC = ROOT / "src"
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
+
+from farm_pipeline.final_acceptance import (  # noqa: E402
+    validated_assembly_semantic_row,
+)
 
 
 def ensure_list(state: dict, key: str, size: int, default):
@@ -139,6 +150,13 @@ def main() -> int:
     assembly_payload = json.loads(
         assembly_review_path.read_text(encoding="utf-8")
     )
+    if (
+        not isinstance(assembly_payload, dict)
+        or assembly_payload.get("schema") != "farm.open-vocabulary-crop-review.v2"
+        or not isinstance(assembly_payload.get("objects"), list)
+    ):
+        raise ValueError("Unsupported assembly review contract")
+    minimum_assembly_confidence = assembly_payload.get("min_confidence", 0.65)
     assembly_index_by_members: dict[tuple[int, ...], int] = {}
     for index, members in enumerate(assembly_members):
         key = _canonical_member_tuple(members)
@@ -199,17 +217,34 @@ def main() -> int:
                 confidences[index] = float(row.get("review_confidence") or 0.0)
                 annotated_inactive_assemblies.append(int(object_ids[index]))
             continue
+        semantic_row, semantic_reason = validated_assembly_semantic_row(
+            state,
+            row,
+            minimum_confidence=minimum_assembly_confidence,
+        )
+        if semantic_row is None:
+            skipped_assemblies.append(
+                {
+                    "id": review_id,
+                    "reason": semantic_reason,
+                    "geometry_status": str(geometry_statuses[index]),
+                    "review_members": list(review_members),
+                }
+            )
+            continue
         active[index] = True
-        categories[index] = str(row.get("review_category") or "object")
-        captions[index] = str(row.get("review_description") or "")
+        categories[index] = str(semantic_row["category"])
+        captions[index] = str(semantic_row.get("description") or "")
         attributes[index] = [
-            str(value) for value in (row.get("review_attributes") or [])
+            str(value) for value in (semantic_row.get("attributes") or [])
         ]
         supercategories[index] = "open-vocabulary assembly"
         decisions[index] = "keep"
-        statuses[index] = "vlm_assembly_confirmed"
-        tiers[index] = "confirmed"
-        confidences[index] = float(row.get("review_confidence") or 0.0)
+        statuses[index] = str(semantic_row["semantic_status"])
+        # An assembly has one blind review event. It is useful structured
+        # evidence, but never an independent confirmation pair.
+        tiers[index] = "probable"
+        confidences[index] = float(semantic_row["review_confidence"])
 
     state["active"] = active
     state["object_review_confidence"] = confidences
@@ -224,7 +259,10 @@ def main() -> int:
         "active_metric_objects": int(active.sum().item()),
         "tier_counts": dict(tier_counts),
         "default_viewer_layer": "confirmed_plus_probable",
-        "activation_invariant": "geometry_pass AND semantic_keep AND exact_member_provenance",
+        "activation_invariant": (
+            "geometry_pass AND validated_structured_semantic_review "
+            "AND exact_member_provenance"
+        ),
         "skipped_direct": skipped_direct,
         "skipped_assemblies": skipped_assemblies,
         "annotated_inactive_compound_assemblies": annotated_inactive_assemblies,

@@ -84,6 +84,9 @@ class Plan:
             "config_dir": str(self.source_path.parent),
             "config_path": str(self.source_path),
             "project_root": str(self.project_root),
+            "execution_project_root": str(
+                (run_dir / "config/source_snapshot/FARM-Project").resolve(strict=False)
+            ),
             "output_root": str(self.output_root),
             "run_dir": str(run_dir),
             "scene_id": self.scene_id,

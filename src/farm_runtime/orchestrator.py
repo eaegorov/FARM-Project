@@ -19,6 +19,10 @@ from typing import Any, Mapping, Sequence
 from .config import Finalizer, Plan, PlanError, Stage, canonical_json, plan_to_public_dict, render_template, resolve_plan_path
 from .process import atomic_write_json, run_monitored_process, utc_now
 from .process import atomic_write_text
+from .source_snapshot import (
+    SourceSnapshotIntegrityError,
+    validated_source_snapshot_project_root,
+)
 
 
 class PipelineRunError(RuntimeError):
@@ -493,6 +497,36 @@ class RunOrchestrator:
         self.scene_root = plan.output_root / plan.scene_id
         self.runs_root = self.scene_root / "runs"
 
+    def _is_standard_contract(self) -> bool:
+        scene = self.plan.raw.get("scene")
+        return bool(
+            isinstance(scene, Mapping)
+            and scene.get("standard_contract") == "farm.scene.v1"
+        )
+
+    def _validated_execution_root(self, run_dir: Path) -> Path | None:
+        """Validate and return canonical first-party source for standard runs."""
+
+        if not self._is_standard_contract():
+            return None
+        try:
+            root = validated_source_snapshot_project_root(run_dir, required=True)
+        except SourceSnapshotIntegrityError as exc:
+            raise PipelineRunError(
+                f"Execution source snapshot integrity failure: {exc}"
+            ) from exc
+        if root is None:  # required=True makes this unreachable; keep typing fail-closed.
+            raise PipelineRunError("Standard run has no execution source snapshot")
+        try:
+            config_sha256 = _sha256_file(self.plan.source_path.resolve(strict=True))
+        except (FileNotFoundError, OSError) as exc:
+            raise PipelineRunError("Standard run source config is missing") from exc
+        if config_sha256 != self.plan.config_sha256:
+            raise PipelineRunError(
+                "Standard run source config changed after the plan was loaded"
+            )
+        return root
+
     def _new_run_dir(self, requested_id: str | None = None) -> Path:
         base = _safe_run_id(requested_id) if requested_id else _run_id(self.plan.config_sha256)
         self.runs_root.mkdir(parents=True, exist_ok=True)
@@ -527,6 +561,7 @@ class RunOrchestrator:
             raise PipelineRunError(f"Run manifest is missing or invalid: {run_dir}")
         if manifest.get("config_sha256") != self.plan.config_sha256:
             raise PipelineRunError("Refusing to resume with a different pipeline config")
+        self._validated_execution_root(run_dir)
         if (run_dir / "_SUCCESS.json").exists():
             raise PipelineRunError("Successful runs are immutable; create a new run instead")
         return run_dir
@@ -569,6 +604,7 @@ class RunOrchestrator:
             "stage_order": list(self.plan.stage_order),
         }
         atomic_write_json(run_dir / "manifest.json", manifest)
+        self._validated_execution_root(run_dir)
         _atomic_symlink(self.scene_root / "latest-attempt", run_dir)
 
     def _update_manifest(self, run_dir: Path, **updates: Any) -> None:
@@ -579,6 +615,9 @@ class RunOrchestrator:
 
     def _context(self, run_dir: Path) -> dict[str, str]:
         context = self.plan.base_context(run_dir)
+        execution_root = self._validated_execution_root(run_dir)
+        if execution_root is not None:
+            context["execution_project_root"] = str(execution_root)
         for name, path in self.plan.resolved_artifacts(run_dir).items():
             context[f"artifact:{name}"] = str(path)
             context[f"artifacts.{name}"] = str(path)
@@ -679,6 +718,8 @@ class RunOrchestrator:
         fingerprint: str,
         input_fingerprints: Sequence[Mapping[str, Any]],
     ) -> Mapping[str, Any]:
+        # Detect tamper before creating an attempt or advancing stage state.
+        self._validated_execution_root(run_dir)
         stage_dir = run_dir / "stages" / resolved.stage.id
         stage_dir.mkdir(parents=True, exist_ok=True)
         old_state = _safe_json_load(stage_dir / "state.json") or {}
@@ -714,6 +755,8 @@ class RunOrchestrator:
         atomic_write_json(stage_dir / "state.json", state)
         try:
             self._validate_inputs(resolved)
+            # Narrow the validation-to-spawn window after all state setup.
+            self._validated_execution_root(run_dir)
             result = run_monitored_process(
                 resolved.command,
                 cwd=resolved.cwd,
@@ -731,6 +774,8 @@ class RunOrchestrator:
             if result.returncode != 0:
                 raise PipelineRunError(f"Stage {resolved.stage.id} exited with code {result.returncode}")
             pass_payloads = self._validate_outputs(resolved)
+            # A child returning 0/PASS cannot bless source altered while it ran.
+            self._validated_execution_root(run_dir)
             telemetry_summary = result.telemetry.as_dict()
             state.update(
                 {
@@ -817,20 +862,24 @@ class RunOrchestrator:
     def _write_standard_report(self, run_dir: Path) -> Mapping[str, Any] | None:
         """Create the required report bundle for canonical farm.scene.v1 runs."""
 
-        scene = self.plan.raw.get("scene")
-        if not isinstance(scene, Mapping) or scene.get("standard_contract") != "farm.scene.v1":
+        if not self._is_standard_contract():
             return None
+        execution_root = self._validated_execution_root(run_dir)
+        assert execution_root is not None
         command = [
             sys.executable,
-            str(self.plan.project_root / "scripts" / "build_farm_run_report.py"),
+            "-B",
+            str(execution_root / "scripts" / "build_farm_run_report.py"),
             "--run-dir",
             str(run_dir),
         ]
+        report_env = dict(os.environ)
+        report_env["PYTHONDONTWRITEBYTECODE"] = "1"
         log_dir = run_dir / "logs" / "report"
         result = run_monitored_process(
             command,
-            cwd=self.plan.project_root,
-            env=dict(os.environ),
+            cwd=execution_root,
+            env=report_env,
             stdout_path=log_dir / "stdout.log",
             stderr_path=log_dir / "stderr.log",
             telemetry_path=log_dir / "telemetry.jsonl",
@@ -839,6 +888,7 @@ class RunOrchestrator:
         )
         if result.returncode != 0 or result.timed_out or result.interrupted:
             raise PipelineRunError("final run report/video generation failed")
+        self._validated_execution_root(run_dir)
         required = (run_dir / "REPORT.md", run_dir / "visuals" / "scene_summary.mp4")
         if any(not path.is_file() or path.stat().st_size == 0 for path in required):
             raise PipelineRunError("final run report/video artifacts are missing")
@@ -860,6 +910,7 @@ class RunOrchestrator:
             env = dict(os.environ)
             env.update(stage_env)
             log_dir = run_dir / "logs" / "finalizers"
+            self._validated_execution_root(run_dir)
             result = run_monitored_process(
                 command,
                 cwd=cwd,
@@ -870,6 +921,7 @@ class RunOrchestrator:
                 interval_seconds=self.plan.telemetry_interval_seconds,
                 timeout_seconds=finalizer.timeout_seconds,
             )
+            self._validated_execution_root(run_dir)
             row = {
                 "index": index,
                 "command": list(_redact_command(command, stage_env)),
@@ -932,6 +984,7 @@ class RunOrchestrator:
                     and not any(stage_actions.get(dep) == "executed" for dep in stage.needs)
                 )
                 if can_skip:
+                    self._validated_execution_root(run_dir)
                     dependency_fingerprints[stage_id] = fingerprint
                     stage_actions[stage_id] = "resumed-cache"
                     continue
@@ -954,18 +1007,23 @@ class RunOrchestrator:
                 timing = self._write_timing(run_dir, started_monotonic)
                 if report is not None:
                     report["duration_seconds"] = round(time.monotonic() - started_monotonic, 6)
+                    execution_root = self._validated_execution_root(run_dir)
+                    assert execution_root is not None
                     subprocess.run(
                         [
                             sys.executable,
-                            str(self.plan.project_root / "scripts" / "build_farm_run_report.py"),
+                            "-B",
+                            str(execution_root / "scripts" / "build_farm_run_report.py"),
                             "--run-dir",
                             str(run_dir),
                             "--no-video",
                         ],
-                        cwd=str(self.plan.project_root),
+                        cwd=str(execution_root),
+                        env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
                         check=True,
                         shell=False,
                     )
+                    self._validated_execution_root(run_dir)
             except Exception as exc:
                 primary_error = exc
                 report = None
@@ -997,6 +1055,7 @@ class RunOrchestrator:
                 "viewer_bundle": "viewer/bundle.json",
                 "run_report": report,
             }
+            self._validated_execution_root(run_dir)
             atomic_write_json(run_dir / "_SUCCESS.json", success)
             self._update_manifest(run_dir, status="success", finished_at=success["finished_at"])
             _atomic_symlink(self.scene_root / "latest", run_dir)
