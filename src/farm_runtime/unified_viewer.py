@@ -423,8 +423,10 @@ def _preflight_source_fingerprint(
     The registry and the producer are allowed to use different supported hash
     algorithms. This is needed for old registries that pin the historical
     sampled digest while current FARM runs record a full SHA-256 for the same
-    release-critical PLY. Algorithm conversion is never inferred from a path:
-    both fingerprints are verified against the actual configured file.
+    release-critical PLY. Producer paths are host provenance and may be
+    relocated by a read-only container mount. Selection therefore requires one
+    unambiguous absolute PLY record, and both fingerprints are verified against
+    the actual configured file; path equality is never used as content proof.
     """
 
     report = _load_json(run_dir / "input" / "scene_preflight.json")
@@ -446,7 +448,7 @@ def _preflight_source_fingerprint(
         raise UnifiedViewerError("FARM scene-preflight fingerprints files must be a list")
 
     canonical_source = source_path.expanduser().resolve(strict=True)
-    path_matches: list[Mapping[str, Any]] = []
+    source_records: list[Mapping[str, Any]] = []
     for row in files:
         if not isinstance(row, Mapping):
             continue
@@ -454,19 +456,15 @@ def _preflight_source_fingerprint(
         if not isinstance(recorded_path, str) or not recorded_path.strip():
             continue
         candidate = Path(recorded_path).expanduser()
-        if not candidate.is_absolute():
-            # Preflight records resolved absolute inputs. Treat a relative
-            # value as malformed instead of guessing a base directory.
-            continue
-        if candidate.resolve(strict=False) == canonical_source:
-            path_matches.append(row)
-    if len(path_matches) != 1:
+        if candidate.is_absolute() and candidate.suffix.lower() == ".ply":
+            source_records.append(row)
+    if len(source_records) != 1:
         raise UnifiedViewerError(
-            "FARM run is not bound to the configured source PLY path "
-            f"({len(path_matches)} exact records)"
+            "FARM run must contain exactly one absolute source PLY fingerprint record "
+            f"(got {len(source_records)})"
         )
 
-    row = path_matches[0]
+    row = source_records[0]
     required = {"algorithm", "digest", "size_bytes", "chunk_bytes", "sampled_offsets"}
     missing = sorted(required - set(row))
     if missing:
@@ -1798,13 +1796,24 @@ def _validate_shaper_candidate(
         raise UnifiedViewerError("ShapeR scene inputs are absent")
     farm_input_path = Path(str(inputs.get("farm_run") or "")).expanduser().resolve(strict=False)
     farm_path_matches = farm_input_path == farm.run_dir.resolve()
-    if not release_eligible and not farm_path_matches:
+    relocated_run_identity_matches = (
+        inputs.get("farm_run_id") == farm.run_id
+        and marker.get("farm_run_id") == farm.run_id
+        and assets.get("farm_run_id") == farm.run_id
+    )
+    if release_eligible and not farm_path_matches:
+        farm_path_matches = relocated_run_identity_matches
+    elif not release_eligible and not farm_path_matches:
         farm_path_matches = (
             farm_input_path.name == farm.run_dir.name
             and inputs.get("farm_run_id") == farm.run_id
             and marker.get("farm_run_id") == farm.run_id
             and assets.get("farm_run_id") == farm.run_id
         )
+    farm_success = _load_json(farm.run_dir / "_SUCCESS.json")
+    farm_viewer_bundle_sha = str(farm_success.get("viewer_bundle_sha256") or "")
+    if release_eligible and not _SHA256_RE.fullmatch(farm_viewer_bundle_sha):
+        raise UnifiedViewerError("ShapeR canonical chain requires FARM viewer-bundle SHA-256")
     expected_chain = {
         "farm_success_sha256": farm.success_sha256,
         "farm_acceptance_sha256": acceptance_sha,
@@ -1813,6 +1822,8 @@ def _validate_shaper_candidate(
         "verified_instance_bank_sha256": dense.bank_sha256,
         "source_ply_sha256": dense.source_full_sha256,
     }
+    if release_eligible:
+        expected_chain["farm_viewer_bundle_sha256"] = farm_viewer_bundle_sha
     if not farm_path_matches or any(
         inputs.get(name) != value for name, value in expected_chain.items()
     ):
@@ -1860,6 +1871,10 @@ def _validate_shaper_candidate(
         "source_shaper_batch_result_sha256": inputs["shaper_batch_result_sha256"],
         "shaper_inputs_result_sha256": inputs["shaper_inputs_result_sha256"],
     }
+    if release_eligible:
+        direct_chain["farm_viewer_bundle_sha256"] = expected_chain[
+            "farm_viewer_bundle_sha256"
+        ]
     if any(assets.get(name) != value for name, value in direct_chain.items()):
         raise UnifiedViewerError("ShapeR viewer assets differ from the canonical scene input chain")
     recorded_batch = Path(str(inputs.get("shaper_batch") or "")).expanduser()

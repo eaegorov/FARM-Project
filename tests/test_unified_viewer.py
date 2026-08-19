@@ -509,9 +509,12 @@ def _make_canonical_shaper(root: Path, run: Path, source: Path, dense: Path, tre
     glb_record = _artifact_from(combined_glb, root)
     dense_result_sha = sha256_file(dense / "result.json")
     bank_sha = sha256_file(dense / "verified_instance_bank.npz")
+    farm_success = json.loads((run / "_SUCCESS.json").read_text(encoding="utf-8"))
+    farm_run_id = str(farm_success["run_id"])
     chain = {
         "farm_success_sha256": sha256_file(run / "_SUCCESS.json"),
         "farm_acceptance_sha256": sha256_file(run / "qa" / "acceptance" / "result.json"),
+        "farm_viewer_bundle_sha256": farm_success["viewer_bundle_sha256"],
         "resolved_context_sha256": sha256_file(run / "input" / "resolved_context.json"),
         "shaper_batch": str(batch.resolve()),
         "shaper_batch_result_sha256": sha256_file(batch_result),
@@ -538,7 +541,7 @@ def _make_canonical_shaper(root: Path, run: Path, source: Path, dense: Path, tre
         "scene_id": "fixture",
         "coordinate_units": "metres",
         "coordinate_frame": "FARM metric world",
-        "inputs": {"farm_run": str(run.resolve()), **chain},
+        "inputs": {"farm_run": str(run.resolve()), "farm_run_id": farm_run_id, **chain},
         "source_authority": {"signed": True, "tree_sha256": tree},
         "contracts": {
             "qa_pass_meshes_only": True,
@@ -563,12 +566,14 @@ def _make_canonical_shaper(root: Path, run: Path, source: Path, dense: Path, tre
         "schema_version": "farm.shaper-viewer-assets.v1",
         "status": "PASS",
         "scene_id": "fixture",
+        "farm_run_id": farm_run_id,
         "source_scene_manifest_sha256": sha256_file(scene_path),
         "source_shaper_batch": str(batch.resolve()),
         "source_shaper_batch_result_sha256": chain["shaper_batch_result_sha256"],
         "shaper_inputs_result_sha256": chain["shaper_inputs_result_sha256"],
         "farm_success_sha256": chain["farm_success_sha256"],
         "farm_acceptance_sha256": chain["farm_acceptance_sha256"],
+        "farm_viewer_bundle_sha256": chain["farm_viewer_bundle_sha256"],
         "gaussian_lift_result_sha256": chain["gaussian_lift_result_sha256"],
         "verified_instance_bank_sha256": chain["verified_instance_bank_sha256"],
         "source_ply_sha256": chain["source_ply_sha256"],
@@ -590,6 +595,7 @@ def _make_canonical_shaper(root: Path, run: Path, source: Path, dense: Path, tre
         "status": "success",
         "release_eligible": True,
         "scene_id": "fixture",
+        "farm_run_id": farm_run_id,
         "result": "scene_manifest.json",
         "result_sha256": sha256_file(scene_path),
         "viewer_assets": "viewer_assets.json",
@@ -625,6 +631,21 @@ def test_full_sha_producer_binds_to_legacy_sampled_registry_pin(tmp_path: Path) 
 
     assert validation.ok
     assert validation.ready_scenes[0].source_table.count == 4
+
+
+def test_producer_source_binding_allows_content_verified_mount_relocation(
+    tmp_path: Path,
+) -> None:
+    run, host_source = _make_run(tmp_path / "host")
+    mounted_source = tmp_path / "workspace" / "data" / "source.ply"
+    mounted_source.parent.mkdir(parents=True)
+    mounted_source.write_bytes(host_source.read_bytes())
+    registry = _write_registry(tmp_path, run, mounted_source)
+
+    validation = validate_registry(registry)
+
+    assert validation.ok
+    assert validation.ready_scenes[0].source_table.path == mounted_source.resolve()
 
 
 def test_legacy_sampled_producer_binding_still_passes(tmp_path: Path) -> None:
@@ -671,7 +692,7 @@ def test_full_sha_producer_detects_mutation_outside_registry_sample(tmp_path: Pa
     assert "source PLY sha256 mismatch" in validation.scenes[0].reason
 
 
-@pytest.mark.parametrize("failure", ["digest", "size", "count", "path"])
+@pytest.mark.parametrize("failure", ["digest", "size", "count"])
 def test_producer_source_binding_rejects_wrong_record_semantics(
     tmp_path: Path,
     failure: str,
@@ -683,17 +704,15 @@ def test_producer_source_binding_rejects_wrong_record_semantics(
         row["digest"] = "0" * 64
     elif failure == "size":
         row["size_bytes"] = source.stat().st_size + 1
-    elif failure == "count":
-        report["checks"][0]["metrics"]["files"].append(dict(row))
     else:
-        row["path"] = str((tmp_path / "different-source.ply").resolve())
+        report["checks"][0]["metrics"]["files"].append(dict(row))
     _write_json(run / "input" / "scene_preflight.json", report)
 
     validation = validate_registry(registry)
 
     assert not validation.ok
-    if failure in {"count", "path"}:
-        assert "configured source PLY path" in validation.scenes[0].reason
+    if failure == "count":
+        assert "exactly one absolute source PLY fingerprint record" in validation.scenes[0].reason
     else:
         assert "source PLY" in validation.scenes[0].reason
 
@@ -1001,7 +1020,9 @@ def test_dense_all_verified_splats_and_canonical_shaper_v2_exact_assets(tmp_path
     assert "SHA-256 changed" in scene.layers["shaper_meshes"].reason
 
 
-def test_shaper_chain_requires_exact_resolved_farm_run_not_same_basename(tmp_path: Path) -> None:
+def test_shaper_chain_allows_cryptographically_bound_farm_run_mount_relocation(
+    tmp_path: Path,
+) -> None:
     run, source = _make_run(tmp_path)
     tree = _add_signed_snapshot(run)
     dense = tmp_path / "dense"
@@ -1025,6 +1046,42 @@ def test_shaper_chain_requires_exact_resolved_farm_run_not_same_basename(tmp_pat
         tmp_path, run, source, dense_roots=[dense], shaper_roots=[shaper]
     )
     scene = validate_registry(registry).ready_scenes[0]
+    assert scene.layers["shaper_meshes"].ready
+
+
+@pytest.mark.parametrize("field", ["farm_run_id", "farm_viewer_bundle_sha256"])
+def test_shaper_relocated_chain_rejects_wrong_run_identity(
+    tmp_path: Path,
+    field: str,
+) -> None:
+    run, source = _make_run(tmp_path)
+    tree = _add_signed_snapshot(run)
+    dense = tmp_path / "dense"
+    _make_dense_lift(dense, run, source)
+    shaper = tmp_path / "assembly"
+    _make_canonical_shaper(shaper, run, source, dense, tree)
+    scene_path = shaper / "scene_manifest.json"
+    scene_manifest = json.loads(scene_path.read_text(encoding="utf-8"))
+    scene_manifest["inputs"]["farm_run"] = "/host/output/farm/fixture-run-v1"
+    scene_manifest["inputs"][field] = "0" * 64 if field.endswith("sha256") else "wrong-run"
+    _write_json(scene_path, scene_manifest)
+    assets_path = shaper / "viewer_assets.json"
+    assets = json.loads(assets_path.read_text(encoding="utf-8"))
+    assets["source_scene_manifest_sha256"] = sha256_file(scene_path)
+    if field == "farm_viewer_bundle_sha256":
+        assets[field] = scene_manifest["inputs"][field]
+    _write_json(assets_path, assets)
+    marker_path = shaper / "_SUCCESS.json"
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    marker["result_sha256"] = sha256_file(scene_path)
+    marker["viewer_assets_sha256"] = sha256_file(assets_path)
+    _write_json(marker_path, marker)
+    registry = _write_registry(
+        tmp_path, run, source, dense_roots=[dense], shaper_roots=[shaper]
+    )
+
+    scene = validate_registry(registry).ready_scenes[0]
+
     assert not scene.layers["shaper_meshes"].ready
     assert "different FARM/lift/source chain" in scene.layers["shaper_meshes"].reason
 
