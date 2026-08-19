@@ -85,6 +85,8 @@ def test_source_snapshot_is_exact_hashed_allowlisted_and_secret_free(
         "tests/output",
         "models",
         "third_party",
+        "third_party/yoloe/ultralytics",
+        "third_party/yoloe/third_party/ml-mobileclip/mobileclip",
         "cache",
     ):
         (tmp_path / name).mkdir(parents=True, exist_ok=True)
@@ -100,6 +102,13 @@ def test_source_snapshot_is_exact_hashed_allowlisted_and_secret_free(
     (tmp_path / "tests/output/result.txt").write_text("generated\n", encoding="utf-8")
     (tmp_path / "models/weights.bin").write_bytes(b"weights")
     (tmp_path / "third_party/vendor.py").write_text("vendor\n", encoding="utf-8")
+    (tmp_path / "third_party/yoloe/ultralytics/__init__.py").write_text(
+        "# runtime package\n", encoding="utf-8"
+    )
+    (
+        tmp_path
+        / "third_party/yoloe/third_party/ml-mobileclip/mobileclip/__init__.py"
+    ).write_text("# runtime package\n", encoding="utf-8")
     (tmp_path / "cache/cache.bin").write_bytes(b"cache")
     (tmp_path / "private-notes.txt").write_text("root secret\n", encoding="utf-8")
     for name, content in {
@@ -148,6 +157,11 @@ def test_source_snapshot_is_exact_hashed_allowlisted_and_secret_free(
         "file_count": len(snapshot_manifest["files"]),
     }
     assert (snapshot_root / "configs/models/runtime.json").is_file()
+    assert (snapshot_root / "third_party/yoloe/ultralytics/__init__.py").is_file()
+    assert (
+        snapshot_root
+        / "third_party/yoloe/third_party/ml-mobileclip/mobileclip/__init__.py"
+    ).is_file()
     for relative in (
         "configs/.env",
         "docker/credentials.json",

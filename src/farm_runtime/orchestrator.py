@@ -113,6 +113,12 @@ _SOURCE_SNAPSHOT_DIRECTORIES = (
     "scripts",
     "src",
     "tests",
+    # The main runtime image installs these two pinned submodule packages in
+    # editable mode. The signed snapshot is bind-mounted over the repository
+    # inside the container, so it must carry the actual import targets rather
+    # than only the submodule commit recorded in its manifest.
+    "third_party/yoloe/ultralytics",
+    "third_party/yoloe/third_party/ml-mobileclip/mobileclip",
 )
 _SOURCE_SNAPSHOT_ROOT_FILES = (
     ".gitmodules",

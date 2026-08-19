@@ -7,6 +7,8 @@ __pycache__/
 # Local-only env files (API keys, etc.)
 docker/**/.env
 .env
+/secrets.json
+/farm_*.png
 
 # Downloaded model weights (fetched by bootstrap_models.sh).
 # models/dinov3-vits16 is committed in-repo and stays tracked.
