@@ -146,7 +146,16 @@ def test_invalid_metric_dimensions_are_not_added_to_prompt() -> None:
     ) == "Identify the object."
 
 
+def test_active_only_catalog_filter_uses_scene_state() -> None:
+    review = _load("farm_active_semantic_filter", "scripts/review_farm_object_crops.py")
+    rows = [{"id": 1}, {"id": 2}, {"id": 3}]
+    state = {
+        "object_id": np.asarray([3, 1, 2], dtype=np.int64),
+        "active": np.asarray([True, False, True], dtype=np.bool_),
+    }
+    assert review.filter_active_rows(rows, state) == [{"id": 2}, {"id": 3}]
 def test_initial_crop_selection_uses_pose_diversity_additively() -> None:
+
     review = _load(
         "farm_pose_aware_initial_selection",
         "scripts/review_farm_object_crops.py",

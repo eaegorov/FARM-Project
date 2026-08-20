@@ -754,13 +754,24 @@ class Context:
         self.result("PASS", audit="audit.json")
 
     def semantics(self) -> None:
+        semantic_state = "/farm-run/mapping/scene_state_surface_prefilter.pt"
+        self.post("audit_farm_gaussian_support.py", [
+            "--scene-state", "/farm-run/mapping/scene_state_visual.pt",
+            "--frames-json", "/farm-run/rgbd/frames.json",
+            "--direct-mask-root", "/farm-run/mapping/masks",
+            "--assembly-mask-root", "/farm-run/mapping/masks",
+            "--surface-cloud", "/farm-run/mapping/presentation/data/cloud.npz",
+            "--output-state", semantic_state,
+            "--output-report", "/farm-run/qa/surface_prefilter/audit.json",
+            "--no-include-inactive-assemblies", "--enforce",
+        ])
         port, model = self.service("caption")
         url = f"http://127.0.0.1:{port}/v1"
         self.post("review_farm_object_crops.py", [
             "--catalog", "/farm-run/qa/mapping/analysis/reliable_objects_min3.json",
             "--selection-report", "/farm-run/qa/visual_consistency/audit.json",
             "--geometry-report", "/farm-run/qa/geometry/audit.json",
-            "--scene-state", "/farm-run/mapping/scene_state_visual.pt",
+            "--scene-state", semantic_state, "--active-only",
             "--frames-json", "/farm-run/rgbd/frames.json",
             "--mask-dir", "/farm-run/mapping/masks", "--output-dir", "/farm-run/qa/semantics/review",
             "--vllm-url", url, "--model", model, "--crops-per-object", "3", "--workers", "2",
@@ -795,13 +806,13 @@ class Context:
             "--output-dir", "/farm-run/qa/semantics/consensus",
         ])
         self.prep_post("prepare_farm_presentation.py", [
-            "--scene-state", "/farm-run/mapping/scene_state_visual.pt", "--scene-ply", "/input/scene.ply",
+            "--scene-state", semantic_state, "--scene-ply", "/input/scene.ply",
             # Consensus retains every geometry-valid direct object while
             # preventing a weak generic-form fallback from silently replacing
             # a stronger current-run FARM identity.
             "--reviewed-catalog", "/farm-run/qa/semantics/consensus/semantic_consensus_catalog.json",
             "--output-dir", "/farm-run/mapping/presentation", "--state-filename", "scene_state_semantic.pt",
-            "--metadata-source-scene-state", "../scene_state_visual.pt",
+            "--metadata-source-scene-state", "../scene_state_surface_prefilter.pt",
             "--metadata-reviewed-catalog", "../../qa/semantics/consensus/semantic_consensus_catalog.json",
             "--reuse-cloud", "--min-observations", "3", "--no-resolved-only",
             # Camera-distance filtering is presentation-only and must not prune

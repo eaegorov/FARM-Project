@@ -112,6 +112,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--frames-json", type=Path, required=True)
     parser.add_argument("--scene-state", type=Path)
     parser.add_argument(
+        "--active-only",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Review only rows active in --scene-state (fail closed without a state).",
+    )
+    parser.add_argument(
         "--expand-image-matches",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -150,6 +156,23 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     return parser.parse_args()
+
+
+def filter_active_rows(rows: list[dict], state: dict) -> list[dict]:
+    """Return catalog rows whose object IDs are active in the supplied state."""
+
+    if "object_id" not in state or "active" not in state:
+        raise KeyError("active-only review requires object_id and active state fields")
+    object_ids = np.asarray(state["object_id"]).reshape(-1)
+    active = np.asarray(state["active"]).reshape(-1)
+    if object_ids.size != active.size:
+        raise ValueError("scene-state object_id/active arrays have different lengths")
+    active_ids = {
+        int(object_id)
+        for object_id, is_active in zip(object_ids.tolist(), active.tolist())
+        if bool(is_active)
+    }
+    return [row for row in rows if int(row["id"]) in active_ids]
 
 
 def _mask_grounded_crop(
@@ -686,8 +709,6 @@ def main() -> None:
             if isinstance(row, dict) and str(row.get("status") or "").endswith("_pass")
         }
         rows = [row for row in rows if int(row["id"]) in selected_ids]
-    if args.max_objects > 0:
-        rows = rows[: args.max_objects]
     if args.scene_state:
         wrapper = torch.load(
             args.scene_state.expanduser().resolve(),
@@ -702,7 +723,13 @@ def main() -> None:
         if not isinstance(state, dict):
             raise TypeError(f"Unsupported scene state: {args.scene_state}")
     else:
+        if args.active_only:
+            raise ValueError("--active-only requires --scene-state")
         state = {"object_id": [int(row["id"]) for row in rows]}
+    if args.active_only:
+        rows = filter_active_rows(rows, state)
+    if args.max_objects > 0:
+        rows = rows[: args.max_objects]
     mask_index = resolve_object_mask_observations(
         state,
         args.mask_dir.expanduser().resolve(),

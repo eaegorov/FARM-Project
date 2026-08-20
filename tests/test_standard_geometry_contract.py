@@ -294,7 +294,12 @@ def test_standard_presentation_metadata_is_run_relative() -> None:
     presentation = inspect.getsource(Context.presentation)
     semantics = inspect.getsource(Context.semantics)
     assert '"--metadata-source-scene-state", "../scene_state_raw.pt"' in presentation
-    assert '"--metadata-source-scene-state", "../scene_state_visual.pt"' in semantics
+    assert (
+        '"--metadata-source-scene-state", "../scene_state_surface_prefilter.pt"'
+        in semantics
+    )
+    assert '"audit_farm_gaussian_support.py"' in semantics
+    assert '"--active-only"' in semantics
     assert '"--metadata-reviewed-catalog", "../../qa/semantics/consensus/semantic_consensus_catalog.json"' in semantics
 
 

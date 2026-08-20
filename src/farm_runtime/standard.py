@@ -79,6 +79,7 @@ STANDARD_STAGE_CODE_INPUTS: dict[str, tuple[str, ...]] = {
         "scripts/plot_farm_visual_consistency.py",
     ),
     "semantics": (
+        "scripts/audit_farm_gaussian_support.py",
         "scripts/review_farm_object_crops.py",
         "scripts/export_reviewed_farm_catalog.py",
         "scripts/adjudicate_farm_semantics.py",
@@ -218,7 +219,11 @@ def compile_standard_scene(
         "mapping": [f"{run}/mapping/scene_state_raw.pt"],
         "geometry": [f"{run}/mapping/scene_state_geometry.pt"],
         "visual_consistency": [f"{run}/mapping/scene_state_visual.pt"],
-        "semantics": [f"{run}/mapping/scene_state_semantic.pt"],
+        "semantics": [
+            f"{run}/mapping/scene_state_surface_prefilter.pt",
+            f"{run}/mapping/scene_state_semantic.pt",
+            f"{run}/qa/surface_prefilter/audit.json",
+        ],
         "assemblies": [f"{run}/mapping/scene_state_assemblies.pt"],
         "surface_support": [f"{run}/mapping/scene_state_surface.pt"],
         "compound_geometry": [f"{run}/mapping/scene_state_compound.pt"],
