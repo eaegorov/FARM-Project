@@ -246,10 +246,10 @@ def test_semantic_processing_state_preserves_geometry_valid_evidence_tiers() -> 
     assert '"/farm-run/qa/semantics/catalog/reviewed_robust_catalog.json"' not in semantic_presentation
 
 
-def test_surface_support_is_diagnostic_not_destructive() -> None:
+def test_surface_support_fails_closed_for_production_active_state() -> None:
     source = inspect.getsource(Context.surface_support)
-    assert '"--no-enforce"' in source
-    assert '"--enforce"' not in source
+    assert '"--enforce"' in source
+    assert '"--no-enforce"' not in source
 
 
 def test_finalization_uses_last_cross_pass_semantic_consensus() -> None:

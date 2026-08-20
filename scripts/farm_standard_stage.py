@@ -897,7 +897,7 @@ class Context:
             "--assembly-mask-root", "/farm-run/qa/assemblies/masks",
             "--surface-cloud", "/farm-run/mapping/presentation/data/cloud.npz",
             "--output-state", "/farm-run/mapping/scene_state_surface.pt",
-            "--output-report", "/farm-run/qa/surface_support/audit.json", "--no-enforce",
+            "--output-report", "/farm-run/qa/surface_support/audit.json", "--enforce",
         ])
         self.result("PASS", audit="audit.json")
 

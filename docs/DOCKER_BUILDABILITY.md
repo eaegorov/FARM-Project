@@ -155,11 +155,13 @@ installs packages.
 
 ## 6. Observed portability closure and acceptance
 
-On 2026-08-19, the separate candidate `farm-prep:portability-v1` built with
-no `docker build --check` warnings and passed an H100 smoke with Python
-3.11.15, Torch 2.5.1+cu121, CUDA 12.1, gsplat 1.5.3, OpenCV 4.11.0,
-pycolmap 3.11.1 and SciPy 1.16.3. This establishes buildability of that
-candidate; it was not used to repin the active production manifest.
+The original `farm-prep:portability-v1` established package buildability but
+was not production-ready: its gsplat CUDA extension was first JIT-compiled in
+the runtime temporary directory, which is intentionally no-exec. The reviewed
+prep Dockerfile now precompiles the extension for CUDA architectures
+7.5/8.0/8.6/8.9/9.0 into the immutable image. A candidate is accepted only
+after a real GPU rasterization smoke succeeds with a read-only root filesystem
+and no-exec `/tmp`; an import-only smoke is insufficient.
 
 A new host is accepted only after:
 

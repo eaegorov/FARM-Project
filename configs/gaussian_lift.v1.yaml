@@ -55,6 +55,28 @@ build:
   minimum_object_gaussians: 64
   maximum_object_fraction: 0.05
 
+# Build-only completion of weak-but-positive surface evidence. Growth is
+# limited to unknown rows connected to a strong multi-timestamp core; strong
+# cross-object conflicts remain unknown and held-out masks are still unopened.
+refinement:
+  enabled: true
+  minimum_seed_gaussians: 16
+  minimum_positive_timestamps: 1
+  maximum_negative_timestamps: 0
+  minimum_timestamp_margin: 1
+  minimum_positive_weight: 0.008
+  minimum_global_purity: 0.72
+  minimum_visible_share: 0.10
+  minimum_core_neighbors: 2
+  maximum_growth_steps: 2
+  minimum_connection_radius_m: 0.025
+  maximum_connection_radius_m: 0.12
+  connection_radius_multiplier: 2.0
+  maximum_growth_ratio: 1.0
+  score_log_weight: 0.08
+  minimum_winner_margin: 0.20
+  minimum_winner_ratio: 1.10
+
 heldout:
   alpha_threshold: 0.04
   good_timestamp_iou: 0.40
@@ -68,10 +90,10 @@ heldout:
   maximum_p90_depth_error_m: 0.20
   minimum_depth_pixels: 32
 
-# Frozen after the 2026-08-19 Factory calibration: 28/40 strict objects passed
-# without changing any per-object build or held-out threshold. Knaack remains
-# a blind/no-retune validation scene; failures stay unknown rather than being
-# forced into the released instance bank.
+# Frozen 2026-08-21 after Factory calibration and blind/no-retune Knaack A/B.
+# Factory: 14->16 verified, strict 0.667->0.762, median held-out recall
+# 0.778->0.826. Knaack: 38->39 verified, recall 0.789->0.806; the old noisy
+# run remains nonrelease, while its independent surface-pass subset is 27/35.
 release:
   calibrated: true
   minimum_verified_objects: 1

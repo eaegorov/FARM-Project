@@ -8,8 +8,8 @@
       "user_uid": 1000
     },
     "prep": {
-      "image": "rest3d:factory-baseline",
-      "image_id": "sha256:94ab3ea00d91f439b7d1e77a2177ef74ceab5cbd1a886fb1050b3aec557de0e0",
+      "image": "farm-prep:portability-v2",
+      "image_id": "sha256:3bd90fd6c899a442e5289623285a143a4d127152c70e5cf179e0f4803d4144c2",
       "python": "/opt/conda/envs/rest3d/bin/python"
     }
   },

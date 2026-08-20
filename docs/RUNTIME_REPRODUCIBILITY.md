@@ -121,9 +121,10 @@ visible through the free-VRAM gate and are never terminated automatically.
   inventory for FARM/model bootstrap, preflight, selection, catalog/report
   generation, trusted scene-state inspection and canonical-image validation.
 - `requirements/bridge-control.lock.txt` is a separate exact direct-package
-  launcher inventory for current ShapeR host validators. Its NumPy/SciPy pins
-  conflict with the control-plane closure, so the venvs must remain separate;
-  it requires Python 3.11+ and is not the inference runtime.
+  launcher inventory for current ShapeR host validators, including trusted
+  scene-state loading through CPU Torch. Its NumPy/SciPy pins conflict with
+  the control-plane closure, so the venvs must remain separate; it requires
+  Python 3.11+ and is not the inference runtime.
 - `requirements/prep-runtime.lock.txt` is the version-pinned direct
   preparation inventory verified in the pinned prep image (Torch
   2.5.1+cu121, pycolmap 3.11.1, gsplat 1.5.3, NumPy 1.26.0).

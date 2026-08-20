@@ -40,8 +40,8 @@ and metric-scene assembler. These are downstream products with their own
 release markers; they do not mutate the FARM run or source PLY. The
 prepare/assemble wrapper runs from the pinned control venv; runtime management
 uses the separate exact `bridge-control.lock.txt` launcher because its direct
-NumPy/SciPy pins conflict with the control-plane closure. Inference computation
-remains in pinned images.
+NumPy/SciPy/Torch pins conflict with the control-plane closure. Inference
+computation remains in pinned images.
 
 ## Upstream research/evaluation utilities
 

@@ -37,10 +37,11 @@ from tools.farm_shaper_bridge import run_gaussian_lift as lift_runner
 from tools.farm_shaper_bridge.run_gaussian_lift import extract_prep_runtime
 
 
-def test_checked_in_lift_config_is_measured_factory_freeze() -> None:
+def test_checked_in_lift_config_is_frozen_after_two_scene_calibration() -> None:
     config_path = Path(__file__).resolve().parents[1] / "configs/gaussian_lift.v1.yaml"
     config, digest = load_config(config_path)
     assert len(digest) == 64
+    assert config["refinement"]["enabled"] is True
     assert config["release"] == {
         "calibrated": True,
         "minimum_verified_objects": 1,

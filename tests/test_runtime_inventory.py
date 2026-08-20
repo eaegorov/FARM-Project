@@ -95,6 +95,7 @@ def test_committed_runtime_profiles_are_exact_and_prep_closure_is_present() -> N
         "opencv-python": "4.11.0.86",
         "pyyaml": "6.0.2",
         "scipy": "1.16.3",
+        "torch": "2.12.0",
     }
     assert {
         "torch", "torchvision", "numpy", "pycolmap", "gsplat", "plyfile",
@@ -140,6 +141,9 @@ def test_docker_contract_has_no_machine_specific_paths_or_viewer_port() -> None:
     assert "requirements/prep-runtime.lock.txt" in dockerfile
     assert "farm_runtime_inventory.py validate" in dockerfile
     assert "/opt/conda/envs/rest3d/bin/python" in dockerfile
+    assert "TORCH_EXTENSIONS_DIR=/opt/farm-torch-extensions" in dockerfile
+    assert "from gsplat.cuda._backend import _C" in dockerfile
+    assert "chmod -R a+rX" in dockerfile
 
 
 def test_canonical_name_matches_python_packaging_normalization() -> None:

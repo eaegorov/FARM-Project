@@ -130,10 +130,12 @@ git commit -m "build: pin reviewed FARM runtime images"
 
 The prep Dockerfile is functionally reproducible, not bit-reproducible: base
 tags, apt repositories and wheels are external mutable inputs. On 2026-08-19,
-the portability candidate built without Docker build-check warnings and passed
-an H100 GPU smoke with Python 3.11.15, Torch 2.5.1+cu121, CUDA 12.1,
-gsplat 1.5.3, OpenCV 4.11.0, pycolmap 3.11.1 and SciPy 1.16.3. That candidate
-was not silently repinned into an already running Factory experiment; a fresh
+the first portability candidate passed package-import smoke but was not a
+production runtime: gsplat still tried to JIT-compile its CUDA extension under
+the deliberately no-exec temporary filesystem. The current Dockerfile builds
+that extension into `/opt/farm-torch-extensions` in the immutable image layer.
+Acceptance therefore requires a real H100 rasterization/contributor-VJP smoke
+with a read-only root and no-exec `/tmp`, not merely `import gsplat`. A fresh
 build still requires the audit, explicit pin and commit sequence above.
 
 ## 4. Input contract
@@ -381,7 +383,7 @@ held-out-failing Gaussians deliberately remain `-1`.
 
 ShapeR is downstream of verified CSR membership and never changes lift labels.
 ShapeR inference runs in its pinned Docker image. The host runtime manager and
-launcher use a separate exact NumPy/OpenCV/SciPy closure whose pins conflict
+launcher use a separate exact NumPy/OpenCV/SciPy/CPU-Torch closure whose pins conflict
 with `$FARM_PY`. SciPy 1.16.3 requires Python 3.11 or newer, so create the
 bridge launcher environment with an explicit 3.11+ interpreter:
 

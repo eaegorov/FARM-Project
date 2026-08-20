@@ -55,6 +55,10 @@ from tools.farm_shaper_bridge.common import (  # noqa: E402
     verify_run_ply_fingerprint,
     write_full_labeled_ply,
 )
+from tools.farm_shaper_bridge.lift_refinement import (  # noqa: E402
+    apply_provisional_geometry_gate,
+    refine_connected_claims,
+)
 
 
 @dataclass
@@ -99,7 +103,8 @@ def _require_sections(config: Mapping[str, Any]) -> None:
     if config.get("schema_version") != CONFIG_SCHEMA:
         raise ValueError(f"unsupported Gaussian lift config: {config.get('schema_version')!r}")
     for section in (
-        "split", "render", "candidate", "mask", "build", "heldout", "release"
+        "split", "render", "candidate", "mask", "build", "refinement",
+        "heldout", "release"
     ):
         if not isinstance(config.get(section), Mapping):
             raise ValueError(f"Gaussian lift config section missing: {section}")
@@ -194,6 +199,30 @@ def _require_sections(config: Mapping[str, Any]) -> None:
     finite("build", "minimum_winner_margin", minimum=0)
     finite("build", "minimum_winner_ratio", minimum=1)
     integer("build", "minimum_object_gaussians", minimum=1)
+
+    refinement = config["refinement"]
+    if not isinstance(refinement.get("enabled"), bool):
+        raise ValueError("refinement.enabled must be boolean")
+    integer("refinement", "minimum_seed_gaussians", minimum=1)
+    integer("refinement", "minimum_positive_timestamps", minimum=1)
+    integer("refinement", "maximum_negative_timestamps", minimum=0)
+    integer("refinement", "minimum_timestamp_margin", minimum=0)
+    integer("refinement", "minimum_core_neighbors", minimum=1)
+    integer("refinement", "maximum_growth_steps", minimum=1)
+    finite("refinement", "minimum_positive_weight", minimum=0, minimum_open=True)
+    finite("refinement", "minimum_global_purity", minimum=0, maximum=1)
+    finite("refinement", "minimum_visible_share", minimum=0, maximum=1)
+    finite("refinement", "minimum_connection_radius_m", minimum=0, minimum_open=True)
+    maximum_connection_radius = finite(
+        "refinement", "maximum_connection_radius_m", minimum=0, minimum_open=True
+    )
+    if maximum_connection_radius < float(refinement["minimum_connection_radius_m"]):
+        raise ValueError("refinement connection radii are inconsistent")
+    finite("refinement", "connection_radius_multiplier", minimum=0, minimum_open=True)
+    finite("refinement", "maximum_growth_ratio", minimum=0)
+    finite("refinement", "score_log_weight", minimum=0)
+    finite("refinement", "minimum_winner_margin", minimum=0)
+    finite("refinement", "minimum_winner_ratio", minimum=1)
 
     for key in ("alpha_threshold", "good_timestamp_iou", "minimum_median_iou",
                 "minimum_q25_iou", "minimum_median_precision", "minimum_median_recall",
@@ -955,34 +984,57 @@ def make_claims(
         minimum_margin=float(policy["minimum_winner_margin"]),
         minimum_ratio=float(policy["minimum_winner_ratio"]),
     )
+    claimed_indices = np.concatenate([
+        np.asarray(row["indices"], dtype=np.int64)
+        for row in claims if np.asarray(row["indices"]).size
+    ]) if any(np.asarray(row["indices"]).size for row in claims) else np.zeros(0, dtype=np.int64)
+    if len(claimed_indices):
+        unique_claimed, claim_counts = np.unique(claimed_indices, return_counts=True)
+        multiply_claimed = unique_claimed[claim_counts > 1]
+        ambiguous_strong_indices = multiply_claimed[labels[multiply_claimed] == UNKNOWN_ID]
+    else:
+        ambiguous_strong_indices = np.zeros(0, dtype=np.int64)
+
     assigned = labels[labels >= 0]
     ids, counts = np.unique(assigned, return_counts=True) if len(assigned) else (
         np.zeros(0, dtype=np.int32), np.zeros(0, dtype=np.int64)
     )
-    count_by_id = {int(object_id): int(count) for object_id, count in zip(ids, counts, strict=True)}
-    invalid = {
-        object_id
-        for object_id, item in evidence.items()
-        if count_by_id.get(object_id, 0) < int(policy["minimum_object_gaussians"])
-        or count_by_id.get(object_id, 0) > int(float(policy["maximum_object_fraction"]) * gaussian_count)
+    count_by_id = {
+        int(object_id): int(count)
+        for object_id, count in zip(ids, counts, strict=True)
     }
-    if invalid:
-        remove = np.isin(labels, np.asarray(sorted(invalid), dtype=np.int32))
+    refinement_enabled = bool(config["refinement"]["enabled"])
+    minimum_seed = (
+        int(config["refinement"]["minimum_seed_gaussians"])
+        if refinement_enabled else int(policy["minimum_object_gaussians"])
+    )
+    seed_invalid = {
+        object_id
+        for object_id in evidence
+        if count_by_id.get(object_id, 0) < minimum_seed
+        or count_by_id.get(object_id, 0)
+        > int(float(policy["maximum_object_fraction"]) * gaussian_count)
+    }
+    if seed_invalid:
+        remove = np.isin(labels, np.asarray(sorted(seed_invalid), dtype=np.int32))
         labels[remove] = UNKNOWN_ID
         confidence[remove] = 0.0
         support[remove] = 0
-    final_count_by_id = {
-        object_id: (0 if object_id in invalid else count)
+    seed_count_by_id = {
+        object_id: (0 if object_id in seed_invalid else count)
         for object_id, count in count_by_id.items()
     }
     for row in rows:
         object_id = int(row["object_id"])
-        row["provisional_gaussians"] = int(final_count_by_id.get(object_id, 0))
-        row["geometry_gate"] = "REJECT" if object_id in invalid else (
-            "PASS" if row["provisional_gaussians"] else "NO_CLAIMS"
+        row["resolved_core_gaussians"] = int(count_by_id.get(object_id, 0))
+        row["seed_gaussians"] = int(seed_count_by_id.get(object_id, 0))
+        row["seed_gate"] = "REJECT" if object_id in seed_invalid else (
+            "PASS" if row["seed_gaussians"] else "NO_CLAIMS"
         )
-    conflict["objects_geometry_rejected"] = len(invalid)
-    return labels, confidence, support, rows, conflict
+        row["provisional_gaussians"] = row["seed_gaussians"]
+        row["geometry_gate"] = "PENDING_REFINEMENT" if row["seed_gaussians"] else "REJECT"
+    conflict["objects_seed_rejected"] = len(seed_invalid)
+    return labels, confidence, support, rows, conflict, ambiguous_strong_indices
 
 
 def _artifact(path: Path) -> dict[str, Any]:
@@ -1362,9 +1414,58 @@ def execute(args: argparse.Namespace) -> dict[str, Any] | None:
     build_rows, build_timing = accumulate_build_evidence(
         gaussians, run, split, evidence, config
     )
-    provisional, provisional_confidence, provisional_support, object_build_rows, conflicts = make_claims(
-        evidence, table.count, config
+    (
+        provisional,
+        provisional_confidence,
+        provisional_support,
+        object_build_rows,
+        conflicts,
+        blocked_strong_indices,
+    ) = make_claims(evidence, table.count, config)
+    refinement_started = time.perf_counter()
+    (
+        provisional,
+        provisional_confidence,
+        provisional_support,
+        refinement_audit,
+    ) = refine_connected_claims(
+        gaussians.means_m,
+        gaussians.radius_m,
+        evidence,
+        provisional,
+        provisional_confidence,
+        provisional_support,
+        blocked_strong_indices,
+        config,
     )
+    refinement_by_id = {
+        int(row["object_id"]): row for row in refinement_audit["objects"]
+    }
+    for row in object_build_rows:
+        row["refinement"] = refinement_by_id.get(int(row["object_id"]), {
+            "object_id": int(row["object_id"]),
+            "seed_gaussians": int(row["seed_gaussians"]),
+            "eligible_build_evidence": 0,
+            "connected_proposals": 0,
+            "added_gaussians": 0,
+            "maximum_growth_step": 0,
+            "median_connection_distance_m": None,
+        })
+    (
+        provisional,
+        provisional_confidence,
+        provisional_support,
+        geometry_gate_audit,
+    ) = apply_provisional_geometry_gate(
+        provisional,
+        provisional_confidence,
+        provisional_support,
+        object_build_rows,
+        table.count,
+        config,
+    )
+    conflicts.update(geometry_gate_audit)
+    refinement_seconds = time.perf_counter() - refinement_started
     provisional_artifacts = save_provisional(
         output, provisional, provisional_confidence, provisional_support
     )
@@ -1385,12 +1486,14 @@ def execute(args: argparse.Namespace) -> dict[str, Any] | None:
         "candidates": candidate_rows,
         "objects": object_build_rows,
         "conflicts": conflicts,
+        "refinement": refinement_audit,
         "provisional_artifacts": provisional_artifacts,
         "frozen_provisional_digest": frozen_digest,
         "views": build_rows,
         "timing_seconds": {
             "gaussian_load": gaussian_load_seconds,
             "candidate_index": candidate_seconds,
+            "build_refinement": refinement_seconds,
             **build_timing,
         },
         "runtime": inventory,

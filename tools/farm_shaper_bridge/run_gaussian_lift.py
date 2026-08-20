@@ -23,6 +23,7 @@ COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 REQUIRED_LIFT_SOURCE = (
     "tools/farm_shaper_bridge/common.py",
     "tools/farm_shaper_bridge/gaussian_lift.py",
+    "tools/farm_shaper_bridge/lift_refinement.py",
     "configs/gaussian_lift.v1.yaml",
 )
 
