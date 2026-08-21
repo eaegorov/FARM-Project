@@ -170,9 +170,29 @@ def load_overlay(recon_dir: Path, *, max_splats: int) -> OverlayData:
     rows = assembly.get("objects")
     if not isinstance(rows, list) or len(rows) != 21:
         raise UnifiedViewerError("FARM reconstruction must contain exactly 21 requested objects")
-    object_rows = {int(row["id"]): row for row in rows if isinstance(row, Mapping)}
-    if len(object_rows) != len(rows):
+    assembly_rows = {int(row["id"]): row for row in rows if isinstance(row, Mapping)}
+    input_rows = {
+        int(row["id"]): row
+        for row in (manifest.get("objects") or [])
+        if isinstance(row, Mapping)
+    }
+    if len(assembly_rows) != len(rows) or set(assembly_rows) != set(input_rows):
         raise UnifiedViewerError("FARM reconstruction object IDs are not unique")
+    object_rows = {
+        object_id: {**input_rows[object_id], **assembly_rows[object_id]}
+        for object_id in sorted(assembly_rows)
+    }
+    orientation_report = assembly.get("orientation_refinement_report")
+    if not isinstance(orientation_report, Mapping):
+        raise UnifiedViewerError("gravity/silhouette orientation report is missing")
+    orientation_path = (root / str(orientation_report.get("path"))).resolve(strict=True)
+    if orientation_path.parent != root or _sha256(orientation_path) != orientation_report.get("sha256"):
+        raise UnifiedViewerError("gravity/silhouette orientation report hash mismatch")
+    for object_id, row in object_rows.items():
+        transform = row.get("transform")
+        orientation = transform.get("orientation_refinement") if isinstance(transform, Mapping) else None
+        if not isinstance(orientation, Mapping) or orientation.get("schema") != "splatica.farm-recon-orientation.v1":
+            raise UnifiedViewerError(f"object {object_id} has no validated orientation refinement")
     ply_record = assembly.get("combined_world_metric_ply")
     if not isinstance(ply_record, Mapping) or ply_record.get("status") != "PASS":
         raise UnifiedViewerError("world-metric Gaussian PLY is not declared PASS")
@@ -286,39 +306,42 @@ class ReconOverlayViewer:
             f"{object_id:06d} — {str(row.get('category') or 'object').replace('_', ' ')}": object_id
             for object_id, row in sorted(object_rows.items())
         }
-        with self.server.gui.add_folder("Knaack — FARM reconstruction", expand_by_default=True):
+        with self.server.gui.add_folder("Knaack — реконструкция FARM", expand_by_default=True):
             self.server.gui.add_markdown(
-                f"**READY** — {len(points):,} neutral scene points; "
-                f"{len(overlay.centers):,} displayed splats sampled deterministically from "
-                f"{overlay.total_rows:,} rows across all {len(object_rows)} MV-SAM3D objects."
+                f"**ГОТОВО** — {len(points):,} опорных точек сцены; "
+                f"показано {len(overlay.centers):,} splat-ов из {overlay.total_rows:,} строк "
+                f"для всех {len(object_rows)} объектов MV-SAM3D."
             )
-            self.show_context = self.server.gui.add_checkbox("Scene context", initial_value=True)
-            self.show_splats = self.server.gui.add_checkbox("MV-SAM3D dense splats", initial_value=True)
+            self.show_context = self.server.gui.add_checkbox("Точки исходной сцены", initial_value=True)
+            self.show_splats = self.server.gui.add_checkbox("Плотные splat-объекты MV-SAM3D", initial_value=True)
             self.instance_colours = self.server.gui.add_checkbox(
-                "Instance colours", initial_value=False,
-                hint="Off: reconstructed appearance. On: categorical object palette.",
+                "Цвет по instance ID", initial_value=False,
+                hint=(
+                    "Выкл.: восстановленный DC-цвет splat-а. Вкл.: детерминированный "
+                    "категориальный RGB только из farm_object_id; это не confidence, "
+                    "не quality score и не новая маска."
+                ),
             )
             self.point_size = self.server.gui.add_slider(
-                "Context point size (m)", min=0.001, max=0.012, step=0.001,
+                "Размер точек сцены (м)", min=0.001, max=0.012, step=0.001,
                 initial_value=float(point_size),
             )
             first_label = next(iter(self.labels_to_ids))
             self.object_select = self.server.gui.add_dropdown(
-                "Orbit target", options=tuple(self.labels_to_ids), initial_value=first_label
+                "Цель вращения камеры", options=tuple(self.labels_to_ids), initial_value=first_label
             )
             self.object_info = self.server.gui.add_markdown("")
-        with self.server.gui.add_folder("Camera / orbit controls", expand_by_default=True):
+        with self.server.gui.add_folder("Камера и вращение", expand_by_default=True):
             self.server.gui.add_markdown(
-                "**Left drag:** orbit · **right drag:** pan · **wheel/pinch:** zoom. "
-                "Selecting an object moves only the orbit pivot; Focus also frames it."
+                "**ЛКМ:** вращение · **ПКМ:** сдвиг · **колесо/щипок:** масштаб. "
+                "Выбор объекта переносит только центр вращения; фокус также кадрирует объект."
             )
-            self.overview = self.server.gui.add_button("Overview scene")
-            self.focus = self.server.gui.add_button("Focus selected object")
-            self.front = self.server.gui.add_button("Front")
-            self.side = self.server.gui.add_button("Side")
-            self.top = self.server.gui.add_button("Top")
-            self.previous_button = self.server.gui.add_button("Previous camera")
-
+            self.overview = self.server.gui.add_button("Обзор всей сцены")
+            self.focus = self.server.gui.add_button("Фокус на выбранном объекте")
+            self.front = self.server.gui.add_button("Спереди")
+            self.side = self.server.gui.add_button("Сбоку")
+            self.top = self.server.gui.add_button("Сверху")
+            self.previous_button = self.server.gui.add_button("Предыдущая камера")
         @self.show_context.on_update
         def _context(_event: Any = None) -> None:
             self.context.visible = bool(self.show_context.value)
@@ -435,12 +458,23 @@ class ReconOverlayViewer:
             views = row.get("views") if isinstance(row.get("views"), list) else []
             reverse = row.get("reverse_projection")
             summary = reverse.get("summary", {}) if isinstance(reverse, Mapping) else {}
+            transform = row.get("transform")
+            orientation = (
+                transform.get("orientation_refinement", {})
+                if isinstance(transform, Mapping)
+                else {}
+            )
             self.object_info.content = (
                 f"**#{object_id} · {row.get('category', 'object')} · {status}**  \n"
-                f"{len(views)} real pinhole views · {int(row.get('vertices', 0)):,} vertices · "
-                f"{int(row.get('faces', 0)):,} faces  \n"
-                f"reverse bbox IoU `{float(summary.get('bbox_iou', 0.0)):.3f}` · "
-                f"center error `{float(summary.get('center_error_px', 0.0)):.1f}px`"
+                f"{len(views)} реальных PINHOLE-кадра · {int(row.get('vertices', 0)):,} вершин · "
+                f"{int(row.get('faces', 0)):,} граней  \n"
+                f"full-mask silhouette IoU `{float(summary.get('silhouette_iou', 0.0)):.3f}` · "
+                f"bbox IoU `{float(summary.get('bbox_iou', 0.0)):.3f}` · "
+                f"ошибка центра `{float(summary.get('center_error_px', 0.0)):.1f}px`  \n"
+                f"наклон canonical-up к gravity: "
+                f"`{float(orientation.get('angle_before_degrees', 0.0)):.1f}° → "
+                f"{float(orientation.get('angle_after_degrees', 0.0)):.1f}°` · "
+                f"принята доля коррекции `{float(orientation.get('accepted_fraction', 0.0)):.1f}`"
             )
             if move_camera:
                 for client in self.server.get_clients().values():
