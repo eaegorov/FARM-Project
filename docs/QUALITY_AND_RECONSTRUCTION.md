@@ -87,7 +87,7 @@ PLY row and field.
 ## MV-SAM3D metric reconstruction contract
 
 The Knaack reconstruction under `splatica_demo_app/outputs/farm_recon` was
-built from 21 reviewed objects and 75 real images from
+built from 21 reviewed objects and 72 real images from
 `data/knaack_colmap_pinhole/images`:
 
 - 2–5 views per object, preferring complete and unoccluded views;
@@ -98,8 +98,8 @@ built from 21 reviewed objects and 75 real images from
   all selected masks;
 - reverse projection against every source mask.
 
-The final result contains all 21 requested objects: 17 PASS and 4 REVIEW. The
-median reverse-projection bbox IoU improved from 0.625 to 0.805. REVIEW remains
+The final result contains all 21 requested objects: 21 PASS and 0 REVIEW. The
+median reverse-projection bbox IoU improved from 0.624 to 0.814. REVIEW remains
 visible for manual inspection and is never silently promoted.
 
 Canonical artifacts are one raw object directory per object plus:
@@ -139,7 +139,7 @@ python scripts/serve_farm_recon_overlay.py \
 It shows neutral context and a deterministic stratified sample retaining all
 21 reconstructed object IDs. Natural colour and an instance palette are
 switchable. Object selection changes the orbit pivot; overview, front, side,
-top, focus and previous controls provide camera recovery. The full 10.9M-row
+top, focus and previous controls provide camera recovery. The full 10.32M-row
 PLY remains authoritative; the browser sample is disclosed explicitly.
 
 Both services are unauthenticated single-user inspection tools. Keep them on
