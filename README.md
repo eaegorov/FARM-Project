@@ -33,6 +33,10 @@ For the production COLMAP + 3DGS workflow (17-stage FARM, dense
 `gaussian_index -> instance_id` lift, optional ShapeR and the unified
 Factory/Knaack viewer), use **[docs/PRODUCTION_PIPELINE.md](docs/PRODUCTION_PIPELINE.md)**.
 
+For layer semantics, measured Factory/Knaack quality, dense-lift completeness
+and the metric MV-SAM3D handoff, read
+**[docs/QUALITY_AND_RECONSTRUCTION.md](docs/QUALITY_AND_RECONSTRUCTION.md)**.
+
 - **Paper:** [arXiv:2606.15476](https://arxiv.org/abs/2606.15476)
 - **Summary video:** [youtube.com/watch?v=0Ek-wPV9O1g](https://www.youtube.com/watch?v=0Ek-wPV9O1g)
 - **Project page:** [goldengait.github.io/farm](https://goldengait.github.io/farm/)

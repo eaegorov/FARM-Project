@@ -504,11 +504,9 @@ scenes:
     farm_run: /absolute/output/farm_pipeline/my_scene/latest
     source_ply: /absolute/data/my_scene/scene.ply
     source_fingerprint:
-      algorithm: sha256-sampled-v1
-      digest: <digest-from-scene-preflight>
+      algorithm: sha256
+      digest: <full-sha256-from-scene-preflight>
       size_bytes: <exact-size>
-      chunk_bytes: 1048576
-      sampled_offsets: [<offset-0>, <offset-1>, <offset-2>]
     bridge_roots: [/absolute/output/bridge/my_scene]
     dense_lift_roots: [/absolute/output/lift/my_scene]
     shaper_roots: [/absolute/output/shaper/my_scene]
@@ -573,6 +571,10 @@ The independent viewer layers are:
   fallback;
 - canonical ShapeR v2 mesh hypotheses;
 - object labels and per-object inspection.
+
+For the evidence meaning of every layer, measured Factory/Knaack quality,
+connected dense-lift refinement and the optional metric MV-SAM3D overlay, see
+[QUALITY_AND_RECONSTRUCTION.md](QUALITY_AND_RECONSTRUCTION.md).
 
 The full-source layer includes all N rows, but Viser transport/storage
 quantizes floating values to float16 and display colours to uint8. It evaluates

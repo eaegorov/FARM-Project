@@ -30,6 +30,10 @@ production commands and release boundary.
   registry on loopback port 8080 by default. It is an unauthenticated
   single-user inspection service; its all-N source layer is a float16/uint8
   Viser DC preview, not a native-precision 3DGS renderer.
+- Reconstruction overlay: `serve_farm_recon_overlay.py` validates a completed
+  `splatica.farm-mv-sam3d.v1` bundle, preserves every object ID in a stable
+  browser sample, and overlays its FARM-world Gaussian PLY on a metric scene
+  cloud with explicit orbit/focus controls.
 
 ## Dense lift and ShapeR bridge
 
