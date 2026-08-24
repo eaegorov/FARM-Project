@@ -236,3 +236,43 @@ def test_cli_scripts_have_valid_syntax_and_launcher_is_executable() -> None:
     assert "No available memory for the cache blocks" in source
     assert "bounded memory retry" in source
     assert "memory_retry_used == 0" in source
+
+
+def test_local_model_required_sibling_hash_is_fail_closed(tmp_path: Path) -> None:
+    manifest_path, _local_model, secret = _fixture(tmp_path)
+    sibling = tmp_path / "processor.json"
+    sibling.write_text('{"processor": "sam3"}\n', encoding="utf-8")
+    digest = hashlib.sha256(sibling.read_bytes()).hexdigest()
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    payload["pipeline_models"]["local-test"]["required_files"] = [
+        {"path": "processor.json", "sha256": digest, "checksum_mode": "full"}
+    ]
+    manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+    manifest = load_model_manifest(manifest_path)
+    passing = run_resource_preflight(
+        manifest,
+        gpu_identifier=0,
+        services=["caption"],
+        secrets_file=secret,
+        include_pipeline_models=True,
+        gpu_inventory=[_gpu()],
+        docker_image_resolver=lambda _image: IMAGE_ID,
+    )
+    assert passing.status == "pass", passing.to_dict()
+
+    sibling.write_text('{"processor": "tampered"}\n', encoding="utf-8")
+    failing = run_resource_preflight(
+        manifest,
+        gpu_identifier=0,
+        services=["caption"],
+        secrets_file=secret,
+        include_pipeline_models=True,
+        gpu_inventory=[_gpu()],
+        docker_image_resolver=lambda _image: IMAGE_ID,
+    )
+    assert failing.status == "fail"
+    assert any(
+        finding.code == "model.sibling_checksum_mismatch"
+        for check in failing.checks
+        for finding in check.findings
+    )

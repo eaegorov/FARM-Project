@@ -160,6 +160,7 @@ def test_bootstrap_uses_exact_manifest_pins_and_never_reports_token(
     assert calls[0]["cache_dir"] == str((tmp_path / "cache/hub").resolve())
     assert calls[0]["allow_patterns"] == ["config.json", "model.bin"]
     assert calls[1]["local_dir"] == str((tmp_path / "models/visual").resolve())
+    assert calls[1]["cache_dir"] == str((tmp_path / "cache/hub").resolve())
     assert calls[1]["allow_patterns"] == ["config.json", "model.safetensors"]
     assert all(call["token"] == TOKEN for call in calls)
 

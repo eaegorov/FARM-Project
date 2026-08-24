@@ -374,7 +374,7 @@ def test_standard_semantics_does_not_require_literal_category_equality() -> None
 def test_every_standard_crop_review_receives_metric_frame_poses() -> None:
     source = (ROOT / "scripts/farm_standard_stage.py").read_text(encoding="utf-8")
     tree = ast.parse(source)
-    invocations = []
+    invocations: list[ast.List] = []
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call) or len(node.args) < 2:
             continue
@@ -386,16 +386,23 @@ def test_every_standard_crop_review_receives_metric_frame_poses() -> None:
             and isinstance(arguments, ast.List)
         ):
             continue
-        invocations.append([
-            value.value
-            for value in arguments.elts
-            if isinstance(value, ast.Constant) and isinstance(value.value, str)
-        ])
+        invocations.append(arguments)
 
-    assert len(invocations) == 2
-    assert all(
-        "--frames-json" in arguments
-        and arguments[arguments.index("--frames-json") + 1]
-        == "/farm-run/rgbd/frames.json"
-        for arguments in invocations
-    )
+    assert len(invocations) == 3
+    for arguments in invocations:
+        index = next(
+            position
+            for position, value in enumerate(arguments.elts)
+            if isinstance(value, ast.Constant) and value.value == "--frames-json"
+        )
+        assert index + 1 < len(arguments.elts)
+        frame_value = arguments.elts[index + 1]
+        if isinstance(frame_value, ast.Constant):
+            assert frame_value.value in {
+                "/farm-run/rgbd/frames.json",
+                "/farm-run/qa/full_colmap_rescue/combined/frames.json",
+            }
+        else:
+            assert isinstance(frame_value, ast.Call)
+            assert isinstance(frame_value.func, ast.Attribute)
+            assert frame_value.func.attr == "direct_frames"

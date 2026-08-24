@@ -95,7 +95,10 @@ gravity, grouping и resource manifest. Не переносите Factory/Knaack
   --config configs/scenes/my_scene.yaml --strict
 
 "$FARM_PY" scripts/farm_resource_preflight.py \
-  --config configs/scenes/my_scene.yaml --verify-full-hashes
+  --manifest configs/models/farm_models.v1.json \
+  --secrets-file /absolute/private/secrets.json \
+  --gpu 0 --services caption text-embed vl-embed \
+  --all-models --verify-full-hashes --strict
 
 "$FARM_PY" scripts/farm_pipeline.py validate-plan \
   --config configs/scenes/my_scene.yaml

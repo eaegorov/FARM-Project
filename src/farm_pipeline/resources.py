@@ -290,7 +290,19 @@ def _parse_model(
     if kind == "local_file":
         path = _resolve_path(raw.get("path"), base_dir, f"{name}.path")
         digest = _sha256(raw["sha256"], f"{name}.sha256") if raw.get("sha256") else None
-        return ModelSpec(kind=kind, local_path=path, sha256=digest)
+        requirements_raw = raw.get("required_files", ())
+        if isinstance(requirements_raw, str) or not isinstance(requirements_raw, Sequence):
+            raise ResourceConfigError(f"{name}.required_files must be a list")
+        requirements = tuple(
+            _parse_file_requirement(item, f"{name}.required_files[{index}]")
+            for index, item in enumerate(requirements_raw)
+        )
+        return ModelSpec(
+            kind=kind,
+            local_path=path,
+            sha256=digest,
+            required_files=requirements,
+        )
     if kind != "huggingface_snapshot":
         raise ResourceConfigError(
             f"{name}.kind must be local_file or huggingface_snapshot"
@@ -592,6 +604,49 @@ def _check_model(
                 check.add("error", "model.checksum_mismatch", "Local model SHA256 mismatch")
         else:
             check.add("warning", "model.checksum_missing", "Local model has no pinned SHA256")
+        sibling_checked = 0
+        sibling_verified = 0
+        sibling_bytes = 0
+        sibling_root = model.local_path.parent.resolve(strict=False)
+        for requirement in model.required_files:
+            candidate = model.local_path.parent / requirement.path
+            try:
+                resolved = candidate.resolve(strict=True)
+            except FileNotFoundError:
+                check.add(
+                    "error", "model.sibling_file_missing",
+                    f"Required local-model sibling is missing: {requirement.path}",
+                )
+                continue
+            if (
+                not resolved.is_relative_to(sibling_root)
+                or candidate.is_symlink()
+                or not candidate.is_file()
+            ):
+                check.add(
+                    "error", "model.sibling_not_file",
+                    f"Required local-model sibling is not a regular contained file: {requirement.path}",
+                )
+                continue
+            sibling_checked += 1
+            sibling_bytes += candidate.stat().st_size
+            if candidate.stat().st_size <= 0:
+                check.add(
+                    "error", "model.sibling_file_empty",
+                    f"Required local-model sibling is empty: {requirement.path}",
+                )
+            if requirement.sha256:
+                actual = sha256_file(candidate)
+                if actual == requirement.sha256:
+                    sibling_verified += 1
+                else:
+                    check.add(
+                        "error", "model.sibling_checksum_mismatch",
+                        f"Required local-model sibling SHA256 mismatch: {requirement.path}",
+                    )
+        metrics["required_sibling_files_checked"] = sibling_checked
+        metrics["required_sibling_files_sha256_verified"] = sibling_verified
+        metrics["required_sibling_bytes"] = sibling_bytes
         return metrics
 
     if not model.local_path.is_dir():

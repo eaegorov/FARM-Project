@@ -116,6 +116,47 @@ def test_rgbd_adapter_uses_generic_preparer_identity_regex_contract() -> None:
     assert 'cleanup_stage_work("rgbd")' in source
 
 
+
+def test_mapping_builds_bounded_verified_adaptive_vocabulary() -> None:
+    source = inspect.getsource(Context.mapping)
+    assert 'self.service("caption")' in source
+    assert '"build_farm_adaptive_vocabulary.py"' in source
+    assert '"--discovery-views", "12"' in source
+    assert '"--verification-views", "12"' in source
+    assert '"--min-visible-views", "2"' in source
+    assert '"--max-additions", "48"' in source
+    assert "finally:\n                self.stop_services()" in source
+    assert "segmenter_vocab_file:=" in source
+    assert 'mapping_dir / "adaptive_inventory"' in source
+
+
+def test_full_colmap_rescue_reuses_verified_adaptive_vocabulary() -> None:
+    source = inspect.getsource(Context.full_colmap_rescue)
+    assert "mapping/adaptive_inventory/yoloe_vocabulary.txt" in source
+    assert "segmenter_vocab_file:=" in source
+    assert source.index("segmenter_vocab_file:=") < source.index("run(command)", source.index("full-colmap-mapping"))
+    mapping_start = source.index("full-colmap-mapping")
+    assert source.index("segmenter_vocab_file:=", mapping_start) < source.index(
+        "run(command)", mapping_start
+    )
+
+
+def test_full_colmap_rescue_uses_bounded_six_view_budget() -> None:
+    source = inspect.getsource(Context.full_colmap_rescue)
+    assert '"--max-objects", "48"' in source
+    assert '"--views-per-object", "6"' in source
+    assert '"--max-total-views", "288"' in source
+
+
+def test_yoloe_uses_class_agnostic_nms_for_overlapping_labels() -> None:
+    source = (
+        Path(__file__).resolve().parents[1]
+        / "src/scene_graph/segmentation/yoloe.py"
+    ).read_text(encoding="utf-8")
+    assert "class_agnostic_nms: bool = True" in source
+
+    assert "agnostic=self.class_agnostic_nms" in source
+
 def test_main_runtime_uses_declared_non_root_uid_and_host_gid() -> None:
     context = object.__new__(Context)
     context.prefix = "farm-test"
@@ -246,19 +287,21 @@ def test_semantic_processing_state_preserves_geometry_valid_evidence_tiers() -> 
     assert '"/farm-run/qa/semantics/catalog/reviewed_robust_catalog.json"' not in semantic_presentation
 
 
-def test_surface_support_fails_closed_for_production_active_state() -> None:
-    source = inspect.getsource(Context.surface_support)
-    assert '"--enforce"' in source
-    assert '"--no-enforce"' not in source
+def test_sampled_surface_support_is_diagnostic_and_cannot_prune_active_objects() -> None:
+    surface = inspect.getsource(Context.surface_support)
+    semantics = inspect.getsource(Context.semantics)
+    assert '"--no-enforce"' in surface
+    assert '"--enforce"' not in surface
+    assert '"--no-enforce"' in semantics
+    assert '"--enforce"' not in semantics
 
 
-def test_finalization_uses_last_cross_pass_semantic_consensus() -> None:
+def test_finalization_uses_accepted_rescue_catalog_with_consensus_fallback() -> None:
     source = inspect.getsource(Context.finalize)
-    assert (
-        '"/farm-run/qa/semantics/consensus/semantic_consensus_catalog.json"'
-        in source
-    )
-    assert '"/farm-run/qa/semantics/ensemble/semantic_tiered_catalog.json"' not in source
+    assert "self.direct_catalog()" in source
+    dynamic = inspect.getsource(Context.direct_catalog)
+    assert '"/farm-run/qa/full_colmap_rescue/semantic_catalog.json"' in dynamic
+    assert '"/farm-run/qa/semantics/consensus/semantic_consensus_catalog.json"' in dynamic
     assert 'self.post("build_farm_final_acceptance.py"' in source
     assert (
         '"--assembly-review", "/farm-run/qa/assemblies/review/reviewed_robust_objects.json"'
@@ -271,6 +314,17 @@ def test_finalization_uses_last_cross_pass_semantic_consensus() -> None:
         "atomic_copy(accepted"
     )
 
+
+def test_full_colmap_rescue_starts_vlm_only_after_geometry() -> None:
+    stage = inspect.getsource(Context.part_whole)
+    assert 'self.service("caption")' not in stage
+    rescue = inspect.getsource(Context.full_colmap_rescue)
+    assert rescue.index('self.post("refine_farm_object_geometry.py"') < rescue.index(
+        'self.service("caption")'
+    )
+    assert rescue.index('self.service("caption")') < rescue.index(
+        'self.post("review_farm_object_crops.py"'
+    )
 
 def test_pre_qa_wall_seconds_uses_only_completed_prefinal_stage_states(tmp_path: Path) -> None:
     context = object.__new__(Context)
@@ -378,3 +432,9 @@ def test_standard_qa_profile_reports_whole_device_peak_and_delta(tmp_path: Path)
         == "whole_selected_device_not_pid_attributed"
     )
     assert "peak_vram_gib" not in resources
+
+
+def test_full_colmap_geometry_prefers_complete_refined_observations() -> None:
+    source = inspect.getsource(Context.full_colmap_rescue)
+    assert '"--preferred-observation-source", "full_colmap_sam3_refinement"' in source
+    assert '"--minimum-preferred-observations", "3"' in source

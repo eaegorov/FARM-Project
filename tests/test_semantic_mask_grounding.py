@@ -94,11 +94,16 @@ def test_crop_candidates_isolate_saved_mask_on_neutral_background(tmp_path: Path
     assert int(grounded[9:11, 9:11, 2].mean()) > 150
 
 
-def test_crop_candidates_do_not_expand_into_neighbouring_source_frame(tmp_path: Path) -> None:
-    review = _load("farm_tight_semantic_crop", "scripts/review_farm_object_crops.py")
+def test_crop_candidates_add_dim_source_context_without_recolouring_target(
+    tmp_path: Path,
+) -> None:
+    review = _load(
+        "farm_contextual_semantic_crop", "scripts/review_farm_object_crops.py"
+    )
     object_dir = tmp_path / "mapping" / "masks" / "object_000007"
     object_dir.mkdir(parents=True)
     image = np.full((20, 24, 3), 190, dtype=np.uint8)
+    image[5:15, 6:18] = np.asarray([20, 30, 230], dtype=np.uint8)
     ok, encoded = cv2.imencode(".jpg", image)
     assert ok
     mask = np.ones((10, 12), dtype=np.uint8)
@@ -111,10 +116,27 @@ def test_crop_candidates_do_not_expand_into_neighbouring_source_frame(tmp_path: 
         raw_bbox_xyxy=np.asarray([30, 30, 42, 40], dtype=np.int32),
     )
 
-    rows = review.crop_candidates([object_dir / "img_000000_det_0000.npz"])
+    rgbd = tmp_path / "rgbd"
+    rgbd.mkdir()
+    source = np.full((80, 100, 3), 200, dtype=np.uint8)
+    source[30:40, 30:42] = np.asarray([20, 30, 230], dtype=np.uint8)
+    assert cv2.imwrite(str(rgbd / "frame.jpg"), source)
+    (rgbd / "frames.json").write_text(
+        '{"frames":[{"rgb_path":"frame.jpg"}]}', encoding="utf-8"
+    )
+
+    rows = review.crop_candidates(
+        [object_dir / "img_000000_det_0000.npz"],
+        frames_json=rgbd / "frames.json",
+    )
     grounded = cv2.imdecode(np.frombuffer(rows[0][1], dtype=np.uint8), cv2.IMREAD_COLOR)
     assert grounded is not None
-    assert grounded.shape[:2] == image.shape[:2]
+    assert grounded.shape[0] > image.shape[0]
+    assert grounded.shape[1] > image.shape[1]
+    # Context remains visible but subordinate; target pixels retain natural red.
+    assert 60.0 < float(grounded[:10, :10].mean()) < 130.0
+    target = grounded[30:40, 30:42]
+    assert int(target[:, :, 2].mean()) > 170
 
 
 def test_metric_dimensions_are_added_as_scale_evidence_without_class_hint() -> None:
@@ -402,3 +424,36 @@ def test_recovery_preflight_rejects_reused_views_before_second_request(
     assert rejected["eligible"] is False
     assert "recovery_view_overlap_above_threshold" in rejected["reason_codes"]
     assert "recovery_same_evidence_fingerprint" in rejected["reason_codes"]
+
+
+def test_review_prefers_complete_refined_observation_subset(tmp_path: Path) -> None:
+    review = _load(
+        "farm_preferred_semantic_evidence",
+        "scripts/review_farm_object_crops.py",
+    )
+    original = tmp_path / "object_000007/img_000001_det_0000.npz"
+    refined_a = tmp_path / "object_000007/img_000010_det_0000.npz"
+    refined_b = tmp_path / "object_000007/img_000011_det_0000.npz"
+    paths = [original, refined_a, refined_b]
+    state = {
+        "object_id": [7],
+        "object_mask_observations": [[
+            {"path": str(original), "source": "mapping"},
+            {"path": str(refined_a), "source": "full_colmap_sam3_refinement"},
+            {"path": str(refined_b), "source": "full_colmap_sam3_refinement"},
+        ]],
+    }
+    selected, audit = review.select_preferred_observation_paths(
+        state, 7, paths,
+        preferred_source="full_colmap_sam3_refinement",
+        minimum_preferred=2,
+    )
+    assert selected == [refined_a, refined_b]
+    assert audit["mode"] == "preferred_source"
+    selected, audit = review.select_preferred_observation_paths(
+        state, 7, paths[:-1],
+        preferred_source="full_colmap_sam3_refinement",
+        minimum_preferred=2,
+    )
+    assert selected == paths[:-1]
+    assert audit["mode"] == "all_resolved_fallback"

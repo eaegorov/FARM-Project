@@ -116,6 +116,11 @@ Model-service ports после terminal run должны быть свободн
 - `pin_farm_runtime_images.py` — tag→immutable image ID audit/repin.
 - `serve_farm_unified_viewer.py` — основной viewer.
 - `serve_farm_recon_overlay.py` — Knaack MV-SAM3D overlay.
+- `plan_farm_full_colmap_rescue.py` — bounded поиск дополнительных PINHOLE-ракурсов.
+- `refine_farm_full_colmap_masks.py` — REST3D-inspired VLM/SAM3 multiview fusion.
+- `merge_farm_full_colmap_rescue.py` — добавляет только принятые mask-наблюдения.
+- `apply_farm_full_colmap_rescue.py` — fail-closed публикация после geometry/VLM QA.
+- `build_farm_adaptive_vocabulary.py` — scene-specific VLM vocabulary discovery.
 - `refine_farm_recon_orientation.py` — gravity + full-mask refinement.
 - `tools/farm_shaper_bridge/run_gaussian_lift.py` — dense lift.
 - `tools/farm_shaper_bridge/run_bridge_stage.py` — ShapeR prepare/assemble.

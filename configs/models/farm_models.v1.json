@@ -194,6 +194,36 @@
         ]
       }
     },
+    "sam3-tracker": {
+      "kind": "local_file",
+      "path": "../../models/sam3-tracker/model.safetensors",
+      "sha256": "6d06f0a5f84e435071fe6603e61d0b4cc7b40e0d39d487cfd4d67d8cc11cc14a",
+      "required_files": [
+        {"path": "config.json", "sha256": "4616385e4b21f2e5e22c875b65679185cbccfa95de42542b9166f7dc3d57160f", "checksum_mode": "full"},
+        {"path": "merges.txt", "sha256": "9fd691f7c8039210e0fced15865466c65820d09b63988b0174bfe25de299051a", "checksum_mode": "full"},
+        {"path": "model.safetensors", "sha256": "6d06f0a5f84e435071fe6603e61d0b4cc7b40e0d39d487cfd4d67d8cc11cc14a", "checksum_mode": "full"},
+        {"path": "processor_config.json", "sha256": "6420cf2671fa9309ea95bc0144a8b9861666d1c5f43c8db09e410dacda974fce", "checksum_mode": "full"},
+        {"path": "special_tokens_map.json", "sha256": "2cdb3b8331a60c92fc1e55a13e9fd61fd2293c5a51275fdcccd62b780052530e", "checksum_mode": "full"},
+        {"path": "tokenizer.json", "sha256": "6d9109cc838977f3ca94a379eec36aecc7c807e1785cd729660ca2fc0171fb35", "checksum_mode": "full"},
+        {"path": "tokenizer_config.json", "sha256": "39670ad98457fe8f14ca59f6bb74591e9fc850974380a63993e5b8ffc865baa2", "checksum_mode": "full"},
+        {"path": "vocab.json", "sha256": "5047b556ce86ccaf6aa22b3ffccfc52d391ea4accdab9c2f2407da5b742d4363", "checksum_mode": "full"}
+      ],
+      "source": {
+        "kind": "huggingface_snapshot",
+        "repo_id": "facebook/sam3",
+        "revision": "3c879f39826c281e95690f02c7821c4de09afae7",
+        "required_files": [
+          "config.json",
+          "merges.txt",
+          "model.safetensors",
+          "processor_config.json",
+          "special_tokens_map.json",
+          "tokenizer.json",
+          "tokenizer_config.json",
+          "vocab.json"
+        ]
+      }
+    },
     "mobileclip": {
       "kind": "local_file",
       "path": "../../models/mobileclip/mobileclip_blt.pt",

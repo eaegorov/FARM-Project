@@ -146,6 +146,16 @@ def test_docker_contract_has_no_machine_specific_paths_or_viewer_port() -> None:
     assert "chmod -R a+rX" in dockerfile
 
 
+def test_documented_resource_preflight_uses_the_actual_manifest_cli() -> None:
+    for relative in ("docs/DEPLOYMENT.md", "docs/INPUTS.md"):
+        text = (ROOT / relative).read_text(encoding="utf-8")
+        command = text[text.index("scripts/farm_resource_preflight.py") :]
+        command = command[: command.index("```")].split("\n\n", 1)[0]
+        assert "--manifest configs/models/farm_models.v1.json" in command
+        assert "--all-models --verify-full-hashes --strict" in command
+        assert "--config" not in command
+
+
 def test_canonical_name_matches_python_packaging_normalization() -> None:
     assert canonical_name("opencv_python") == "opencv-python"
     assert canonical_name("Qwen.VL-Utils") == "qwen-vl-utils"

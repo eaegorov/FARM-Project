@@ -334,7 +334,12 @@ class Context:
         mounted: set[tuple[Path, str]] = set()
         for key, spec in self.models.pipeline_models.items():
             source = spec.local_path.resolve(strict=True).parent
-            alias = "yoloe" if key.startswith("yoloe-") else key
+            if key.startswith("yoloe-"):
+                alias = "yoloe"
+            elif key.startswith("sam3-tracker"):
+                alias = "sam3-tracker"
+            else:
+                alias = key
             target = f"/farm-models/{alias}"
             item = (source, target)
             if item not in mounted:
@@ -642,6 +647,36 @@ class Context:
         os.chmod(work / "masks", 0o775)
         relative = work.relative_to(self.run_dir).as_posix()
         try:
+            port, model = self.service("caption")
+            try:
+                self.post(
+                    "build_farm_adaptive_vocabulary.py",
+                    [
+                        "--frames-json", "/farm-run/rgbd/frames.json",
+                        "--base-vocabulary",
+                        "/home/scene_graph/scene_graph/configs/yoloe_vocabulary.txt",
+                        "--output-dir", f"/farm-run/{relative}/adaptive_inventory",
+                        "--vllm-url", f"http://127.0.0.1:{port}/v1",
+                        "--model", model,
+                        "--discovery-views", "12",
+                        "--verification-views", "12",
+                        "--batch-views", "6",
+                        "--min-visible-views", "2",
+                        "--min-confidence", "0.72",
+                        "--max-additions", "48",
+                    ],
+                    host_network=True,
+                )
+            finally:
+                self.stop_services()
+            inventory = load_json(work / "adaptive_inventory/inventory.json")
+            if str(inventory.get("status", "")).upper() != "PASS":
+                raise RuntimeError("adaptive object inventory did not pass")
+            counts = inventory.get("counts") or {}
+            if int(counts.get("added_terms", -1)) < 0 or int(
+                counts.get("added_terms", 49)
+            ) > 48:
+                raise RuntimeError("adaptive object inventory exceeded its bounded additions")
             self.prepare_main_mount()
             command, _ = self.docker_base("mapping", gpu=True, runtime="main")
             command += self.model_mounts()
@@ -664,6 +699,7 @@ class Context:
             parameters = [
                 "segmenter_device:=cuda:0", "segmenter_conf:=0.30",
                 f"segmenter_model_id:={self.resolved()['model_contract']['segmentation']}",
+                f"segmenter_vocab_file:=/farm-run/{relative}/adaptive_inventory/yoloe_vocabulary.txt",
                 "correspondence_feature_sim_thresh:=0.60", "correspondence_hellinger_thresh:=0.65",
                 "correspondence_max_merge_distance_m:=0.60", "correspondence_use_class_gate:=false",
                 "correspondence_assignment_mode:=best_only", "prune_enabled:=false",
@@ -681,6 +717,9 @@ class Context:
             if (work / "mapping_timing.json").is_file():
                 atomic_copy(work / "mapping_timing.json", self.run_dir / "timing/mapping_timing.json")
             replace_directory(work / "masks", mapping_dir / "masks")
+            replace_directory(
+                work / "adaptive_inventory", mapping_dir / "adaptive_inventory"
+            )
         finally:
             if work.exists():
                 shutil.rmtree(work)
@@ -763,7 +802,7 @@ class Context:
             "--surface-cloud", "/farm-run/mapping/presentation/data/cloud.npz",
             "--output-state", semantic_state,
             "--output-report", "/farm-run/qa/surface_prefilter/audit.json",
-            "--no-include-inactive-assemblies", "--enforce",
+            "--no-include-inactive-assemblies", "--no-enforce",
         ])
         port, model = self.service("caption")
         url = f"http://127.0.0.1:{port}/v1"
@@ -830,13 +869,257 @@ class Context:
             service_scope=self.scope,
         )
 
+    def direct_state(self) -> str:
+        rescued = self.run_dir / "mapping/scene_state_rescued.pt"
+        return (
+            "/farm-run/mapping/scene_state_rescued.pt"
+            if rescued.is_file()
+            else "/farm-run/mapping/scene_state_semantic.pt"
+        )
+
+    def direct_frames(self) -> str:
+        combined = self.run_dir / "qa/full_colmap_rescue/combined/frames.json"
+        return (
+            "/farm-run/qa/full_colmap_rescue/combined/frames.json"
+            if combined.is_file()
+            else "/farm-run/rgbd/frames.json"
+        )
+
+    def direct_masks(self) -> str:
+        combined = self.run_dir / "qa/full_colmap_rescue/combined/masks"
+        return (
+            "/farm-run/qa/full_colmap_rescue/combined/masks"
+            if combined.is_dir()
+            else "/farm-run/mapping/masks"
+        )
+
+    def direct_catalog(self) -> str:
+        rescued = self.run_dir / "qa/full_colmap_rescue/semantic_catalog.json"
+        return (
+            "/farm-run/qa/full_colmap_rescue/semantic_catalog.json"
+            if rescued.is_file()
+            else "/farm-run/qa/semantics/consensus/semantic_consensus_catalog.json"
+        )
+
+    def full_colmap_rescue(self) -> dict[str, Any]:
+        """Run bounded full-dataset SAM3+VLM rescue for uncertain direct objects."""
+
+        root = self.run_dir / "qa/full_colmap_rescue"
+        if root.exists():
+            shutil.rmtree(root)
+        root.mkdir(parents=True)
+        plan_path = root / "plan.json"
+        selected_names = root / "selected_names.txt"
+        command, _ = self.docker_base("full-colmap-plan", runtime="main")
+        command += [
+            "-e", "PYTHONDONTWRITEBYTECODE=1",
+            "-v", f"{ROOT}:/home/scene_graph/scene_graph:ro",
+            "-v", f"{self.run_dir}:/farm-run",
+            "-v", f"{self.config.inputs.colmap_model}:/input/colmap:ro",
+            "-v", f"{self.config.inputs.image_root}:/input/images:ro",
+            "--entrypoint", "/bin/bash", self.main_image,
+            "/home/scene_graph/scene_graph/docker/python-entrypoint.sh",
+            "/home/scene_graph/scene_graph/scripts/plan_farm_full_colmap_rescue.py",
+            "--scene-state", "/farm-run/mapping/scene_state_semantic.pt",
+            "--colmap-model", "/input/colmap",
+            "--image-root", "/input/images",
+            "--frames-json", "/farm-run/rgbd/frames.json",
+            "--output", "/farm-run/qa/full_colmap_rescue/plan.json",
+            "--selected-names-output", "/farm-run/qa/full_colmap_rescue/selected_names.txt",
+            "--max-objects", "48", "--views-per-object", "6",
+            "--max-total-views", "288", "--min-priority", "1.0",
+        ]
+        run(command)
+        plan = load_json(plan_path)
+        selected_count = int(plan.get("unique_rescue_views") or 0)
+        if selected_count <= 0:
+            atomic_write_json(root / "acceptance.json", {
+                "schema": "farm.full-colmap-rescue-acceptance.v1",
+                "status": "PASS",
+                "candidate_objects": int(plan.get("objects_considered") or 0),
+                "accepted_objects": 0,
+                "accepted_object_ids": [],
+                "policy": {"adaptive_noop": True, "uncertainty_preserves_original": True},
+            })
+            return load_json(root / "acceptance.json")
+
+        rescue_rgbd = root / "rgbd"
+        rescue_rgbd.mkdir()
+        g = self.config.camera_grouping
+        command, _ = self.docker_base("full-colmap-rgbd", gpu=True)
+        command += [
+            "-e", "PYTHONDONTWRITEBYTECODE=1",
+            "-v", f"{ROOT}:/project:ro", "-v", f"{self.run_dir}:/farm-run",
+            "-v", f"{self.config.inputs.colmap_model}:/input/colmap:ro",
+            "-v", f"{self.config.inputs.image_root}:/input/images:ro",
+            "-v", f"{self.config.inputs.gaussian_ply}:/input/scene.ply:ro",
+            "--entrypoint", self.prep_python, self.prep_image,
+            "/project/scripts/prepare_colmap_3dgs_rgbd.py",
+            "--colmap-model", "/input/colmap", "--image-root", "/input/images",
+            "--ply", "/input/scene.ply",
+            "--selected-names", "/farm-run/qa/full_colmap_rescue/selected_names.txt",
+            "--output-dir", "/farm-run/qa/full_colmap_rescue/rgbd",
+            "--scene-id", self.config.scene_id,
+            "--resolution", str(self.config.resources.render_resolution),
+            "--qa-sampled-views", str(min(24, selected_count)),
+            "--meters-per-scene-unit", str(self.resolved()["meters_per_scene_unit"]),
+            "--sensor-group", g.member_group,
+            "--timestamp-group", g.timestamp_group,
+            "--family-group", g.view_group,
+        ]
+        if g.pattern:
+            command += ["--identity-regex", g.pattern]
+        run(command)
+        summary = load_json(rescue_rgbd / "prep_summary.json")
+        if not summary.get("alignment_qa", {}).get("passed"):
+            raise RuntimeError("full-COLMAP rescue RGB-D alignment QA failed")
+
+        rescue_mapping = root / "mapping"
+        (rescue_mapping / "masks").mkdir(parents=True)
+        self.prepare_main_mount()
+        command, _ = self.docker_base("full-colmap-mapping", gpu=True, runtime="main")
+        command += self.model_mounts()
+        command += [
+            "-e", "HF_HUB_OFFLINE=1", "-e", "TRANSFORMERS_OFFLINE=1",
+            "-e", f"ROS_DOMAIN_ID={50 + int(self.scope[1:5], 16) % 150}",
+            "-v", f"{ROOT}:/home/scene_graph/scene_graph:ro",
+            "-v", f"{self.run_dir}:/farm-run",
+            "--entrypoint", "/bin/bash", self.main_image,
+            "/home/scene_graph/scene_graph/docker/entrypoint.sh",
+            "python", "-m", "scene_graph.offline.run",
+            "--source", "frames-json",
+            "--frames-json-dir", "/farm-run/qa/full_colmap_rescue/rgbd",
+            "--batch-size", str(self.config.resources.mapping_batch_size),
+            "--target-fps", "0", "--warmup-frames", "2",
+            "--save-path", "/farm-run/qa/full_colmap_rescue/mapping/scene_state_raw.pt",
+            "--covisibility", "--offline-debug",
+            "--debug-trace-path", "/farm-run/qa/full_colmap_rescue/mapping/debug_trace.jsonl",
+            "--timing-report-path", "/farm-run/qa/full_colmap_rescue/mapping/timing.json",
+            "--mask-observation-dir", "/farm-run/qa/full_colmap_rescue/mapping/masks",
+            "--mask-observation-max-per-object", "12",
+        ]
+        for value in (
+            "segmenter_device:=cuda:0", "segmenter_conf:=0.24",
+            f"segmenter_model_id:={self.resolved()['model_contract']['segmentation']}",
+            "correspondence_feature_sim_thresh:=0.60",
+            "correspondence_hellinger_thresh:=0.65",
+            "correspondence_max_merge_distance_m:=0.60",
+            "correspondence_use_class_gate:=false",
+            "correspondence_assignment_mode:=best_only",
+            "prune_enabled:=false", "caption_enabled:=false", "region_enabled:=false",
+            "scene_graph_json_save_enabled:=false", "scene_graph_snapshot_save_enabled:=false",
+        ):
+            command += ["--extra-param", value]
+        adaptive_vocabulary = (
+            self.run_dir / "mapping/adaptive_inventory/yoloe_vocabulary.txt"
+        )
+        if adaptive_vocabulary.is_file():
+            command += [
+                "--extra-param",
+                "segmenter_vocab_file:="
+                "/farm-run/mapping/adaptive_inventory/yoloe_vocabulary.txt",
+            ]
+        run(command)
+        if not (rescue_mapping / "scene_state_raw.pt").is_file():
+            raise RuntimeError("full-COLMAP rescue mapping produced no scene state")
+
+        sam3 = Path("/farm-models/sam3-tracker")
+        self.post("refine_farm_full_colmap_masks.py", [
+            "--plan", "/farm-run/qa/full_colmap_rescue/plan.json",
+            "--source-state", "/farm-run/mapping/scene_state_semantic.pt",
+            "--rescue-state", "/farm-run/qa/full_colmap_rescue/mapping/scene_state_raw.pt",
+            "--rescue-frames-json", "/farm-run/qa/full_colmap_rescue/rgbd/frames.json",
+            "--rescue-mask-root", "/farm-run/qa/full_colmap_rescue/mapping/masks",
+            "--model", str(sam3),
+            "--output-dir", "/farm-run/qa/full_colmap_rescue/sam3",
+            "--minimum-association-views", "2", "--minimum-accepted-views", "2",
+        ], gpu=True)
+        self.post("merge_farm_full_colmap_rescue.py", [
+            "--source-state", "/farm-run/mapping/scene_state_semantic.pt",
+            "--source-frames", "/farm-run/rgbd/frames.json",
+            "--source-mask-root", "/farm-run/mapping/masks",
+            "--rescue-state", "/farm-run/qa/full_colmap_rescue/mapping/scene_state_raw.pt",
+            "--rescue-frames", "/farm-run/qa/full_colmap_rescue/rgbd/frames.json",
+            "--refinement", "/farm-run/qa/full_colmap_rescue/sam3/result.json",
+            "--prior-catalog", "/farm-run/qa/semantics/consensus/semantic_consensus_catalog.json",
+            "--output-dir", "/farm-run/qa/full_colmap_rescue/combined",
+        ])
+        merge = load_json(root / "combined/merge_report.json")
+        if int(merge.get("accepted_objects") or 0) <= 0:
+            atomic_copy(
+                root / "combined/scene_state_pre_geometry.pt",
+                self.run_dir / "mapping/scene_state_rescued.pt",
+            )
+            atomic_copy(
+                self.run_dir / "qa/semantics/consensus/semantic_consensus_catalog.json",
+                root / "semantic_catalog.json",
+            )
+            atomic_write_json(root / "acceptance.json", {
+                "schema": "farm.full-colmap-rescue-acceptance.v1",
+                "status": "PASS", "candidate_objects": 0,
+                "accepted_objects": 0, "accepted_object_ids": [],
+                "policy": {"sam3_noop": True, "uncertainty_preserves_original": True},
+            })
+            return load_json(root / "acceptance.json")
+
+        self.post("refine_farm_object_geometry.py", [
+            "--scene-state", "/farm-run/qa/full_colmap_rescue/combined/scene_state_pre_geometry.pt",
+            "--frames-json", "/farm-run/qa/full_colmap_rescue/combined/frames.json",
+            "--mask-dir", "/farm-run/qa/full_colmap_rescue/combined/masks",
+            "--object-id-file", "/farm-run/qa/full_colmap_rescue/combined/rescue_object_ids.txt",
+            "--preferred-observation-source", "full_colmap_sam3_refinement",
+            "--minimum-preferred-observations", "3",
+            "--output-state", "/farm-run/qa/full_colmap_rescue/scene_state_geometry.pt",
+            "--output-report", "/farm-run/qa/full_colmap_rescue/geometry_audit.json",
+            "--min-depth-observations", "3", "--min-consistency", "0.65",
+            "--min-center-inside-rate", "0.80",
+            "--max-normalized-reprojection-error", "0.30",
+            "--min-median-projected-box-iou", "0.35",
+            "--min-box-support-rate", "0.70", "--min-voxel-inside-rate", "0.55",
+            "--orientation-mode", "gravity_yaw", "--up-vector", self.up(),
+        ])
+        port, model = self.service("caption")
+        self.post("review_farm_object_crops.py", [
+            "--catalog", "/farm-run/qa/full_colmap_rescue/combined/review_queue.json",
+            "--scene-state", "/farm-run/qa/full_colmap_rescue/scene_state_geometry.pt",
+            "--active-only",
+            "--geometry-report", "/farm-run/qa/full_colmap_rescue/geometry_audit.json",
+            "--frames-json", "/farm-run/qa/full_colmap_rescue/combined/frames.json",
+            "--mask-dir", "/farm-run/qa/full_colmap_rescue/combined/masks",
+            "--preferred-observation-source", "full_colmap_sam3_refinement",
+            "--minimum-preferred-observations", "2",
+            "--output-dir", "/farm-run/qa/full_colmap_rescue/vlm_review",
+            "--vllm-url", f"http://127.0.0.1:{port}/v1", "--model", model,
+            "--crops-per-object", "5", "--workers", "2", "--verify-kept",
+        ], host_network=True)
+        self.post("apply_farm_full_colmap_rescue.py", [
+            "--source-state", "/farm-run/mapping/scene_state_semantic.pt",
+            "--refined-state", "/farm-run/qa/full_colmap_rescue/scene_state_geometry.pt",
+            "--refinement", "/farm-run/qa/full_colmap_rescue/sam3/result.json",
+            "--geometry-report", "/farm-run/qa/full_colmap_rescue/geometry_audit.json",
+            "--review-report", "/farm-run/qa/full_colmap_rescue/vlm_review/reviewed_robust_objects.json",
+            "--prior-catalog", "/farm-run/qa/semantics/consensus/semantic_consensus_catalog.json",
+            "--output-state", "/farm-run/mapping/scene_state_rescued.pt",
+            "--output-catalog", "/farm-run/qa/full_colmap_rescue/semantic_catalog.json",
+            "--output-report", "/farm-run/qa/full_colmap_rescue/acceptance.json",
+        ])
+        return load_json(root / "acceptance.json")
+
     def part_whole(self) -> None:
-        self.service("caption")
+        rescue = self.full_colmap_rescue()
         self.post("analyze_farm_part_whole.py", [
-            "--scene-state", "/farm-run/mapping/scene_state_raw.pt", "--mask-root", "/farm-run/mapping/masks",
+            "--scene-state", self.direct_state(),
+            "--semantic-catalog", self.direct_catalog(),
+            "--mask-root", self.direct_masks(),
             "--output", "/farm-run/qa/part_whole/audit.json",
         ])
-        self.result("PASS", audit="audit.json", service_scope=self.scope)
+        self.result(
+            "PASS",
+            audit="audit.json",
+            full_colmap_rescue="../full_colmap_rescue/acceptance.json",
+            full_colmap_rescued_objects=int(rescue.get("accepted_objects") or 0),
+            service_scope=self.scope,
+        )
 
     def embedding(self, service: str, mode: str, source: str, output: str) -> None:
         port, model = self.service(service)
@@ -846,7 +1129,7 @@ class Context:
             "--report", f"/farm-run/qa/assemblies/{mode}_embedding.json",
         ]
         if mode == "vl":
-            arguments += ["--mask-root", "/farm-run/mapping/masks", "--mask-root",
+            arguments += ["--mask-root", self.direct_masks(), "--mask-root",
                           "/farm-run/qa/assemblies/masks", "--crops-per-object", "3"]
         self.post("enrich_farm_embeddings.py", arguments, host_network=True)
 
@@ -855,9 +1138,9 @@ class Context:
             port, model = self.service("caption")
             url = f"http://127.0.0.1:{port}/v1"
             common = [
-                "--scene-state", "/farm-run/mapping/scene_state_semantic.pt",
+                "--scene-state", self.direct_state(),
                 "--part-whole-report", "/farm-run/qa/part_whole/audit.json",
-                "--mask-root", "/farm-run/mapping/masks",
+                "--mask-root", self.direct_masks(),
                 "--up-vector", self.up(),
             ]
             self.post("build_farm_object_assemblies.py", common + [
@@ -870,7 +1153,7 @@ class Context:
             self.post("review_farm_object_crops.py", [
                 "--catalog", "/farm-run/qa/assemblies/review_queue.json",
                 "--scene-state", "/farm-run/qa/assemblies/scene_state_candidates.pt",
-                "--frames-json", "/farm-run/rgbd/frames.json",
+                "--frames-json", self.direct_frames(),
                 "--mask-dir", "/farm-run/qa/assemblies/review_masks", "--output-dir", "/farm-run/qa/assemblies/review",
                 "--vllm-url", url, "--model", model, "--crops-per-object", "6", "--workers", "2",
                 "--expand-image-matches",
@@ -886,7 +1169,7 @@ class Context:
             ])
             self.post("refine_farm_object_geometry.py", [
                 "--scene-state", "/farm-run/qa/assemblies/scene_state_reviewed.pt",
-                "--frames-json", "/farm-run/rgbd/frames.json", "--mask-dir", "/farm-run/qa/assemblies/masks",
+                "--frames-json", self.direct_frames(), "--mask-dir", "/farm-run/qa/assemblies/masks",
                 "--output-state", "/farm-run/qa/assemblies/scene_state_geometry.pt",
                 "--output-report", "/farm-run/qa/assemblies/geometry_audit.json",
                 "--assembly-only", "--orientation-mode", "gravity_yaw", "--up-vector", self.up(),
@@ -904,18 +1187,18 @@ class Context:
     def surface_support(self) -> None:
         self.post("audit_farm_gaussian_support.py", [
             "--scene-state", "/farm-run/mapping/scene_state_assemblies.pt",
-            "--frames-json", "/farm-run/rgbd/frames.json", "--direct-mask-root", "/farm-run/mapping/masks",
+            "--frames-json", self.direct_frames(), "--direct-mask-root", self.direct_masks(),
             "--assembly-mask-root", "/farm-run/qa/assemblies/masks",
             "--surface-cloud", "/farm-run/mapping/presentation/data/cloud.npz",
             "--output-state", "/farm-run/mapping/scene_state_surface.pt",
-            "--output-report", "/farm-run/qa/surface_support/audit.json", "--enforce",
+            "--output-report", "/farm-run/qa/surface_support/audit.json", "--no-enforce",
         ])
         self.result("PASS", audit="audit.json")
 
     def compound_geometry(self) -> None:
         self.post("refine_farm_compound_geometry.py", [
             "--scene-state", "/farm-run/mapping/scene_state_surface.pt",
-            "--frames-json", "/farm-run/rgbd/frames.json",
+            "--frames-json", self.direct_frames(),
             "--assembly-mask-dir", "/farm-run/qa/assemblies/masks",
             "--cloud-npz", "/farm-run/mapping/presentation/data/cloud.npz",
             "--output-state", "/farm-run/qa/compound_geometry/scene_state_raw.pt",
@@ -924,7 +1207,7 @@ class Context:
         self.post("refine_farm_compound_presentation.py", [
             "--scene-state", "/farm-run/qa/compound_geometry/scene_state_raw.pt",
             "--cloud-npz", "/farm-run/mapping/presentation/data/cloud.npz",
-            "--frames-json", "/farm-run/rgbd/frames.json", "--mask-root", "/farm-run/qa/assemblies/masks",
+            "--frames-json", self.direct_frames(), "--mask-root", "/farm-run/qa/assemblies/masks",
             "--output-scene-state", "/farm-run/mapping/scene_state_compound.pt",
             "--report", "/farm-run/qa/compound_geometry/presentation_audit.json",
         ])
@@ -933,7 +1216,7 @@ class Context:
     def geometry_qa(self) -> None:
         self.post("validate_farm_geometry.py", [
             "--scene-state", "/farm-run/mapping/scene_state_compound.pt",
-            "--direct-state", "/farm-run/mapping/scene_state_semantic.pt",
+            "--direct-state", self.direct_state(),
             "--resolved-context", "/farm-run/input/resolved_context.json",
             "--surface-report", "/farm-run/qa/surface_support/audit.json",
             "--output", "/farm-run/qa/geometry_qa/structural.json",
@@ -951,7 +1234,7 @@ class Context:
             "--scene-state", "/farm-run/qa/dedup/scene_state_unified.pt",
             "--output-state", "/farm-run/mapping/scene_state_dedup.pt",
             "--output-report", "/farm-run/qa/dedup/audit.json",
-            "--mask-root", "/farm-run/mapping/masks",
+            "--mask-root", self.direct_masks(),
         ])
         self.result("PASS", audit="audit.json", unified_presentation="unified_presentation.json")
 
@@ -968,16 +1251,16 @@ class Context:
             # The ensemble catalog is intentionally conservative and is an
             # intermediate input to cross-pass consensus; using it here
             # silently regressed resolved objects back to geometry_only.
-            "--direct-catalog", "/farm-run/qa/semantics/consensus/semantic_consensus_catalog.json",
+            "--direct-catalog", self.direct_catalog(),
             "--assembly-review", "/farm-run/qa/assemblies/review/reviewed_robust_objects.json",
             "--output", "/farm-run/.stage_work/finalize/scene_state_tiered.pt",
         ])
         self.post("build_farm_final_acceptance.py", [
             "--scene-state", "/farm-run/.stage_work/finalize/scene_state_tiered.pt",
             "--dedup-audit", "/farm-run/qa/dedup/audit.json",
-            "--semantic-catalog", "/farm-run/qa/semantics/consensus/semantic_consensus_catalog.json",
+            "--semantic-catalog", self.direct_catalog(),
             "--assembly-review", "/farm-run/qa/assemblies/review/reviewed_robust_objects.json",
-            "--mask-root", "/farm-run/mapping/masks",
+            "--mask-root", self.direct_masks(),
             "--mask-root", "/farm-run/qa/assemblies/masks",
             "--output-state", "/farm-run/.stage_work/finalize/scene_state_accepted.pt",
             "--output-report", "/farm-run/.stage_work/finalize/acceptance/result.json",
@@ -1176,9 +1459,9 @@ class Context:
         self.post("build_farm_final_acceptance.py", [
             "--scene-state", "/farm-run/final/scene_state.pt",
             "--dedup-audit", "/farm-run/qa/dedup/audit.json",
-            "--semantic-catalog", "/farm-run/qa/semantics/consensus/semantic_consensus_catalog.json",
+            "--semantic-catalog", self.direct_catalog(),
             "--assembly-review", "/farm-run/qa/assemblies/review/reviewed_robust_objects.json",
-            "--mask-root", "/farm-run/mapping/masks",
+            "--mask-root", self.direct_masks(),
             "--mask-root", "/farm-run/qa/assemblies/masks",
             "--output-state", "/farm-run/.stage_work/qa_bundle/acceptance_verify/scene_state.pt",
             "--output-report", "/farm-run/.stage_work/qa_bundle/acceptance_verify/result.json",
@@ -1224,7 +1507,7 @@ class Context:
                 "final acceptance verification failed: " + ", ".join(acceptance_failures)
             )
         self.post("analyze_farm_scene_quality.py", [
-            "--pt", "/farm-run/final/scene_state.pt", "--frames-json", "/farm-run/rgbd/frames.json",
+            "--pt", "/farm-run/final/scene_state.pt", "--frames-json", self.direct_frames(),
             "--selection-manifest", "/farm-run/selection/selection_manifest.json",
             "--prep-summary", "/farm-run/rgbd/prep_summary.json",
             "--timing-summary", "/farm-run/timing/qa_snapshot.json",
@@ -1250,8 +1533,8 @@ class Context:
             shutil.rmtree(visual_work)
         visual_work.parent.mkdir(parents=True, exist_ok=True)
         self.post("visualize_farm_scene_state.py", [
-            "--pt", "/farm-run/final/scene_state.pt", "--frames-json", "/farm-run/rgbd/frames.json",
-            "--segmentation-dir", "/farm-run/mapping/masks",
+            "--pt", "/farm-run/final/scene_state.pt", "--frames-json", self.direct_frames(),
+            "--segmentation-dir", self.direct_masks(),
             "--presentation-catalog", "/farm-run/final/presentation_catalog.json",
             "--dedup-audit", "/farm-run/qa/dedup/audit.json",
             "--acceptance-report", "/farm-run/qa/acceptance/result.json",

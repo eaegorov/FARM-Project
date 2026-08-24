@@ -23,7 +23,7 @@ COLMAP + RGB + 3DGS
 
 ## Куда смотреть
 
-Документация сведена к четырём файлам:
+Документация сведена к пяти русским файлам; это весь основной маршрут:
 
 1. **[Развёртывание](docs/DEPLOYMENT.md)** — новый сервер, модели, Docker,
    cold run, lift, ShapeR и viewer.
@@ -31,21 +31,28 @@ COLMAP + RGB + 3DGS
    gravity и конфиг новой сцены.
 3. **[Качество](docs/QUALITY.md)** — смысл слоёв, acceptance, recall lift,
    MV-SAM3D, ориентация и текущие метрики Factory/Knaack.
-4. **[Справочник](docs/REFERENCE.md)** — 17 стадий, CLI, выходы, порты и
+4. **[Исходный FARM и текущий модуль](docs/ORIGINAL_VS_CURRENT.md)** — что было
+   в research-коде, что добавлено здесь и какой проверяемый эффект получен.
+5. **[Справочник](docs/REFERENCE.md)** — 17 стадий, CLI, выходы, порты и
    диагностика.
 
 Если нужно просто перенести FARM на другой сервер — начинайте с
 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md). Если нужно понять, можно ли отдавать
 результат руководству — с [docs/QUALITY.md](docs/QUALITY.md).
 
-## Что проверено сейчас
+Состояние на 2026-08-24:
 
-Состояние на 2026-08-21:
-
-| Сцена | Cold FARM | Final / presentation | Release lift |
+| Сцена | Cold run | Final / presentation | Release lift |
 | --- | --- | ---: | ---: |
 | Factory | `factory-production-v4-quality` | 85 / 36 | 15/21 strict, 188 051 splat, PASS |
 | Knaack | `knaack-production-v8-quality` | 96 / 52 | 31/36 strict, 163 271 splat, PASS |
+
+Это последние полностью завершённые и криптографически проверенные runs, но не
+безусловная визуальная приёмка. Factory v4 отклонён пользовательским review как регрессия по
+labels/OBB/recall и остаётся диагностическим baseline. Новый REST3D-inspired
+full-COLMAP A/B уже дал 38 mask-pass → 27 geometry-pass → 23 whole-object
+acceptance (8 label-verified, 15 `geometry_only`) за 61.26 с SAM3 stage. Это ещё
+не release: до замены Factory нужен новый signed cold run.
 
 Старый Knaack давал 323 активных объекта и визуальный лес больших OBB. Новый
 surface gate снял 227 неподдержанных треков до публикации. Это повысило precision,
@@ -120,7 +127,7 @@ tools/farm_shaper_bridge Gaussian lift и ShapeR bridge
 docker/                  production Dockerfile
 requirements/            точные host lock-файлы
 tests/                   first-party regression suite
-docs/                    четыре русских руководства
+docs/                    пять русских руководств
 ```
 
 ## Главные правила качества

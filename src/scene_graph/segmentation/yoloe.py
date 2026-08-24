@@ -16,6 +16,7 @@ from scene_graph.runtime_paths import find_model_file, find_package_file
 
 from .interfaces import SegmentationBackend
 from .models import SegmentationOutput
+from .overlap import suppress_contained_masks
 from .dino import DEFAULT_MODEL as DEFAULT_DINO_MODEL
 from .dino import DINOFeaturesExtractor
 from .visualization import SegmentationVisualizer
@@ -59,6 +60,7 @@ class YOLOESegmenter(SegmentationBackend):
         imgsz: int | tuple[int, int] = 640,
         conf_thres: float = 0.4,
         iou_thres: float = 0.5,
+        class_agnostic_nms: bool = True,
         device: str | None = None,
         use_dino_features: bool = False,
         dino_extractor: DINOFeaturesExtractor | None = None,
@@ -92,6 +94,7 @@ class YOLOESegmenter(SegmentationBackend):
             self.imgsz = tuple(imgsz)
         self.conf_thres = conf_thres
         self.iou_thres = iou_thres
+        self.class_agnostic_nms = bool(class_agnostic_nms)
         self.max_det = max_det
         self.min_mask_pixels = min_mask_pixels
         self.min_depth_points = min_depth_points
@@ -1012,6 +1015,7 @@ class YOLOESegmenter(SegmentationBackend):
             self.conf_thres,
             self.iou_thres,
             max_det=self.max_det,
+            agnostic=self.class_agnostic_nms,
             nc=head_nc or 0,
         )
         if self._timing_enabled:
@@ -1067,6 +1071,16 @@ class YOLOESegmenter(SegmentationBackend):
                 img_hw,
                 upsample=True,
             )
+            keep_indices = suppress_contained_masks(masks_b, scores_b)
+            if int(keep_indices.numel()) != n_b:
+                boxes_b = boxes_b[keep_indices]
+                scores_b = scores_b[keep_indices]
+                class_ids_b = class_ids_b[keep_indices]
+                masks_b = masks_b[keep_indices]
+                if attach_lrpc_indices:
+                    det_indices_b = det_indices_b[keep_indices]
+                n_b = int(keep_indices.numel())
+                det_per_img[-1] = n_b
             boxes_scaled_b = boxes_b.clone()
             ops.scale_boxes(
                 img_hw,

@@ -199,6 +199,33 @@ def _review_map(path: Path | None) -> dict[tuple[int, ...], dict]:
     return mapped
 
 
+
+def reviewed_assembly_eligible(review: object) -> tuple[bool, str]:
+    """Require an explicit positive multi-view review before reviewed materialisation."""
+
+    if not isinstance(review, dict):
+        return False, "missing_review"
+    decision = str(review.get("review_decision") or "").strip().lower()
+    category = str(review.get("review_category") or "").strip()
+    description = str(review.get("review_description") or "").strip()
+    if decision not in {"keep", "relabel"}:
+        return False, f"review_decision:{decision or 'missing'}"
+    if not category or category.lower() == "unknown":
+        return False, "review_category_missing"
+    if not description:
+        return False, "review_description_missing"
+    contract = review.get("review_label_contract")
+    if not isinstance(contract, dict) or contract.get("contract_valid") is not True:
+        return False, "review_label_contract_invalid"
+    if contract.get("complete_bounded") is not True:
+        return False, "review_not_complete_bounded"
+    if str(contract.get("topology") or "") not in {
+        "standalone_whole", "carrier_payload"
+    }:
+        return False, "review_not_whole_topology"
+    return True, "reviewed_multi_view_whole"
+
+
 def _unpack_mask_canvas(data: np.lib.npyio.NpzFile, kind: str, image_shape: tuple[int, int]) -> np.ndarray:
     height, width = image_shape
     canvas = np.zeros((height, width), dtype=bool)
@@ -331,8 +358,11 @@ def main() -> int:
     parser.add_argument("--require-reviewed", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--quantile", type=float, default=0.025)
     parser.add_argument("--voxel-cap", type=int, default=2000)
+    parser.add_argument("--max-assembly-members", type=int, default=6)
     add_up_arguments(parser, default_axis="y")
     args = parser.parse_args()
+    if args.max_assembly_members < 2:
+        parser.error("--max-assembly-members must be at least 2")
     up_policy = policy_from_args(args)
 
     source = args.scene_state.expanduser().resolve()
@@ -402,14 +432,32 @@ def main() -> int:
     for key, (default, _) in list_fields.items():
         _ensure_list(state, key, count, default)
 
+    skipped_groups: list[dict] = []
     for members, relations in groups:
         if any(member not in id_to_index for member in members):
+            continue
+        member_key = canonical_member_tuple(members)
+        review = reviews.get(member_key, {})
+        if len(members) > int(args.max_assembly_members):
+            skipped_groups.append({
+                "members": members,
+                "reason": "member_count_exceeds_limit",
+            })
+            continue
+        review_eligible, review_reason = reviewed_assembly_eligible(review)
+        if args.require_reviewed and not review_eligible:
+            skipped_groups.append({
+                "members": members,
+                "reason": review_reason,
+            })
             continue
         indices = [id_to_index[member] for member in members]
         relation_types = {str(row.get("relation_type") or "part_whole") for row in relations}
         assembly_relation_type = (
             "duplicate_track_consolidation"
             if relation_types == {"duplicate_overlap"}
+            else "multi_view_whole_candidate"
+            if "complementary_parts" in relation_types
             else "part_whole_candidate"
         )
         merged_keys = torch.empty((0,), dtype=torch.int64)
@@ -488,7 +536,6 @@ def main() -> int:
         )
         merged_feature = (features[indices] * feature_weights[:, None]).sum(dim=0) / feature_weights.sum()
         merged_feature = merged_feature / torch.clamp(torch.linalg.vector_norm(merged_feature), min=1.0e-12)
-        review = reviews.get(canonical_member_tuple(members), {})
         category = str(review.get("review_category") or "").strip()
         description = str(review.get("review_description") or "").strip()
         decision = str(review.get("review_decision") or "unknown").strip().lower()
@@ -622,6 +669,9 @@ def main() -> int:
         "category_agnostic": True,
         "assemblies_added": new_count,
         "assembly_object_ids": new_ids,
+        "assemblies_skipped": len(skipped_groups),
+        "skipped_groups": skipped_groups,
+        "max_assembly_members": int(args.max_assembly_members),
         "require_reviewed": bool(args.require_reviewed),
         "up": up_policy.to_dict(),
     }
@@ -632,6 +682,9 @@ def main() -> int:
         "category_agnostic": True,
         "up": up_policy.to_dict(),
         "assemblies_added": new_count,
+        "assemblies_skipped": len(skipped_groups),
+        "skipped_groups": skipped_groups,
+        "max_assembly_members": int(args.max_assembly_members),
         "active_assemblies": sum(bool(row["active"]) for row in rows),
         "objects": rows,
         "timing": {"duration_seconds": time.perf_counter() - started, "stage": "part_whole_assembly"},

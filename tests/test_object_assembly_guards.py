@@ -4,12 +4,16 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from scripts.analyze_farm_part_whole import classify_part_whole_relation
+from scripts.analyze_farm_part_whole import (
+    classify_part_whole_relation,
+    semantic_assembly_hint,
+)
 from scripts.build_farm_object_assemblies import (
     _copy_member_review_masks,
     _merge_mask_files,
     _unpack_mask_canvas,
     canonical_member_tuple,
+    reviewed_assembly_eligible,
 )
 from scripts.build_farm_tiered_state import assembly_tiered_eligibility
 
@@ -137,6 +141,104 @@ def test_nonfinite_feature_similarity_fails_closed(feature_similarity: float) ->
 
     assert relation_class == "rejected"
     assert diagnostics["feature_valid"] is False
+
+
+def test_structurally_hinted_adjacent_fragments_can_form_review_candidate() -> None:
+    relation_class, diagnostics = _classify_relation(
+        contained_frames=0,
+        common_frames=2,
+        observations_a=3,
+        observations_b=2,
+        median_iou=0.04,
+        median_area_ratio=0.35,
+        centre_distance_m=1.20,
+        feature_similarity=0.70,
+        adjacent_frames=2,
+        median_bbox_gap_ratio=0.05,
+        semantic_assembly_hint=True,
+    )
+
+    assert relation_class == "complementary_parts"
+    assert diagnostics["complementary_parts"] is True
+
+
+def test_adjacent_fragments_without_structural_hint_fail_closed() -> None:
+    relation_class, _ = _classify_relation(
+        contained_frames=0,
+        common_frames=2,
+        observations_a=3,
+        observations_b=2,
+        median_iou=0.04,
+        median_area_ratio=0.35,
+        centre_distance_m=1.20,
+        feature_similarity=0.70,
+        adjacent_frames=2,
+        median_bbox_gap_ratio=0.05,
+        semantic_assembly_hint=False,
+    )
+
+    assert relation_class == "rejected"
+
+
+def test_semantic_uncertainty_alone_never_authorizes_assembly() -> None:
+    hinted, reasons = semantic_assembly_hint(
+        {
+            "semantic_status": "physical_component_or_contradiction_suppressed",
+            "topology": "standalone_whole",
+            "category_role": "whole_object",
+            "category": "unresolved object",
+        }
+    )
+
+    assert hinted is False
+    assert reasons == []
+
+
+def test_explicit_carrier_payload_topology_authorizes_review_candidate() -> None:
+    hinted, reasons = semantic_assembly_hint(
+        {"topology": "carrier_payload", "category": "box"}
+    )
+
+    assert hinted is True
+    assert reasons == ["topology:carrier_payload"]
+
+
+@pytest.mark.parametrize(
+    ("review", "eligible"),
+    [
+        ({
+            "review_decision": "keep", "review_category": "crane",
+            "review_description": "complete crane",
+            "review_label_contract": {
+                "contract_valid": True, "complete_bounded": True,
+                "topology": "standalone_whole",
+            },
+        }, True),
+        ({
+            "review_decision": "keep", "review_category": "crane",
+            "review_description": "fragment",
+            "review_label_contract": {
+                "contract_valid": True, "complete_bounded": False,
+                "topology": "attached_component",
+            },
+        }, False),
+        ({
+            "review_decision": "keep", "review_category": "crane",
+            "review_description": "mixed masks",
+            "review_label_contract": {
+                "contract_valid": True, "complete_bounded": True,
+                "topology": "mixed_targets",
+            },
+        }, False),
+        ({"review_decision": "reject", "review_category": "crane", "review_description": "fragment"}, False),
+        ({"review_decision": "keep", "review_category": "unknown", "review_description": "fragment"}, False),
+        ({"review_decision": "keep", "review_category": "crane", "review_description": ""}, False),
+        ({}, False),
+    ],
+)
+def test_reviewed_assembly_materialisation_is_fail_closed(review: dict, eligible: bool) -> None:
+    actual, _ = reviewed_assembly_eligible(review)
+    assert actual is eligible
 
 
 def _write_mask(

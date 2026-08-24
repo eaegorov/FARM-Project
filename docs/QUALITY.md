@@ -58,6 +58,64 @@ Connected refinement повышает полноту консервативно:
 Для новой сцены thresholds не подстраиваются по объектам. Сначала calibration
 на одной сцене, commit конфигурации, затем blind validation на другой.
 
+
+## REST3D-inspired уточнение 2D-масок
+
+Для сложных объектов основной subset кадров недостаточен: маска может покрывать
+только видимую грань, а label — случайный компонент. Поэтому для ограниченной
+очереди неопределённых объектов используется отдельный fail-closed проход:
+
+1. Планировщик ищет до шести хорошо видимых ракурсов по всей зарегистрированной
+   PINHOLE COLMAP-модели; исходные RGB не растягиваются и не размываются.
+2. Независимые seed-маски backproject-ятся через render-depth в метрический мир,
+   обрезаются расширенным OBB и объединяются только при поддержке минимум двух
+   ракурсов.
+3. Согласованные 3D-точки reproject-ятся с depth-consistency и становятся
+   positive prompts для SAM3; competing masks дают negative prompts.
+4. Лучший независимо принятый seed распространяется вперёд и назад по кадрам.
+   Как в локальном REST3D, направления используют отдельные одинаково seeded
+   sessions: forward-cache не может повлиять на reverse.
+5. Каждая propagated-маска заново проходит confidence, component, rendered-depth
+   и metric-OBB gates. Одного tracker output недостаточно; нужен хотя бы один
+   независимо принятый seed и общая 3D-поддержка минимум двух видов.
+6. Повторный geometry refit проверяет метрический центр, размеры, reprojection,
+   box support и voxel support.
+7. Слепой VLM решает, является ли маска целым физическим объектом. Отдельная
+   candidate-conditioned проверка решает только, можно ли публиковать label.
+   Неуверенный label становится `geometry_only / unresolved object`, но уже
+   доказанная геометрия не удаляется. Неуверенность в существовании по-прежнему
+   сохраняет исходный объект без замены.
+
+Production budget: до 48 объектов, шесть видов на объект и 288 уникальных кадров
+с round-robin распределением. На Factory план дал всем 48 объектам по шесть
+ракурсов (251 уникальный RGB); planning занял 52.77 с, RGB-D — 60.82 с.
+
+Измеренный A/B 2026-08-24:
+
+- предыдущий 192-view budget: 27 mask-pass → 20 geometry-pass → 17
+  whole-object acceptance (4 label-verified, 13 `geometry_only`);
+- текущий 6-view/288 budget: всем 48 кандидатам назначено по шесть ракурсов,
+  251 уникальный реальный RGB;
+- mapping: 251/251, dropped 0, 124.88 с;
+- SAM3 + независимые directional propagation sessions: 38 mask-pass,
+  123 refined mask sidecars, 61.26 с (13.40 с model inference);
+- strict metric geometry: 27 pass / 11 reject;
+- VLM: 27 initial + 27 verification запросов, 0 transport errors, 102.93 с;
+- итоговый existence gate: 23 объекта;
+- из них 8 label-verified и 15 честно `geometry_only`.
+
+Полный измеренный A/B-контур после готового VLM service занимает около 6.8 мин:
+52.77 с planning + 60.82 с RGB-D + 124.88 с mapping + 61.26 с SAM3 +
+102.93 с VLM и короткие merge/geometry/acceptance. Холодный старт VLM учитывается
+отдельно и зависит от GPU/runtime cache.
+
+Это не cold-run acceptance и не повод подменять текущий Factory release: новый
+механизм должен пройти полный signed cold run. Но A/B доказывает три исправленные
+ошибки: scale теперь связан между plan/render/OBB fail-closed, а неуверенность
+candidate-conditioned label-аудита больше не уничтожает достоверный 3D-объект,
+а расширение до шести full-COLMAP видов повышает mask-pass 27→38 и итоговый
+whole-object acceptance 17→23 без ослабления geometry/VLM gates.
+
 ## Knaack MV-SAM3D
 
 Deliverable: `splatica_demo_app/outputs/farm_recon`.

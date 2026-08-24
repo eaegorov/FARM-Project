@@ -71,6 +71,58 @@ def _load_frames(path: Path) -> tuple[Path, dict[str, dict]]:
     return path.parent, by_stem
 
 
+
+def _select_observation_paths(
+    state: dict,
+    index: int,
+    resolved_paths: list[Path],
+    *,
+    preferred_source: str,
+    minimum_preferred: int,
+) -> tuple[list[Path], dict]:
+    """Prefer a complete, provenance-tagged mask subset without weakening fallback."""
+
+    source = str(preferred_source or "").strip()
+    all_paths = list(resolved_paths)
+    if not source:
+        return all_paths, {
+            "mode": "all_resolved",
+            "preferred_source": None,
+            "preferred_records": 0,
+            "selected_paths": len(all_paths),
+            "fallback_used": False,
+        }
+    rows = state.get("object_mask_observations")
+    row = rows[index] if isinstance(rows, list) and 0 <= index < len(rows) else []
+    preferred_tails: set[tuple[str, str]] = set()
+    preferred_records = 0
+    for record in row if isinstance(row, (list, tuple)) else []:
+        if not isinstance(record, dict) or str(record.get("source") or "") != source:
+            continue
+        text = str(record.get("path") or record.get("mask_path") or "").strip()
+        if not text:
+            continue
+        path = Path(text)
+        if len(path.parts) < 2:
+            continue
+        preferred_tails.add((path.parts[-2], path.parts[-1]))
+        preferred_records += 1
+    preferred = [
+        path for path in all_paths
+        if len(path.parts) >= 2 and (path.parts[-2], path.parts[-1]) in preferred_tails
+    ]
+    threshold = max(1, int(minimum_preferred))
+    use_preferred = len(preferred) >= threshold
+    return (preferred if use_preferred else all_paths), {
+        "mode": "preferred_source" if use_preferred else "all_resolved_fallback",
+        "preferred_source": source,
+        "preferred_records": preferred_records,
+        "preferred_resolved_paths": len(preferred),
+        "minimum_preferred_observations": threshold,
+        "selected_paths": len(preferred) if use_preferred else len(all_paths),
+        "fallback_used": not use_preferred,
+    }
+
 def _unpack_mask(data: np.lib.npyio.NpzFile, kind: str) -> tuple[np.ndarray, np.ndarray] | None:
     if f"{kind}_bits" not in data.files:
         return None
@@ -635,7 +687,32 @@ def main() -> int:
         action="store_true",
         help="Evaluate provisional assembly rows only and preserve every direct object bit-for-bit.",
     )
+    parser.add_argument(
+        "--object-id-file",
+        type=Path,
+        help=(
+            "Evaluate only the exact newline-delimited object IDs in this file. "
+            "This is mutually exclusive with --assembly-only and preserves every "
+            "unlisted row bit-for-bit."
+        ),
+    )
+    parser.add_argument(
+        "--preferred-observation-source",
+        default="",
+        help=(
+            "Use only canonical mask observations with this exact provenance source "
+            "when enough resolve; otherwise retain the complete observation set."
+        ),
+    )
+    parser.add_argument(
+        "--minimum-preferred-observations",
+        type=int,
+        default=3,
+        help="Minimum resolved preferred-source views required before source isolation.",
+    )
     args = parser.parse_args()
+    if args.assembly_only and args.object_id_file is not None:
+        parser.error("--assembly-only and --object-id-file are mutually exclusive")
     up_policy = policy_from_args(args)
     up_axis_index = up_policy.axis_index
 
@@ -710,7 +787,32 @@ def main() -> int:
         for index in range(min(count, len(assembly_members)))
         if isinstance(assembly_members[index], (list, tuple)) and len(assembly_members[index]) > 0
     }
-    if args.assembly_only:
+    if args.object_id_file is not None:
+        requested_path = args.object_id_file.expanduser().resolve(strict=True)
+        requested_ids: list[int] = []
+        for line_number, raw in enumerate(
+            requested_path.read_text(encoding="utf-8").splitlines(), start=1
+        ):
+            value = raw.strip()
+            if not value or value.startswith("#"):
+                continue
+            try:
+                object_id = int(value)
+            except ValueError as exc:
+                raise ValueError(
+                    f"invalid object ID on line {line_number} of {requested_path}: {value!r}"
+                ) from exc
+            if object_id < 0:
+                raise ValueError(f"object IDs must be non-negative: {object_id}")
+            requested_ids.append(object_id)
+        if len(set(requested_ids)) != len(requested_ids):
+            raise ValueError("--object-id-file contains duplicate object IDs")
+        index_by_id = {int(value): index for index, value in enumerate(object_ids.tolist())}
+        missing = sorted(set(requested_ids) - set(index_by_id))
+        if missing:
+            raise ValueError(f"--object-id-file contains unknown object IDs: {missing}")
+        evaluation_indices = [index_by_id[object_id] for object_id in requested_ids]
+    elif args.assembly_only:
         evaluation_indices = sorted(assembly_indices)
     else:
         evaluation_indices = np.flatnonzero(active).tolist()
@@ -730,9 +832,16 @@ def main() -> int:
                     decode_voxel_keys_numpy(voxel_flat[start:end], int(voxel_levels[index])),
                     dtype=np.float32,
                 ).reshape(-1, 3)
+        observation_paths, observation_selection = _select_observation_paths(
+            state,
+            index,
+            mask_index.for_index(index),
+            preferred_source=str(args.preferred_observation_source),
+            minimum_preferred=int(args.minimum_preferred_observations),
+        )
         result = _refine_object(
             object_id,
-            mask_index.for_index(index),
+            observation_paths,
             state_images=state_images,
             voxel_points=voxel_points,
             frames_root=frames_root,
@@ -814,6 +923,7 @@ def main() -> int:
             "status": status,
             "is_assembly": is_assembly,
             "assembly_member_ids": list(assembly_members[index]) if is_assembly else [],
+            "observation_selection": observation_selection,
             "valid_observations": valid,
             "consistent_observations": consistent,
             "centroid_consistent_observations": int(result.get("centroid_consistent_observations", consistent)),
@@ -892,6 +1002,10 @@ def main() -> int:
             "active_objects": int(active.sum()),
             "evaluated_objects": len(rows),
             "assembly_only": bool(args.assembly_only),
+            "object_id_filter": (
+                str(args.object_id_file.expanduser().resolve())
+                if args.object_id_file is not None else None
+            ),
         }
     else:
         payload = state
@@ -906,6 +1020,10 @@ def main() -> int:
         "rejected_objects": int(len(rows) - passed_evaluated),
         "active_objects": int(active.sum()),
         "assembly_only": bool(args.assembly_only),
+        "object_id_filter": (
+            str(args.object_id_file.expanduser().resolve())
+            if args.object_id_file is not None else None
+        ),
         "up": up_policy.to_dict(),
         "mask_observation_contract": mask_index.diagnostics,
         "timing": {
@@ -914,6 +1032,8 @@ def main() -> int:
             "stage": "multi_view_rgbd_obb_refinement",
         },
         "thresholds": {
+            "preferred_observation_source": str(args.preferred_observation_source or "") or None,
+            "minimum_preferred_observations": int(args.minimum_preferred_observations),
             "min_depth_observations": int(args.min_depth_observations),
             "min_consistency": float(args.min_consistency),
             "min_center_inside_rate": float(args.min_center_inside_rate),

@@ -74,11 +74,10 @@ VLM_MAX_IMAGE_PIXELS = 512 * 512
 _FRAME_INDEX_CACHE: dict[Path, list[Path | None]] = {}
 
 
-def _source_frames(mask_dir: Path) -> list[Path | None]:
-    """Resolve mapping image indices to RGB-D source frames, when available."""
+def _source_frames(frames_json: Path) -> list[Path | None]:
+    """Resolve mapping image indices to the explicitly supplied RGB frames."""
 
-    root = mask_dir.parent.parent
-    frames_json = root / "rgbd" / "frames.json"
+    frames_json = frames_json.expanduser().resolve()
     if frames_json in _FRAME_INDEX_CACHE:
         return _FRAME_INDEX_CACHE[frames_json]
     result: list[Path | None] = []
@@ -94,11 +93,11 @@ def _source_frames(mask_dir: Path) -> list[Path | None]:
     return result
 
 
-def _source_frame_for_crop(mask_dir: Path, crop_path: Path) -> np.ndarray | None:
+def _source_frame_for_crop(frames_json: Path, crop_path: Path) -> np.ndarray | None:
     match = re.search(r"img_(\d+)", crop_path.name)
     if not match:
         return None
-    frames = _source_frames(mask_dir)
+    frames = _source_frames(frames_json)
     index = int(match.group(1))
     if not 0 <= index < len(frames) or frames[index] is None:
         return None
@@ -123,6 +122,16 @@ def parse_args() -> argparse.Namespace:
         default=False,
         help="Resolve derivative crop-bank files for canonical observation image IDs.",
     )
+    parser.add_argument(
+        "--preferred-observation-source",
+        default="",
+        help=(
+            "Prefer a complete provenance-tagged observation subset, for example "
+            "full_colmap_sam3_refinement. Falls back to all observations unless "
+            "--minimum-preferred-observations are available."
+        ),
+    )
+    parser.add_argument("--minimum-preferred-observations", type=int, default=0)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--vllm-url", default=None)
     parser.add_argument("--model", default="qwen3-vl-8b")
@@ -173,6 +182,67 @@ def filter_active_rows(rows: list[dict], state: dict) -> list[dict]:
         if bool(is_active)
     }
     return [row for row in rows if int(row["id"]) in active_ids]
+
+
+def select_preferred_observation_paths(
+    state: dict,
+    object_id: int,
+    resolved_paths: list[Path],
+    *,
+    preferred_source: str,
+    minimum_preferred: int,
+) -> tuple[list[Path], dict]:
+    """Prefer complete refined evidence while retaining an explicit fallback."""
+
+    source = str(preferred_source or "").strip()
+    all_paths = list(resolved_paths)
+    if not source:
+        return all_paths, {
+            "mode": "all_resolved",
+            "preferred_source": None,
+            "preferred_records": 0,
+            "selected_paths": len(all_paths),
+            "fallback_used": False,
+        }
+    values = state.get("object_id")
+    if isinstance(values, torch.Tensor):
+        object_ids = [int(value) for value in values.detach().cpu().reshape(-1).tolist()]
+    else:
+        object_ids = [int(value) for value in np.asarray(values).reshape(-1).tolist()]
+    try:
+        index = object_ids.index(int(object_id))
+    except ValueError:
+        index = -1
+    rows = state.get("object_mask_observations")
+    records = rows[index] if isinstance(rows, list) and 0 <= index < len(rows) else []
+    preferred_tails: set[tuple[str, str]] = set()
+    preferred_records = 0
+    for record in records if isinstance(records, (list, tuple)) else []:
+        if not isinstance(record, dict) or str(record.get("source") or "") != source:
+            continue
+        text = str(record.get("path") or record.get("mask_path") or "").strip()
+        path = Path(text)
+        if not text or len(path.parts) < 2:
+            continue
+        preferred_tails.add((path.parts[-2], path.parts[-1]))
+        preferred_records += 1
+    preferred = [
+        path
+        for path in all_paths
+        if len(path.parts) >= 2
+        and (path.parts[-2], path.parts[-1]) in preferred_tails
+    ]
+    threshold = max(1, int(minimum_preferred))
+    use_preferred = len(preferred) >= threshold
+    return (preferred if use_preferred else all_paths), {
+        "mode": "preferred_source" if use_preferred else "all_resolved_fallback",
+        "preferred_source": source,
+        "preferred_records": preferred_records,
+        "preferred_resolved_paths": len(preferred),
+        "minimum_preferred_observations": threshold,
+        "selected_paths": len(preferred) if use_preferred else len(all_paths),
+        "fallback_used": not use_preferred,
+    }
 
 
 def _mask_grounded_crop(
@@ -273,7 +343,9 @@ def _mask_grounded_crop(
     return bytes(buffer) if ok else encoded
 
 
-def crop_candidates(paths: list[Path]) -> list[tuple[Path, bytes]]:
+def crop_candidates(
+    paths: list[Path], *, frames_json: Path | None = None
+) -> list[tuple[Path, bytes]]:
     result = []
     for path in paths:
         try:
@@ -286,7 +358,11 @@ def crop_candidates(paths: list[Path]) -> list[tuple[Path, bytes]]:
                 # carts, cabinets and tools dominate small target instances.
                 # The crop-local mask still preserves dim placement context,
                 # while the outlined natural-colour pixels decide identity.
-                encoded = _mask_grounded_crop(payload, encoded)
+                source_image = (
+                    _source_frame_for_crop(frames_json, path)
+                    if frames_json is not None else None
+                )
+                encoded = _mask_grounded_crop(payload, encoded, source_image)
             if encoded:
                 result.append((path, encoded))
         except Exception:
@@ -741,10 +817,19 @@ def main() -> None:
     crop_partitions: dict[int, dict] = {}
     verification_crop_map: dict[int, list[tuple[Path, bytes]]] = {}
     verification_crop_partitions: dict[int, dict] = {}
+    observation_selection: dict[int, dict] = {}
     missing = []
     for row in rows:
         object_id = int(row["id"])
-        candidates = crop_candidates(mask_index.for_object_id(object_id))
+        selected_paths, selection_audit = select_preferred_observation_paths(
+            state,
+            object_id,
+            mask_index.for_object_id(object_id),
+            preferred_source=args.preferred_observation_source,
+            minimum_preferred=args.minimum_preferred_observations,
+        )
+        observation_selection[object_id] = selection_audit
+        candidates = crop_candidates(selected_paths, frames_json=args.frames_json)
         crops, partition = choose_evidence_crops(
             candidates,
             "initial_blind_review",
@@ -953,6 +1038,7 @@ def main() -> None:
             str(args.scene_state.expanduser().resolve()) if args.scene_state else None
         ),
         "mask_observation_contract": mask_index.diagnostics,
+        "observation_selection": {str(key): value for key, value in observation_selection.items()},
         "min_confidence": float(args.min_confidence),
         "workers": max(1, int(args.workers)),
         "crops_per_object": max(1, int(args.crops_per_object)),

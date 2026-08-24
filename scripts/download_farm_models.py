@@ -297,6 +297,7 @@ def download_local_sources(
     *,
     token: str | None,
     local_files_only: bool,
+    cache_root: Path | None = None,
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for source in sources:
@@ -320,6 +321,7 @@ def download_local_sources(
                 _snapshot_download(
                     repo_id=source.repo_id,
                     revision=source.revision,
+                    cache_dir=(str(cache_root / "hub") if cache_root is not None else None),
                     local_dir=str(source.target.parent),
                     allow_patterns=list(source.required_files),
                     token=token,
@@ -385,7 +387,10 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
     )
     downloads.extend(
         download_local_sources(
-            sources, token=token, local_files_only=bool(args.local_files_only)
+            sources,
+            token=token,
+            local_files_only=bool(args.local_files_only),
+            cache_root=manifest.cache_root,
         )
     )
     snapshots = []
