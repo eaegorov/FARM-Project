@@ -30,7 +30,7 @@ import cv2
 import numpy as np
 
 
-SCRIPT_VERSION = "1.1"
+SCRIPT_VERSION = "1.2"
 DEFAULT_IDENTITY_REGEX = (
     r"^(?P<sensor>.+?)_(?P<timestamp>\d+)_"
     r"(?P<family>center|yaw_left|yaw_right|pitch_up|pitch_down)\.(?:png|jpe?g)$"
@@ -91,6 +91,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--nominal-hz", type=float, default=10.0)
     parser.add_argument("--resolution", type=int, default=896)
+    parser.add_argument("--camera-alignment", choices=("off", "rig"), default="off")
     parser.add_argument("--sh-degree", type=int, choices=(0, 1, 2, 3), default=3)
     parser.add_argument("--alpha-min", type=float, default=0.05)
     parser.add_argument("--depth-min-m", type=float, default=0.05)
@@ -621,7 +622,7 @@ def build_run_fingerprint(
     args: argparse.Namespace, selected_names: Sequence[str], source_paths: Sequence[Path],
 ) -> tuple[str, dict[str, Any]]:
     config_keys = (
-        "scene_id", "identity_regex", "sensor_group", "timestamp_group", "family_group",
+        "scene_id", "identity_regex", "sensor_group", "timestamp_group", "family_group", "camera_alignment",
         "meters_per_scene_unit", "nominal_hz", "resolution", "sh_degree", "alpha_min",
         "depth_min_m", "depth_max_m", "radius_clip", "jpeg_quality", "expected_baseline_m",
         "baseline_tolerance_m", "baseline_camera_ids", "baseline_sensors",
@@ -634,7 +635,7 @@ def build_run_fingerprint(
     source_digest = hashlib.sha256(json.dumps(source_meta, sort_keys=True).encode("utf-8")).hexdigest()
     payload = {
         "script": "prepare_colmap_3dgs_rgbd", "version": SCRIPT_VERSION,
-        "config": {key: getattr(args, key) for key in config_keys},
+        "config": {key: getattr(args, key, "off" if key == "camera_alignment" else None) for key in config_keys},
         "selected_names_sha256": selected_digest,
         "selected_count": len(selected_names),
         "inputs": {
@@ -643,6 +644,12 @@ def build_run_fingerprint(
             "source_images_sha256": source_digest,
         },
     }
+    if getattr(args, "camera_alignment", "off") == "rig":
+        runtime = Path(__file__).resolve().parents[1] / "src" / "farm_runtime"
+        payload["registration_source_sha256"] = {
+            name: hashlib.sha256((runtime / name).read_bytes()).hexdigest()
+            for name in ("camera_alignment.py", "input_registration.py")
+        }
     serializable = json.loads(json.dumps(payload, default=str))
     fingerprint = hashlib.sha256(json.dumps(serializable, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
     return fingerprint, serializable
@@ -1091,6 +1098,28 @@ def run(args: argparse.Namespace) -> int:
         load_peak = int(torch.cuda.max_memory_allocated(device))
         peak_vram = load_peak
 
+        registration = None
+        if args.camera_alignment == "rig":
+            if args.sh_degree < 1:
+                raise ValueError("RGB registration requires view-dependent SH colours")
+            import sys
+            sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+            from farm_runtime.input_registration import register_preparation_views
+            registration_started = time.perf_counter()
+            views, retained, registration = register_preparation_views(
+                views, identities, geometries, source_paths, scale=args.meters_per_scene_unit,
+                render=lambda view, K, width, height: render_gaussians(gaussians, view, K, width, height, args, device),
+                read_source=read_source,
+            )
+            atomic_write_json(qa_dir / "camera_registration.json", registration)
+            if len(retained) < max(3, int(np.ceil(.8 * len(identities)))):
+                raise RuntimeError("Fewer than 80% of selected views have validated RGB/3DGS registration")
+            identities = [identities[i] for i in retained]
+            geometries = [geometries[i] for i in retained]
+            source_paths = [source_paths[i] for i in retained]
+            selected_names = [view.name for view in views]
+            stage["camera_registration_seconds"] = time.perf_counter() - registration_started
+
         qa_indices = distributed_indices(len(views), args.qa_sampled_views)
         qa_set = set(qa_indices)
         render_order = qa_indices + [index for index in range(len(views)) if index not in qa_set]
@@ -1107,9 +1136,16 @@ def run(args: argparse.Namespace) -> int:
             rgb_path, depth_path = rgb_dir / f"{key}.jpg", depth_dir / f"{key}.npy"
             checkpoint_path = checkpoints_dir / f"{key}.json"
             panel_path = panels_dir / f"{key}.jpg"
+            # A resumed depth must belong to this exact corrected pose and K.
+            # Registration can be recomputed after an interrupted preparation.
+            camera_sha256 = hashlib.sha256(
+                np.asarray(view.camera_to_world, dtype="<f8").tobytes()
+                + np.asarray(K, dtype="<f8").tobytes()
+            ).hexdigest()
             checkpoint = None if args.rerender else _load_checkpoint(checkpoint_path, fingerprint)
             can_resume = (
-                checkpoint is not None and _valid_pair(rgb_path, depth_path, width, height) and
+                checkpoint is not None and checkpoint.get("camera_sha256") == camera_sha256 and
+                _valid_pair(rgb_path, depth_path, width, height) and
                 (selected_index not in qa_set or panel_path.is_file())
             )
             if can_resume:
@@ -1156,7 +1192,7 @@ def run(args: argparse.Namespace) -> int:
                     )
                     stat["appearance"] = appearance_alignment_metrics(source, rendered_rgb, depth > 0)
                     atomic_write_jpeg(panel_path, make_qa_panel(source, rendered_rgb, depth, view.name), 92)
-                atomic_write_json(checkpoint_path, {"fingerprint": fingerprint, "stats": stat})
+                atomic_write_json(checkpoint_path, {"fingerprint": fingerprint, "camera_sha256": camera_sha256, "stats": stat})
                 stats_by_index[selected_index] = stat
                 rendered_count += 1
                 duration = time.perf_counter() - view_started
@@ -1217,6 +1253,7 @@ def run(args: argparse.Namespace) -> int:
             "meters_per_scene_unit": args.meters_per_scene_unit,
             "source_coordinate_units": "COLMAP/3DGS scene units",
             "depth_source": "3DGS gsplat expected-depth (RGB+ED), alpha-filtered",
+            "camera_registration": registration,
             "identity_contract": {
                 "regex": args.identity_regex,
                 "sensor_group": args.sensor_group,
@@ -1226,6 +1263,8 @@ def run(args: argparse.Namespace) -> int:
             "selection_contract": {
                 "selected_names": str(args.selected_names.resolve()),
                 "exact_order_preserved": True, "count": len(selected_names),
+                "requested_count": len(source_paths) if registration is None else registration["source_views"],
+                "omitted_timestamps": [] if registration is None else registration["omitted_timestamps"],
             },
             "frames": frames,
         }

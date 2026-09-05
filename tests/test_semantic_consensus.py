@@ -27,7 +27,7 @@ def _load_script(module_name: str, relative: str):
 
 def _load():
     return _load_script(
-        "farm_semantic_finalizer", "scripts/finalize_farm_semantic_consensus.py"
+        "farm_semantic_finalizer", "scripts/semantics/finalize_farm_semantic_consensus.py"
     )
 
 
@@ -206,7 +206,7 @@ def test_single_paired_blind_vote_is_probable_not_confirmed() -> None:
 
 def test_reconciler_filters_nonkeep_and_uses_provenance_for_tiers() -> None:
     semantic = _load_script(
-        "farm_semantic_reconciler", "scripts/reconcile_farm_semantics.py"
+        "farm_semantic_reconciler", "scripts/semantics/reconcile_farm_semantics.py"
     )
     keep = _evidence("blind_pass_b", "poster")
     rejected = _evidence("verification_pass", "sign", decision="unknown")
@@ -360,12 +360,13 @@ def test_failed_part_only_recovery_forces_suppression_override() -> None:
     assert override["category"] == "unresolved object"
 
 
-def test_standard_semantics_does_not_require_literal_category_equality() -> None:
+def test_standard_semantics_uses_independent_blind_two_pass_review() -> None:
     source = (ROOT / "scripts/farm_standard_stage.py").read_text(encoding="utf-8")
     start = source.index("    def semantics(self)")
     end = source.index("\n    def ", start + 8)
     block = source[start:end]
-    assert '"--verify-kept"' not in block
+    assert '"--verify-kept"' in block
+    assert '"--verification-mode", "independent_blind"' in block
     assert '"--require-category-consensus"' not in block
     assert '"--blind-adjudication"' not in block
     assert '"--enable-recovery-calls"' not in block
@@ -406,3 +407,11 @@ def test_every_standard_crop_review_receives_metric_frame_poses() -> None:
             assert isinstance(frame_value, ast.Call)
             assert isinstance(frame_value.func, ast.Attribute)
             assert frame_value.func.attr == "direct_frames"
+        literals = [
+            value.value
+            for value in arguments.elts
+            if isinstance(value, ast.Constant) and isinstance(value.value, str)
+        ]
+        assert literals.count("--verify-kept") == 1
+        mode_index = literals.index("--verification-mode")
+        assert literals[mode_index + 1] == "independent_blind"

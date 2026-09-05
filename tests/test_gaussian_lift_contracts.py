@@ -612,6 +612,31 @@ def test_runner_mounts_signed_snapshot_and_only_exact_output_rw(
         "validated": True,
         "dirty": False,
     }
+    rebuilt_image_id = "sha256:" + "e" * 64
+    monkeypatch.setattr(lift_runner, "_docker_image_id", lambda _tag: rebuilt_image_id)
+    with pytest.raises(RuntimeError, match="prep image drift"):
+        lift_runner.build_command(Namespace(
+            run=run, ply=ply, output=output, config=config, gpu="0",
+            plan_only=False, smoke_object_id=[], allow_legacy_run=False,
+            print_command=False,
+        ))
+    rebuilt_command, rebuilt_metadata = lift_runner.build_command(Namespace(
+        run=run, ply=ply, output=output, config=config, gpu="0",
+        plan_only=False, smoke_object_id=[], allow_legacy_run=False,
+        allow_rebuilt_image_nonrelease=True, print_command=False,
+    ))
+    assert rebuilt_command[rebuilt_command.index("--entrypoint") + 2] == rebuilt_image_id
+    assert f"FARM_BRIDGE_IMAGE_ID={rebuilt_image_id}" in rebuilt_command
+    assert "FARM_BRIDGE_SOURCE_DIRTY=true" in rebuilt_command
+    assert rebuilt_metadata["source_run_image_id"] == image_id
+    assert rebuilt_metadata["image_id"] == rebuilt_image_id
+    assert rebuilt_metadata["runtime_image_drift"] is True
+    assert rebuilt_metadata["nonrelease_warnings"] == [
+        "explicit_rebuilt_image_nonrelease_mode",
+        "rebuilt_prep_image_differs_from_source_run",
+    ]
+    monkeypatch.setattr(lift_runner, "_docker_image_id", lambda _tag: image_id)
+
     config.write_text("# drifted\n", encoding="utf-8")
     with pytest.raises(ValueError, match="byte-for-byte"):
         lift_runner.build_command(Namespace(

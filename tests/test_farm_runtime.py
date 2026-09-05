@@ -596,7 +596,7 @@ def test_standard_finalizer_and_report_execute_from_snapshot(
     assert report is not None
     assert calls[0][0][1] == str(snapshot_root / "scripts/farm_standard_stage.py")
     assert calls[0][1] == snapshot_root
-    assert calls[1][0][2] == str(snapshot_root / "scripts/build_farm_run_report.py")
+    assert calls[1][0][2] == str(snapshot_root / "scripts/evaluation/build_farm_run_report.py")
     assert calls[1][1] == snapshot_root
 
 
@@ -803,7 +803,7 @@ def test_standard_stage_code_is_frozen_after_run_initialization(tmp_path: Path) 
     )
     plan = load_plan(scene_path, project_root=tmp_path)
     runner = RunOrchestrator(plan)
-    target = tmp_path / "scripts/refine_farm_object_geometry.py"
+    target = tmp_path / "scripts/geometry/refine_farm_object_geometry.py"
     target.parent.mkdir(parents=True)
     target.write_text("# geometry implementation v1\n", encoding="utf-8")
     semantic_contract = tmp_path / "src/scene_graph/captioning/label_contract.py"
@@ -814,7 +814,7 @@ def test_standard_stage_code_is_frozen_after_run_initialization(tmp_path: Path) 
     snapshot_root = run_dir / "config/source_snapshot/FARM-Project"
 
     geometry = runner._resolve_stage(plan.stages_by_id["geometry"], run_dir)
-    snapshot_target = snapshot_root / "scripts/refine_farm_object_geometry.py"
+    snapshot_target = snapshot_root / "scripts/geometry/refine_farm_object_geometry.py"
     assert snapshot_target in geometry.fingerprint_inputs
     before, _ = runner._stage_fingerprint(geometry, {})
     target.write_text("# changed geometry implementation\n", encoding="utf-8")
@@ -871,7 +871,7 @@ def test_each_standard_stage_declares_target_code_dependencies() -> None:
     )
     assert "src/farm_pipeline/final_acceptance.py" in STANDARD_STAGE_CODE_INPUTS["finalize"]
     assert "src/scene_graph/captioning/evidence.py" in STANDARD_STAGE_CODE_INPUTS["finalize"]
-    assert "scripts/build_farm_final_acceptance.py" in STANDARD_STAGE_CODE_INPUTS["qa_bundle"]
+    assert "scripts/evaluation/build_farm_final_acceptance.py" in STANDARD_STAGE_CODE_INPUTS["qa_bundle"]
     assert "src/scene_graph/captioning/evidence.py" in STANDARD_STAGE_CODE_INPUTS["qa_bundle"]
     semantic_shared = {
         "src/scene_graph/captioning/evidence.py",

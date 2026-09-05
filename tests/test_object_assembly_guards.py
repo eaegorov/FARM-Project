@@ -4,18 +4,18 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from scripts.analyze_farm_part_whole import (
+from scripts.geometry.analyze_farm_part_whole import (
     classify_part_whole_relation,
     semantic_assembly_hint,
 )
-from scripts.build_farm_object_assemblies import (
+from scripts.geometry.build_farm_object_assemblies import (
     _copy_member_review_masks,
     _merge_mask_files,
     _unpack_mask_canvas,
     canonical_member_tuple,
     reviewed_assembly_eligible,
 )
-from scripts.build_farm_tiered_state import assembly_tiered_eligibility
+from scripts.geometry.build_farm_tiered_state import assembly_tiered_eligibility
 
 
 def _classify_relation(**overrides):
@@ -290,7 +290,15 @@ def test_shared_frame_member_masks_are_logically_unioned(tmp_path: Path) -> None
         crop_bytes=[3, 4, 5, 6],
     )
 
-    assert _merge_mask_files([first, second], destination) == 4
+    stats = _merge_mask_files([first, second], destination)
+    assert stats == {
+        "image_shape": [8, 10],
+        "raw_pixels": 12,
+        "inlier_pixels": 4,
+        "crop_jpeg_bytes_len": 4,
+        "crop_bbox_xyxy": [0, 0, 1, 1],
+        "crop_shape": [1, 1],
+    }
     expected_raw = np.zeros(shape, dtype=bool)
     expected_raw[1:3, 1:4] = True
     expected_raw[5:7, 6:9] = True
@@ -301,6 +309,37 @@ def test_shared_frame_member_masks_are_logically_unioned(tmp_path: Path) -> None
         assert np.array_equal(_unpack_mask_canvas(merged, "raw", shape), expected_raw)
         assert np.array_equal(_unpack_mask_canvas(merged, "inlier", shape), expected_inlier)
         assert merged["crop_jpeg_bytes"].tolist() == [3, 4, 5, 6]
+
+
+def test_overlapping_member_mask_stats_count_union_once(tmp_path: Path) -> None:
+    shape = (4, 4)
+    first = tmp_path / "first.npz"
+    second = tmp_path / "second.npz"
+    destination = tmp_path / "merged.npz"
+    _write_mask(
+        first,
+        shape=shape,
+        raw_bbox=(0, 0, 3, 3),
+        raw_crop=np.ones((3, 3), dtype=np.uint8),
+        inlier_bbox=(0, 0, 2, 2),
+        inlier_crop=np.ones((2, 2), dtype=np.uint8),
+        crop_bytes=[1, 2, 3],
+    )
+    _write_mask(
+        second,
+        shape=shape,
+        raw_bbox=(1, 1, 4, 4),
+        raw_crop=np.ones((3, 3), dtype=np.uint8),
+        inlier_bbox=(1, 1, 3, 3),
+        inlier_crop=np.ones((2, 2), dtype=np.uint8),
+        crop_bytes=[4, 5, 6, 7],
+    )
+
+    stats = _merge_mask_files([first, second], destination)
+
+    assert stats["raw_pixels"] == 14
+    assert stats["inlier_pixels"] == 7
+    assert stats["crop_jpeg_bytes_len"] == 4
 
 
 def test_review_bank_keeps_member_crops_separate(tmp_path: Path) -> None:

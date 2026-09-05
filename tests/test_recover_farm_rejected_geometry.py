@@ -2,7 +2,7 @@ import numpy as np
 import pytest
 import torch
 
-from scripts.recover_farm_rejected_geometry import (
+from scripts.geometry.recover_farm_rejected_geometry import (
     GeometryGates,
     adaptive_erode_mask,
     assert_indexed_rows_unchanged,
@@ -26,6 +26,7 @@ def _passing_candidate(**overrides):
         "median_projected_box_iou": 0.50,
         "box_support_rate": 0.80,
         "voxel_inside_obb_rate": 0.70,
+        "voxel_component_fraction": 0.80,
         "orientation_required": True,
         "orientation_confidence": 0.60,
         "box_volume_m3": 1.10,
@@ -42,6 +43,7 @@ def _rejected_baseline(**overrides):
         "median_projected_box_iou": 0.34,
         "box_support_rate": 0.75,
         "voxel_inside_obb_rate": 0.65,
+        "voxel_component_fraction": 0.70,
         "orientation_confidence": 0.55,
         "box_volume_m3": 1.0,
     }
@@ -111,6 +113,11 @@ def test_candidate_requires_hard_gates_pareto_and_a_strict_improvement() -> None
     [
         (_passing_candidate(view_retention_rate=0.60), "hard_gate_failures", "view_retention"),
         (_passing_candidate(box_volume_m3=1.40), "hard_gate_failures", "volume_expansion"),
+        (
+            _passing_candidate(voxel_component_fraction=0.20),
+            "hard_gate_failures",
+            "voxel_fragmentation",
+        ),
         (_passing_candidate(box_support_rate=0.71), "pareto_regressions", "box_support_rate"),
     ],
 )

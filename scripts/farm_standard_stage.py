@@ -570,9 +570,17 @@ class Context:
             command += ["--name-regex", g.pattern]
         for value in g.required_members:
             command += ["--sensor", value]
+        anchors = list(p.anchor_views) or (
+            [self.config.metric_scale.baseline_view or ("center" if "center" in views else views[0])]
+            if p.view_policy == "balanced" else views
+        )
+        for value in anchors:
+            command += ["--anchor-family", value]
         for value in views:
-            command += ["--anchor-family", value, "--output-family", value]
-        budget = p.max_timestamps * max(1, len(g.required_members)) * max(1, len(views))
+            command += ["--output-family", value]
+        command += ["--view-policy", p.view_policy, "--views-per-sensor", str(p.views_per_sensor)]
+        emitted_per_sensor = p.views_per_sensor if p.view_policy == "balanced" else max(1, len(views))
+        budget = p.max_timestamps * max(1, len(g.required_members)) * emitted_per_sensor
         command += ["--max-output-views", str(max(500, budget))]
         if self.config.metric_scale.expected_baseline_m:
             command += ["--expected-baseline-m", str(self.config.metric_scale.expected_baseline_m),
@@ -615,6 +623,7 @@ class Context:
             "--output-dir", "/farm-run/.stage_work/rgbd/output",
             "--scene-id", self.config.scene_id, "--resolution", str(self.config.resources.render_resolution),
             "--qa-sampled-views", "48",
+            "--camera-alignment", self.config.camera.rgb_alignment,
             "--meters-per-scene-unit", str(self.resolved()["meters_per_scene_unit"]),
             "--sensor-group", g.member_group, "--timestamp-group", g.timestamp_group,
             "--family-group", g.view_group,
@@ -814,6 +823,7 @@ class Context:
             "--frames-json", "/farm-run/rgbd/frames.json",
             "--mask-dir", "/farm-run/mapping/masks", "--output-dir", "/farm-run/qa/semantics/review",
             "--vllm-url", url, "--model", model, "--crops-per-object", "3", "--workers", "2",
+            "--verify-kept", "--verification-mode", "independent_blind",
         ], host_network=True)
         self.post("export_reviewed_farm_catalog.py", [
             "--review", "/farm-run/qa/semantics/review/reviewed_robust_objects.json",
@@ -910,22 +920,19 @@ class Context:
         root.mkdir(parents=True)
         plan_path = root / "plan.json"
         selected_names = root / "selected_names.txt"
-        command, _ = self.docker_base("full-colmap-plan", runtime="main")
-        command += [
-            "-e", "PYTHONDONTWRITEBYTECODE=1",
-            "-v", f"{ROOT}:/home/scene_graph/scene_graph:ro",
-            "-v", f"{self.run_dir}:/farm-run",
-            "-v", f"{self.config.inputs.colmap_model}:/input/colmap:ro",
-            "-v", f"{self.config.inputs.image_root}:/input/images:ro",
-            "--entrypoint", "/bin/bash", self.main_image,
-            "/home/scene_graph/scene_graph/docker/python-entrypoint.sh",
-            "/home/scene_graph/scene_graph/scripts/plan_farm_full_colmap_rescue.py",
-            "--scene-state", "/farm-run/mapping/scene_state_semantic.pt",
-            "--colmap-model", "/input/colmap",
-            "--image-root", "/input/images",
-            "--frames-json", "/farm-run/rgbd/frames.json",
-            "--output", "/farm-run/qa/full_colmap_rescue/plan.json",
-            "--selected-names-output", "/farm-run/qa/full_colmap_rescue/selected_names.txt",
+        # Planning is a control-plane operation. It needs pycolmap, which is
+        # pinned in the host control environment rather than the main GPU
+        # image. Execute the planner from this run validated source snapshot
+        # with the same interpreter that launched this wrapper.
+        command = [
+            sys.executable,
+            str(ROOT / "scripts/geometry/plan_farm_full_colmap_rescue.py"),
+            "--scene-state", str(self.run_dir / "mapping/scene_state_semantic.pt"),
+            "--colmap-model", str(self.config.inputs.colmap_model),
+            "--image-root", str(self.config.inputs.image_root),
+            "--frames-json", str(self.run_dir / "rgbd/frames.json"),
+            "--output", str(plan_path),
+            "--selected-names-output", str(selected_names),
             "--max-objects", "48", "--views-per-object", "6",
             "--max-total-views", "288", "--min-priority", "1.0",
         ]
@@ -962,6 +969,7 @@ class Context:
             "--scene-id", self.config.scene_id,
             "--resolution", str(self.config.resources.render_resolution),
             "--qa-sampled-views", str(min(24, selected_count)),
+            "--camera-alignment", self.config.camera.rgb_alignment,
             "--meters-per-scene-unit", str(self.resolved()["meters_per_scene_unit"]),
             "--sensor-group", g.member_group,
             "--timestamp-group", g.timestamp_group,
@@ -973,6 +981,26 @@ class Context:
         summary = load_json(rescue_rgbd / "prep_summary.json")
         if not summary.get("alignment_qa", {}).get("passed"):
             raise RuntimeError("full-COLMAP rescue RGB-D alignment QA failed")
+
+        # Rendering is the only operation allowed to see the planned union.
+        # Publish immutable manifest-only fold views before any detector,
+        # association, SAM3, merge or OBB fitting stage runs.  Both fold JSONs
+        # reference the same rendered files; no RGB/depth bytes are copied.
+        rescue_folds = root / "rgbd_folds"
+        run([
+            sys.executable,
+            str(ROOT / "scripts/evaluation/build_farm_full_colmap_folds.py"),
+            "--plan", str(plan_path),
+            "--union-frames-json", str(rescue_rgbd / "frames.json"),
+            "--output-dir", str(rescue_folds),
+        ])
+        fold_manifest = load_json(rescue_folds / "manifest.json")
+        if fold_manifest.get("status") != "PASS":
+            raise RuntimeError("full-COLMAP train/heldout fold validation failed")
+        if fold_manifest.get("fit_policy", {}).get("fit_splits") != ["train"]:
+            raise RuntimeError("full-COLMAP fold manifest authorizes non-train fitting")
+        if fold_manifest.get("fit_policy", {}).get("heldout_consumed") is not False:
+            raise RuntimeError("full-COLMAP heldout must remain frozen and unconsumed")
 
         rescue_mapping = root / "mapping"
         (rescue_mapping / "masks").mkdir(parents=True)
@@ -988,7 +1016,7 @@ class Context:
             "/home/scene_graph/scene_graph/docker/entrypoint.sh",
             "python", "-m", "scene_graph.offline.run",
             "--source", "frames-json",
-            "--frames-json-dir", "/farm-run/qa/full_colmap_rescue/rgbd",
+            "--frames-json-dir", "/farm-run/qa/full_colmap_rescue/rgbd_folds/train",
             "--batch-size", str(self.config.resources.mapping_batch_size),
             "--target-fps", "0", "--warmup-frames", "2",
             "--save-path", "/farm-run/qa/full_colmap_rescue/mapping/scene_state_raw.pt",
@@ -1026,20 +1054,22 @@ class Context:
         sam3 = Path("/farm-models/sam3-tracker")
         self.post("refine_farm_full_colmap_masks.py", [
             "--plan", "/farm-run/qa/full_colmap_rescue/plan.json",
+            "--view-role", "train",
             "--source-state", "/farm-run/mapping/scene_state_semantic.pt",
             "--rescue-state", "/farm-run/qa/full_colmap_rescue/mapping/scene_state_raw.pt",
-            "--rescue-frames-json", "/farm-run/qa/full_colmap_rescue/rgbd/frames.json",
+            "--rescue-frames-json", "/farm-run/qa/full_colmap_rescue/rgbd_folds/train/frames.json",
             "--rescue-mask-root", "/farm-run/qa/full_colmap_rescue/mapping/masks",
             "--model", str(sam3),
             "--output-dir", "/farm-run/qa/full_colmap_rescue/sam3",
-            "--minimum-association-views", "2", "--minimum-accepted-views", "2",
+            "--minimum-association-views", "2",
+            "--minimum-accepted-views", "3", "--minimum-independent-views", "2",
         ], gpu=True)
         self.post("merge_farm_full_colmap_rescue.py", [
             "--source-state", "/farm-run/mapping/scene_state_semantic.pt",
             "--source-frames", "/farm-run/rgbd/frames.json",
             "--source-mask-root", "/farm-run/mapping/masks",
             "--rescue-state", "/farm-run/qa/full_colmap_rescue/mapping/scene_state_raw.pt",
-            "--rescue-frames", "/farm-run/qa/full_colmap_rescue/rgbd/frames.json",
+            "--rescue-frames", "/farm-run/qa/full_colmap_rescue/rgbd_folds/train/frames.json",
             "--refinement", "/farm-run/qa/full_colmap_rescue/sam3/result.json",
             "--prior-catalog", "/farm-run/qa/semantics/consensus/semantic_consensus_catalog.json",
             "--output-dir", "/farm-run/qa/full_colmap_rescue/combined",
@@ -1087,13 +1117,14 @@ class Context:
             "--frames-json", "/farm-run/qa/full_colmap_rescue/combined/frames.json",
             "--mask-dir", "/farm-run/qa/full_colmap_rescue/combined/masks",
             "--preferred-observation-source", "full_colmap_sam3_refinement",
-            "--minimum-preferred-observations", "2",
+            "--minimum-preferred-observations", "3",
             "--output-dir", "/farm-run/qa/full_colmap_rescue/vlm_review",
             "--vllm-url", f"http://127.0.0.1:{port}/v1", "--model", model,
             "--crops-per-object", "5", "--workers", "2", "--verify-kept",
+            "--verification-mode", "independent_blind",
         ], host_network=True)
         self.post("apply_farm_full_colmap_rescue.py", [
-            "--source-state", "/farm-run/mapping/scene_state_semantic.pt",
+            "--source-state", "/farm-run/qa/full_colmap_rescue/combined/scene_state_source_canonical.pt",
             "--refined-state", "/farm-run/qa/full_colmap_rescue/scene_state_geometry.pt",
             "--refinement", "/farm-run/qa/full_colmap_rescue/sam3/result.json",
             "--geometry-report", "/farm-run/qa/full_colmap_rescue/geometry_audit.json",
@@ -1156,7 +1187,8 @@ class Context:
                 "--frames-json", self.direct_frames(),
                 "--mask-dir", "/farm-run/qa/assemblies/review_masks", "--output-dir", "/farm-run/qa/assemblies/review",
                 "--vllm-url", url, "--model", model, "--crops-per-object", "6", "--workers", "2",
-                "--expand-image-matches",
+                "--expand-image-matches", "--verify-kept",
+                "--verification-mode", "independent_blind",
             ], host_network=True)
             self.post("build_farm_object_assemblies.py", common + [
                 "--output-state", "/farm-run/qa/assemblies/scene_state_reviewed.pt",

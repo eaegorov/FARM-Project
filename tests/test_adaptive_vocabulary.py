@@ -6,7 +6,7 @@ from pathlib import Path
 import numpy as np
 
 
-SCRIPT = Path(__file__).parents[1] / "scripts/build_farm_adaptive_vocabulary.py"
+SCRIPT = Path(__file__).parents[1] / "scripts/semantics/build_farm_adaptive_vocabulary.py"
 SPEC = importlib.util.spec_from_file_location("build_farm_adaptive_vocabulary", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
 MODULE = importlib.util.module_from_spec(SPEC)

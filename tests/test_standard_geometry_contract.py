@@ -17,7 +17,7 @@ from scripts.farm_standard_stage import (
     validate_canonical_visuals,
 )
 from farm_pipeline.resources import load_model_manifest
-from scripts.validate_farm_geometry import validate_state
+from scripts.geometry.validate_farm_geometry import validate_state
 
 
 def _metric_state(object_ids: list[int]) -> dict:
@@ -146,6 +146,16 @@ def test_full_colmap_rescue_uses_bounded_six_view_budget() -> None:
     assert '"--max-objects", "48"' in source
     assert '"--views-per-object", "6"' in source
     assert '"--max-total-views", "288"' in source
+
+
+def test_full_colmap_planner_uses_pinned_host_control_runtime() -> None:
+    source = inspect.getsource(Context.full_colmap_rescue)
+    planner = source[: source.index('rescue_rgbd = root / "rgbd"')]
+    assert "sys.executable" in planner
+    assert 'ROOT / "scripts/geometry/plan_farm_full_colmap_rescue.py"' in planner
+    assert 'docker_base("full-colmap-plan"' not in planner
+    assert 'str(self.config.inputs.colmap_model)' in planner
+    assert 'str(self.config.inputs.image_root)' in planner
 
 
 def test_yoloe_uses_class_agnostic_nms_for_overlapping_labels() -> None:

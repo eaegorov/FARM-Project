@@ -24,7 +24,7 @@ CONTROL_PLANE_EXECUTION_FILES = (
     ROOT / "src/farm_pipeline/preflight.py",
     ROOT / "src/farm_pipeline/scene_config.py",
     ROOT / "scripts/select_colmap_keyframes.py",
-    ROOT / "scripts/build_farm_run_report.py",
+    ROOT / "scripts/evaluation/build_farm_run_report.py",
 )
 CONTROL_IMPORT_DISTRIBUTIONS = {
     "PIL": "pillow",

@@ -36,6 +36,7 @@ DEFAULT_MAX_PARTITIONS = 3
 DEFAULT_CROP_DETAIL_FLOOR_RATIO = 0.80
 DEFAULT_MAX_CROP_COMBINATIONS = 4096
 POSE_AWARE_CROP_SELECTION_SCHEMA = "farm.pose-aware-crop-selection.v1"
+GRAVITY_UPRIGHT_NORMALIZATION_SCHEMA = "farm.gravity-upright-normalization.v1"
 
 # Sources that share a channel deliberately reuse a deterministic view fold.
 # This keeps every request useful when tracks are short while making the
@@ -96,7 +97,7 @@ def _unit(vector: Sequence[float]) -> tuple[float, float, float] | None:
     return tuple(float(value) / magnitude for value in vector)  # type: ignore[return-value]
 
 
-def _camera_pose_from_transform(value: object) -> dict[str, list[float]] | None:
+def _camera_pose_from_transform(value: object) -> dict[str, Any] | None:
     if not isinstance(value, (list, tuple)) or len(value) != 4:
         return None
     rows = [_finite_vector(row, 4) for row in value]
@@ -125,10 +126,16 @@ def _camera_pose_from_transform(value: object) -> dict[str, list[float]] | None:
     return {
         "camera_center_world_m": [matrix[index][3] for index in range(3)],
         "camera_forward_world": list(forward),
+        # OpenCV pinhole convention: +x points to image right and +y to image
+        # down. Retaining these axes lets semantic evidence undo camera roll by
+        # exact quarter turns without resampling target pixels or masks.
+        "camera_right_world": list(rotation_columns[0]),
+        "camera_down_world": list(rotation_columns[1]),
+        "T_world_cam": [list(row) for row in matrix],
     }
 
 
-def load_frame_pose_index(frames_json: Path) -> dict[int, dict[str, list[float]]]:
+def load_frame_pose_index(frames_json: Path) -> dict[int, dict[str, Any]]:
     """Load validated metric ``T_world_cam`` poses keyed by FARM frame index.
 
     Crop sidecars encode the zero-based index into ``frames`` as ``img_XXXXXX``.
@@ -143,14 +150,162 @@ def load_frame_pose_index(frames_json: Path) -> dict[int, dict[str, list[float]]
     frames = payload.get("frames")
     if not isinstance(frames, list):
         raise ValueError("frames.json is missing a frames list")
-    result: dict[int, dict[str, list[float]]] = {}
+    result: dict[int, dict[str, Any]] = {}
     for index, row in enumerate(frames):
         pose = _camera_pose_from_transform(
             row.get("T_world_cam") if isinstance(row, Mapping) else None
         )
         if pose is not None:
+            source_image = str(row.get("source_image") or "").strip()
+            rgb_path = str(row.get("rgb_path") or "").strip()
+            if source_image:
+                pose["source_image"] = source_image
+            if rgb_path:
+                pose["rgb_path"] = rgb_path
+            for field in ("physical_timestamp", "frame_id", "timestamp_ns"):
+                if row.get(field) is not None:
+                    pose[field] = row[field]
             result[int(index)] = pose
     return result
+
+
+def gravity_upright_orientation(
+    image_id: int | None,
+    *,
+    frame_pose_index: Mapping[int, Mapping[str, Any]] | None,
+    world_up_vector: object,
+    world_up_source: str = "",
+) -> dict[str, Any]:
+    """Resolve an exact, no-interpolation crop rotation from pose and gravity.
+
+    ``T_world_cam`` follows the OpenCV pinhole convention used by FARM: its
+    first two rotation columns are image-right and image-down in world space.
+    The projected world-up vector is matched to the nearest cardinal image-up
+    direction. The result deliberately contains only 0/90/180/270-degree
+    rotations; arbitrary-angle resampling would damage small masks and text.
+
+    Missing or degenerate pose/up evidence returns ``status=unavailable`` and
+    zero turns. Callers must preserve the source pixels in that case.
+    """
+
+    base: dict[str, Any] = {
+        "schema": GRAVITY_UPRIGHT_NORMALIZATION_SCHEMA,
+        "image_id": int(image_id) if image_id is not None else None,
+        "status": "unavailable",
+        "source_orientation": "unavailable",
+        "source_roll_degrees_clockwise": None,
+        "projected_world_up_image_xy": [],
+        "applied_quarter_turns_ccw": 0,
+        "applied_rotation_degrees_ccw": 0,
+        "residual_roll_degrees": None,
+        "world_up_vector": [],
+        "world_up_source": str(world_up_source or ""),
+        "camera_pose_source": "rgbd/frames.json:T_world_cam",
+        "source_image": "",
+        "operation": "numpy.rot90_no_interpolation",
+    }
+    up = _unit(_finite_vector(world_up_vector, 3) or ())
+    if up is None:
+        base["reason"] = "invalid_or_missing_world_up"
+        return base
+    base["world_up_vector"] = list(up)
+    if image_id is None:
+        base["reason"] = "unparseable_crop_image_id"
+        return base
+    if not isinstance(frame_pose_index, Mapping):
+        base["reason"] = "missing_frame_pose_index"
+        return base
+    pose = frame_pose_index.get(int(image_id))
+    if not isinstance(pose, Mapping):
+        base["reason"] = "missing_T_world_cam"
+        return base
+    base["source_image"] = str(
+        pose.get("source_image") or pose.get("rgb_path") or ""
+    ).strip()
+    right = _unit(_finite_vector(pose.get("camera_right_world"), 3) or ())
+    down = _unit(_finite_vector(pose.get("camera_down_world"), 3) or ())
+    if right is None or down is None:
+        base["reason"] = "missing_T_world_cam_image_axes"
+        return base
+    projected = (
+        sum(up[index] * right[index] for index in range(3)),
+        sum(up[index] * down[index] for index in range(3)),
+    )
+    magnitude = math.hypot(*projected)
+    if not math.isfinite(magnitude) or magnitude <= 1.0e-6:
+        base["reason"] = "world_up_parallel_to_optical_axis"
+        return base
+    source_up = (projected[0] / magnitude, projected[1] / magnitude)
+
+    # np.rot90(..., k=1) maps a source image vector (x, y) to (y, -x).
+    # Choose the stable lowest k whose transformed world-up best matches
+    # screen-up (0, -1).
+    candidates: list[tuple[float, int, tuple[float, float]]] = []
+    for turns in range(4):
+        x_value, y_value = source_up
+        for _ in range(turns):
+            x_value, y_value = y_value, -x_value
+        candidates.append((-y_value, turns, (x_value, y_value)))
+    _, turns, corrected = max(candidates, key=lambda item: (item[0], -item[1]))
+    roll_degrees = math.degrees(math.atan2(source_up[0], -source_up[1]))
+    residual = math.degrees(math.atan2(corrected[0], -corrected[1]))
+    orientation_names = {
+        0: "upright",
+        1: "clockwise_90",
+        2: "upside_down",
+        3: "counterclockwise_90",
+    }
+    base.update({
+        "status": "applied" if turns else "already_upright",
+        "source_orientation": orientation_names[turns],
+        "source_roll_degrees_clockwise": float(roll_degrees),
+        "projected_world_up_image_xy": [float(value) for value in source_up],
+        "applied_quarter_turns_ccw": int(turns),
+        "applied_rotation_degrees_ccw": int(turns * 90),
+        "residual_roll_degrees": float(residual),
+        "reason": "nearest_cardinal_world_up_alignment",
+    })
+    return base
+
+
+def gravity_upright_evidence_manifest(
+    crops: Sequence[Any],
+    *,
+    frame_pose_index: Mapping[int, Mapping[str, Any]] | None,
+    world_up_vector: object,
+    world_up_source: str = "",
+) -> dict[str, Any]:
+    """Return hash-stable per-crop upright-normalization provenance."""
+
+    rows = [
+        gravity_upright_orientation(
+            crop_image_id(candidate),
+            frame_pose_index=frame_pose_index,
+            world_up_vector=world_up_vector,
+            world_up_source=world_up_source,
+        )
+        for candidate in crops
+    ]
+    canonical = {
+        "schema": GRAVITY_UPRIGHT_NORMALIZATION_SCHEMA,
+        "world_up_source": str(world_up_source or ""),
+        "rows": rows,
+    }
+    return {
+        "schema": GRAVITY_UPRIGHT_NORMALIZATION_SCHEMA,
+        "world_up_source": str(world_up_source or ""),
+        "world_up_vector": rows[0].get("world_up_vector", []) if rows else [],
+        "operation": "numpy.rot90_no_interpolation",
+        "provenance_complete": bool(
+            rows
+            and all(
+                row.get("status") in {"applied", "already_upright"}
+                for row in rows
+            )
+        ),
+        "crops": rows,
+        "fingerprint_sha256": _canonical_sha256(canonical),
+    }
 
 
 def _pose_canonical(
@@ -831,8 +986,23 @@ def evidence_camera_poses(
         except (TypeError, ValueError):
             return None
         center = _finite_vector(raw.get("camera_center_world_m"), 3)
-        forward = _unit(_finite_vector(raw.get("camera_forward_world"), 3) or ())
-        if image_id < 0 or image_id in seen or center is None or forward is None:
+        # The producer stores the already-normalized forward vector and hashes
+        # those exact serialized floats.  Re-normalizing here can change the
+        # least-significant bits after a JSON round trip (for example a vector
+        # with norm 0.9999999999999999), so a valid persisted event would fail
+        # its own fingerprint.  Validate that the stored vector is unit length,
+        # but hash the exact stored values.  This keeps old evidence verifiable
+        # while still failing closed for malformed directions.
+        forward = _finite_vector(raw.get("camera_forward_world"), 3)
+        forward_norm = _norm(forward or ())
+        if (
+            image_id < 0
+            or image_id in seen
+            or center is None
+            or forward is None
+            or not math.isfinite(forward_norm)
+            or abs(forward_norm - 1.0) > 2e-6
+        ):
             return None
         seen.add(image_id)
         rows.append({

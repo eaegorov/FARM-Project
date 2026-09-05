@@ -11,8 +11,8 @@ for source_root in (PROJECT_ROOT / "src", PROJECT_ROOT / "scripts"):
     if str(source_root) not in sys.path:
         sys.path.insert(0, str(source_root))
 
-from refine_farm_compound_geometry import _fit_floor_obb  # noqa: E402
-from refine_farm_compound_presentation import (  # noqa: E402
+from scripts.geometry.refine_farm_compound_geometry import _fit_floor_obb  # noqa: E402
+from scripts.geometry.refine_farm_compound_presentation import (  # noqa: E402
     _obb_record,
     _rotation_from_wxyz,
     _projection_metrics,

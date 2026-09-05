@@ -3,12 +3,13 @@ scene_id: factory
 
 # Paths are resolved relative to this file.
 inputs:
-  colmap_model: ../../../data/factory_pinhole_multi/sparse/0
-  image_root: ../../../data/factory_pinhole_multi/images
-  gaussian_ply: ../../../data/factory_scene_last.ply
-output_root: ../../../output/farm_pipeline
+  colmap_model: ../../../../data/factory_pinhole_multi/sparse/0
+  image_root: ../../../../data/factory_pinhole_multi/images
+  gaussian_ply: ../../../../data/factory_3dgs_scene.ply
+output_root: ../../../../output/farm_pipeline
 
 camera:
+  rgb_alignment: rig
   accepted_models: [PINHOLE]
   require_virtual_pinhole: true
 
@@ -39,7 +40,7 @@ resources:
   profile: auto
   gpu: "0"
   model_manifest: ../models/farm_models.v1.json
-  secrets_file: ../../../secrets.json
+  secrets_file: ../../../../secrets.json
   render_resolution: 896
   depth_batch_size: 1
   mapping_batch_size: 2

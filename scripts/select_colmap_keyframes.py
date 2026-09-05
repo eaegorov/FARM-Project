@@ -31,6 +31,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Sequence
 
+import sys
+
+SRC = Path(__file__).resolve().parents[1] / "src"
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
+from farm_runtime.angular_discovery import balanced_view_selection
+
 import matplotlib
 
 matplotlib.use("Agg")
@@ -115,6 +122,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=[],
         help="Families emitted for selected timestamps. '*' emits every available family.",
     )
+    parser.add_argument("--view-policy", choices=("fixed", "balanced"), default="fixed")
+    parser.add_argument("--views-per-sensor", type=int, default=1)
+    parser.add_argument("--exclude-timestamps", type=Path, help="One physical timestamp per line; all lenses/directions excluded before selection.")
+    parser.add_argument("--max-source-pixels", type=int, default=0, help="Hard sum of native source image pixels; zero disables the cap.")
     parser.add_argument("--fallback-family", default="default")
     parser.add_argument("--min-sensor-coverage", type=float, default=0.95)
     parser.add_argument("--target-observations", type=int, default=160)
@@ -794,6 +805,8 @@ def stable_sha256(values: Iterable[str]) -> str:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
+    if args.views_per_sensor < 1 or args.max_source_pixels < 0:
+        raise ValueError("views-per-sensor must be positive and max-source-pixels nonnegative")
     # Validate scale and grouping before creating even an empty output folder.
     # This makes misconfigured automated runs side-effect free.
     args.meters_per_scene_unit = validate_meters_per_scene_unit(
@@ -830,6 +843,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.timestamp_group,
         args.family_group,
     )
+    excluded_timestamps = set()
+    if args.exclude_timestamps:
+        excluded_timestamps = {line.strip() for line in args.exclude_timestamps.read_text().splitlines()
+                               if line.strip() and not line.lstrip().startswith("#")}
+        views = [v for v in views if v.timestamp not in excluded_timestamps]
+        if len({v.timestamp for v in views}) < 2:
+            raise ValueError("fewer than two timestamps after exclusion")
     requested_sensors = _csv(args.sensor)
     requested_anchors = _csv(args.anchor_family)
     requested_outputs = _csv(args.output_family)
@@ -858,6 +878,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         ),
         default=1,
     )
+    if args.view_policy == "balanced":
+        per_observation_views = len(sensors) * args.views_per_sensor
     max_by_view_budget = max(2, args.max_output_views // max(per_observation_views, 1))
     args.max_observations = min(args.max_observations, max_by_view_budget, len(observations))
     args.target_observations = min(args.target_observations, args.max_observations)
@@ -873,9 +895,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     selected_indices = sorted(selected)
     selected_observations = [observations[index] for index in selected_indices]
-    output_views = resolve_output_views(
-        selected_observations, by_timestamp, sensors, output_families, anchor_families
-    )
+    angular_policy = {"policy": "fixed"}
+    if args.view_policy == "balanced":
+        angular_families = sorted({v.family for v in views}) if "*" in output_families else output_families
+        output_views, angular_policy = balanced_view_selection(
+            by_timestamp, [o.timestamp for o in selected_observations], sensors, angular_families,
+            views_per_sensor=args.views_per_sensor,
+        )
+    else:
+        output_views = resolve_output_views(
+            selected_observations, by_timestamp, sensors, output_families, anchor_families
+        )
+    source_pixels = sum(int(reconstruction.cameras[v.camera_id].width) *
+                        int(reconstruction.cameras[v.camera_id].height) for v in output_views)
+    if args.max_source_pixels and source_pixels > args.max_source_pixels:
+        raise ValueError(f"source pixel budget exceeded: {source_pixels} > {args.max_source_pixels}")
+
     if len(output_views) > args.max_output_views:
         raise RuntimeError(
             f"Resolved {len(output_views)} views, above max-output-views={args.max_output_views}"
@@ -979,6 +1014,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             "min_shared_tracks": args.min_shared_tracks,
             "min_overlap_ratio": args.min_overlap_ratio,
         },
+        "angular_selection": angular_policy,
+        "source_pixel_budget": {"selected_source_pixels": source_pixels,
+                                "maximum": args.max_source_pixels or None,
+                                "note": "Metadata upper bound for one full decode per selected source. Resizing PNG does not reduce source decoding."},
+        "excluded_timestamps": sorted(excluded_timestamps, key=natural_key),
+        "emitted_family_counts": {f: sum(v.family == f for v in output_views) for f in sorted({v.family for v in output_views})},
         "baseline_pairs": baselines,
         "baseline_check": baseline_check,
         "selected": [

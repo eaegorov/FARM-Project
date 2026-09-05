@@ -138,7 +138,7 @@ Deliverable: `splatica_demo_app/outputs/farm_recon`.
 частичной генерации PCA-ось не означает «верх объекта». Поэтому OBB мог быть
 правильным, а реконструированный splat — наклонённым.
 
-`scripts/refine_farm_recon_orientation.py` теперь:
+`scripts/geometry/refine_farm_recon_orientation.py` теперь:
 
 1. восстанавливает canonical Z-up MV-SAM3D из pose contract;
 2. вычисляет минимальную rotation к `resolved_up` FARM;

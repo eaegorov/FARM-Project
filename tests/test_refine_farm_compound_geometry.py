@@ -8,7 +8,7 @@ SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
-from refine_farm_compound_geometry import (  # noqa: E402
+from scripts.geometry.refine_farm_compound_geometry import (  # noqa: E402
     build_multiview_consensus,
     coarse_voxel_support_metrics,
     find_binary_compound,

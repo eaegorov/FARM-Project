@@ -902,7 +902,7 @@ class RunOrchestrator:
         command = [
             sys.executable,
             "-B",
-            str(execution_root / "scripts" / "build_farm_run_report.py"),
+            str(execution_root / "scripts/evaluation/build_farm_run_report.py"),
             "--run-dir",
             str(run_dir),
         ]
@@ -1046,7 +1046,7 @@ class RunOrchestrator:
                         [
                             sys.executable,
                             "-B",
-                            str(execution_root / "scripts" / "build_farm_run_report.py"),
+                            str(execution_root / "scripts/evaluation/build_farm_run_report.py"),
                             "--run-dir",
                             str(run_dir),
                             "--no-video",

@@ -7,7 +7,7 @@ import cv2
 import numpy as np
 
 
-MODULE_PATH = Path(__file__).resolve().parents[1] / "scripts/build_farm_run_report.py"
+MODULE_PATH = Path(__file__).resolve().parents[1] / "scripts/evaluation/build_farm_run_report.py"
 SPEC = importlib.util.spec_from_file_location("build_farm_run_report", MODULE_PATH)
 assert SPEC and SPEC.loader
 MODULE = importlib.util.module_from_spec(SPEC)

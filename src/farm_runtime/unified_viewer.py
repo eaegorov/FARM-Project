@@ -53,6 +53,8 @@ _ABSOLUTE_UI_PATH_RE = re.compile(r"(?<![A-Za-z0-9_.-])/(?:[^\s`'\";,]+)")
 _VERIFIED_BANK_FIELDS = {
     "object_ids", "indptr", "indices", "confidence", "timestamp_support",
 }
+OBJECT_SELECTOR_PLACEHOLDER = "— выберите объект —"
+_OBJECT_SELECTOR_RE = re.compile(r"^#([0-9]+) · ")
 
 
 class UnifiedViewerError(RuntimeError):
@@ -1505,8 +1507,9 @@ def _validate_dense_candidate(
         raise UnifiedViewerError("dense lift counts are absent")
     verified_gaussians = int(counts.get("verified_gaussians", -1))
     verified_objects = int(counts.get("verified_objects", -1))
+    quality_status = result.get("quality_status")
     if (
-        result.get("quality_status") != ("PASS" if release_eligible else "WARN")
+        (release_eligible and quality_status != "PASS")
         or verified_gaussians <= 0
         or verified_objects <= 0
         or verified_gaussians > source_table.count
@@ -1514,13 +1517,28 @@ def _validate_dense_candidate(
         raise UnifiedViewerError("dense lift verified counts are invalid")
     if not release_eligible:
         quality_gate = result.get("quality_gate")
-        if (
-            not isinstance(quality_gate, Mapping)
-            or quality_gate.get("calibrated") is not False
-            or quality_gate.get("passed") is not False
-            or "configuration_not_calibrated" not in quality_gate.get("reasons", [])
-        ):
-            raise UnifiedViewerError("review lift is not an explicit uncalibrated quality-gate result")
+        runtime = result.get("runtime")
+        uncalibrated_review = (
+            quality_status == "WARN"
+            and isinstance(quality_gate, Mapping)
+            and quality_gate.get("calibrated") is False
+            and quality_gate.get("passed") is False
+            and "configuration_not_calibrated" in quality_gate.get("reasons", [])
+        )
+        calibrated_provenance_review = (
+            quality_status == "PASS"
+            and isinstance(quality_gate, Mapping)
+            and quality_gate.get("calibrated") is True
+            and quality_gate.get("passed") is True
+            and quality_gate.get("reasons") == []
+            and contracts.get("clean_versioned_source_snapshot") is False
+            and isinstance(runtime, Mapping)
+            and str(runtime.get("source_dirty", "")).lower() == "true"
+        )
+        if not (uncalibrated_review or calibrated_provenance_review):
+            raise UnifiedViewerError(
+                "review lift is neither an explicit uncalibrated result nor a calibrated provenance-nonrelease result"
+            )
     _validate_verified_bank(
         bank_path,
         object_id_path=sidecar_paths["object_id"],
@@ -1610,9 +1628,18 @@ def _find_review_lift(
                 marker_name=marker_name,
                 release_eligible=False,
             )
+            gate = bundle.result.get("quality_gate")
+            quality_note = (
+                "calibrated quality PASS; provenance nonrelease"
+                if bundle.result.get("quality_status") == "PASS"
+                and isinstance(gate, Mapping)
+                and gate.get("calibrated") is True
+                and gate.get("passed") is True
+                else "uncalibrated/nonrelease"
+            )
             return bundle, (
                 f"REVIEW ONLY: exact contributor calibration; {bundle.verified_objects} verified objects, "
-                f"{bundle.verified_gaussians:,} source Gaussians; uncalibrated/nonrelease"
+                f"{bundle.verified_gaussians:,} source Gaussians; {quality_note}"
             )
         except (UnifiedViewerError, OSError, KeyError, TypeError, ValueError) as exc:
             reasons.append(f"{candidate}: {exc}")
@@ -2368,6 +2395,32 @@ def load_dense_gaussian_splats(
 
 
 
+def filter_object_gaussian_splats(
+    centers: np.ndarray,
+    covariances: np.ndarray,
+    rgbs: np.ndarray,
+    opacities: np.ndarray,
+    labels: np.ndarray,
+    object_id: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Select one verified object while preserving aligned Gaussian arrays."""
+
+    arrays = (
+        np.asarray(centers),
+        np.asarray(covariances),
+        np.asarray(rgbs),
+        np.asarray(opacities),
+    )
+    object_labels = np.asarray(labels, dtype=np.int32).reshape(-1)
+    if any(len(array) != len(object_labels) for array in arrays):
+        raise UnifiedViewerError("dense Gaussian arrays and labels are misaligned")
+    use = np.flatnonzero(object_labels == int(object_id))
+    if not len(use):
+        raise UnifiedViewerError(f"verified Gaussian mask is absent for object #{int(object_id)}")
+    selected = tuple(np.ascontiguousarray(array[use]) for array in arrays)
+    return (*selected, np.ascontiguousarray(object_labels[use]))
+
+
 def load_review_gaussian_splats(
     scene: ValidatedScene,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -2738,6 +2791,37 @@ def focus_pose(
     )
 
 
+def object_axis_pose(
+    bounds: np.ndarray,
+    world_up: Sequence[float],
+    view: str,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Frame one object from a deterministic metric front, side, or top view."""
+
+    box = np.asarray(bounds, dtype=np.float64).reshape(2, 3)
+    if not np.isfinite(box).all() or np.any(box[1] < box[0]):
+        raise UnifiedViewerError("object bounds must be finite and ordered")
+    if view not in {"front", "side", "top"}:
+        raise UnifiedViewerError(f"unsupported object axis view: {view}")
+    axis_a, axis_b, up = _horizontal_basis(world_up)
+    center = box.mean(axis=0)
+    distance = max(1.35 * float(np.linalg.norm(box[1] - box[0])), 0.72)
+    if view == "front":
+        position = center - distance * axis_b + 0.08 * distance * up
+        camera_up = up
+    elif view == "side":
+        position = center + distance * axis_a + 0.08 * distance * up
+        camera_up = up
+    else:
+        position = center + distance * up
+        camera_up = -axis_b
+    return (
+        position.astype(np.float32),
+        center.astype(np.float32),
+        camera_up.astype(np.float32),
+    )
+
+
 def _set_markdown(handle: Any, content: str) -> None:
     if hasattr(handle, "content"):
         handle.content = content
@@ -2755,6 +2839,30 @@ def _markdown_text(value: Any) -> str:
         "!": "&#33;", "\\": "&#92;", "*": "&#42;", "_": "&#95;",
     }
     return "".join(replacements.get(character, character) for character in text)
+
+
+def object_selector_options(catalog: Sequence[Mapping[str, Any]]) -> tuple[str, ...]:
+    """Return stable human-readable choices for direct object-centred QA."""
+
+    rows: list[tuple[int, str]] = []
+    seen: set[int] = set()
+    for row in catalog:
+        object_id = int(row["id"])
+        if object_id in seen:
+            raise UnifiedViewerError(f"duplicate object id in presentation catalog: {object_id}")
+        seen.add(object_id)
+        category = " ".join(str(row.get("category") or "object").split())
+        rows.append((object_id, category))
+    return (OBJECT_SELECTOR_PLACEHOLDER,) + tuple(
+        f"#{object_id} · {category}" for object_id, category in sorted(rows)
+    )
+
+
+def object_id_from_selector(value: Any) -> int | None:
+    """Parse an object selector choice without trusting its display label."""
+
+    match = _OBJECT_SELECTOR_RE.match(str(value))
+    return int(match.group(1)) if match else None
 
 
 def _short_reason(value: str, limit: int = 420) -> str:
@@ -2829,6 +2937,12 @@ class _SceneRuntime:
     review_mesh_ids: set[int] = field(default_factory=set)
     evidence_state: Mapping[str, Any] | None = None
     evidence_galleries: dict[int, ObjectEvidenceGallery] = field(default_factory=dict)
+    dense_splats: tuple[
+        np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray
+    ] | None = None
+    review_splats: tuple[
+        np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray
+    ] | None = None
 
 
 class UnifiedViserViewer:
@@ -2906,6 +3020,13 @@ class UnifiedViserViewer:
             )
             self.scene_title = self.server.gui.add_markdown("")
         with self.server.gui.add_folder("Выбранный объект", expand_by_default=True):
+            self.object_select = self.server.gui.add_dropdown(
+                "Объект",
+                options=object_selector_options(
+                    self.runtime[self.current_scene_id].scene.farm.catalog
+                ),
+                initial_value=OBJECT_SELECTOR_PLACEHOLDER,
+            )
             self.selected_markdown = self.server.gui.add_markdown(
                 "Нажмите на OBB или реконструированную поверхность объекта."
             )
@@ -2936,12 +3057,17 @@ class UnifiedViserViewer:
                 hint="Облегчённое облако точек исходной сцены.",
             )
             self.show_obbs = self.server.gui.add_checkbox(
-                "OBB объектов", initial_value=True
+                "3D OBB", initial_value=True
             )
             self.show_instances = self.server.gui.add_checkbox(
-                "Проверенные 3D-маски",
+                "3D Gaussian-маски",
                 initial_value=False,
-                hint="Плотные проверенные instance-splats; review-слой только при отсутствии release.",
+                hint="Проверенные instance-splats; review-слой явно помечается в статусе.",
+            )
+            self.isolate_selected = self.server.gui.add_checkbox(
+                "Только маска выбранного объекта",
+                initial_value=True,
+                hint="Скрывает маски остальных объектов после выбора.",
             )
             self.show_meshes = self.server.gui.add_checkbox(
                 "Реконструированные mesh-объекты",
@@ -2992,6 +3118,15 @@ class UnifiedViserViewer:
                     return
                 self._activate_scene(self.label_to_id[str(self.scene_select.value)])
 
+        @self.object_select.on_update
+        def _object_changed(_event: Any = None) -> None:
+            with self._mutation_lock:
+                if self._updating_controls:
+                    return
+                object_id = object_id_from_selector(self.object_select.value)
+                if object_id is not None:
+                    self._select_object(self.runtime[self.current_scene_id], object_id)
+
         layer_controls = {
             "farm_preview": self.show_farm,
             "farm_obbs": self.show_obbs,
@@ -3035,6 +3170,7 @@ class UnifiedViserViewer:
                             self._ensure_layer(runtime, name)
                         except UnifiedViewerError as exc:
                             runtime.visibility[name] = False
+                            self._unload_layer(runtime, name)
                             self._updating_controls = True
                             self.show_instances.value = False
                             self._updating_controls = False
@@ -3042,6 +3178,28 @@ class UnifiedViserViewer:
                     else:
                         self._unload_layer(runtime, name)
                     self._apply_layer_visibility(runtime, name)
+
+        @self.isolate_selected.on_update
+        def _isolate_selected_changed(_event: Any = None) -> None:
+            with self._mutation_lock:
+                if self._updating_controls:
+                    return
+                runtime = self.runtime[self.current_scene_id]
+                target = self._primary_instance_layer(runtime)
+                if target is not None and runtime.visibility.get(target, False):
+                    try:
+                        self._unload_layer(runtime, target)
+                        self._ensure_layer(runtime, target)
+                    except UnifiedViewerError as exc:
+                        runtime.visibility[target] = False
+                        self._updating_controls = True
+                        self.show_instances.value = False
+                        self._updating_controls = False
+                        _set_markdown(
+                            self.scene_status,
+                            self._status_markdown(runtime, error=str(exc)),
+                        )
+                    self._apply_layer_visibility(runtime, target)
 
         @self.show_meshes.on_update
         def _meshes_changed(_event: Any = None) -> None:
@@ -3084,15 +3242,15 @@ class UnifiedViserViewer:
 
         @self.front_button.on_click
         def _front(_event: Any = None) -> None:
-            self._apply_preset("front")
+            self._apply_axis_view("front")
 
         @self.side_button.on_click
         def _side(_event: Any = None) -> None:
-            self._apply_preset("side")
+            self._apply_axis_view("side")
 
         @self.top_button.on_click
         def _top(_event: Any = None) -> None:
-            self._apply_preset("top")
+            self._apply_axis_view("top")
 
         @self.previous_button.on_click
         def _previous(_event: Any = None) -> None:
@@ -3173,6 +3331,21 @@ class UnifiedViserViewer:
         for client in self.server.get_clients().values():
             self._set_camera(client, runtime.presets[name])
 
+    @_serialized_mutation
+    def _apply_axis_view(self, name: str) -> None:
+        runtime = self.runtime[self.current_scene_id]
+        object_id = runtime.selected_object_id
+        if object_id is None or object_id not in runtime.bounds_by_id:
+            self._apply_preset(name)
+            return
+        pose = object_axis_pose(
+            runtime.bounds_by_id[object_id],
+            runtime.scene.farm.world_up,
+            name,
+        )
+        for client in self.server.get_clients().values():
+            self._set_camera(client, pose)
+
     @staticmethod
     def _primary_instance_layer(runtime: _SceneRuntime) -> str | None:
         for name in ("dense_lift", "exact_lift_review"):
@@ -3198,6 +3371,8 @@ class UnifiedViserViewer:
         runtime = self.runtime[scene_id]
         self.server.scene.set_up_direction(tuple(float(value) for value in runtime.scene.farm.world_up))
         self._updating_controls = True
+        self.object_select.options = object_selector_options(runtime.scene.farm.catalog)
+        self.object_select.value = OBJECT_SELECTOR_PLACEHOLDER
         controls = {
             "farm_preview": self.show_farm,
             "farm_obbs": self.show_obbs,
@@ -3219,6 +3394,7 @@ class UnifiedViserViewer:
             runtime.visibility[name] = instance_visible and name == instance_layer
         self.show_instances.disabled = instance_layer is None
         self.show_instances.value = bool(instance_layer and runtime.visibility[instance_layer])
+        self.isolate_selected.disabled = instance_layer is None
 
         mesh_layer = self._primary_mesh_layer(runtime)
         mesh_visible = any(
@@ -3234,6 +3410,10 @@ class UnifiedViserViewer:
                 self._ensure_layer(runtime, name)
             self._apply_layer_visibility(runtime, name)
         runtime.selected_object_id = None
+        _set_markdown(
+            self.selected_markdown,
+            "Выберите объект в списке или нажмите на его OBB/поверхность.",
+        )
         _set_markdown(
             self.scene_title,
             f"# {_markdown_text(runtime.scene.spec.label)} | `{_markdown_text(runtime.scene.farm.run_id)}`",
@@ -3369,7 +3549,7 @@ class UnifiedViserViewer:
                 self._select_object(runtime, captured)
 
             layer.handles.append(handle)
-            half = 0.5 * float(np.linalg.norm(dimensions))
+            half = 0.5 * dimensions
             runtime.bounds_by_id[object_id] = np.stack((center - half, center + half)).astype(np.float32)
 
     def _load_source_layer(self, runtime: _SceneRuntime, layer: _LayerRuntime) -> None:
@@ -3399,9 +3579,21 @@ class UnifiedViserViewer:
         layer.handles.append(handle)
 
     def _load_review_lift_layer(self, runtime: _SceneRuntime, layer: _LayerRuntime) -> None:
-        centers, covariances, rgbs, opacities, _ = load_review_gaussian_splats(runtime.scene)
+        if runtime.review_splats is None:
+            runtime.review_splats = load_review_gaussian_splats(runtime.scene)
+        splats = runtime.review_splats
+        object_id = (
+            runtime.selected_object_id
+            if bool(self.isolate_selected.value)
+            else None
+        )
+        path_suffix = "all_verified_instance_splats"
+        if object_id is not None:
+            splats = filter_object_gaussian_splats(*splats, object_id)
+            path_suffix = f"selected_{object_id:06d}"
+        centers, covariances, rgbs, opacities, _ = splats
         handle = self.server.scene.add_gaussian_splats(
-            f"/scenes/{runtime.scene.spec.scene_id}/exact_lift_review/all_verified_instance_splats",
+            f"/scenes/{runtime.scene.spec.scene_id}/exact_lift_review/{path_suffix}",
             centers=centers,
             covariances=covariances,
             rgbs=rgbs,
@@ -3486,9 +3678,21 @@ class UnifiedViserViewer:
             runtime.review_mesh_ids.add(object_id)
 
     def _load_dense_layer(self, runtime: _SceneRuntime, layer: _LayerRuntime) -> None:
-        centers, covariances, rgbs, opacities, _ = load_dense_gaussian_splats(runtime.scene)
+        if runtime.dense_splats is None:
+            runtime.dense_splats = load_dense_gaussian_splats(runtime.scene)
+        splats = runtime.dense_splats
+        object_id = (
+            runtime.selected_object_id
+            if bool(self.isolate_selected.value)
+            else None
+        )
+        path_suffix = "all_verified_instance_splats"
+        if object_id is not None:
+            splats = filter_object_gaussian_splats(*splats, object_id)
+            path_suffix = f"selected_{object_id:06d}"
+        centers, covariances, rgbs, opacities, _ = splats
         handle = self.server.scene.add_gaussian_splats(
-            f"/scenes/{runtime.scene.spec.scene_id}/dense_lift/all_verified_instance_splats",
+            f"/scenes/{runtime.scene.spec.scene_id}/dense_lift/{path_suffix}",
             centers=centers,
             covariances=covariances,
             rgbs=rgbs,
@@ -3584,19 +3788,46 @@ class UnifiedViserViewer:
         runtime.selected_object_id = object_id
         catalog = {int(row["id"]): row for row in runtime.scene.farm.catalog}
         row = catalog.get(object_id, {})
+        selected_option = next(
+            (
+                option
+                for option in object_selector_options(runtime.scene.farm.catalog)
+                if object_id_from_selector(option) == object_id
+            ),
+            None,
+        )
+        if selected_option is not None and self.object_select.value != selected_option:
+            previous_update_state = self._updating_controls
+            self._updating_controls = True
+            try:
+                self.object_select.value = selected_option
+            finally:
+                self._updating_controls = previous_update_state
+        instance_layer = self._primary_instance_layer(runtime)
+        if (
+            bool(self.isolate_selected.value)
+            and instance_layer is not None
+            and runtime.visibility.get(instance_layer, False)
+        ):
+            try:
+                self._unload_layer(runtime, instance_layer)
+                self._ensure_layer(runtime, instance_layer)
+            except UnifiedViewerError as exc:
+                runtime.visibility[instance_layer] = False
+                self._updating_controls = True
+                self.show_instances.value = False
+                self._updating_controls = False
+                _set_markdown(
+                    self.scene_status,
+                    self._status_markdown(runtime, error=str(exc)),
+                )
+            self._apply_layer_visibility(runtime, instance_layer)
         category = _markdown_text(row.get("category") or "объект")
         description = _markdown_text(
             row.get("description") or "Описание отсутствует."
         )
-        center = np.asarray(
-            row.get("center_m", [np.nan, np.nan, np.nan]), dtype=np.float64
-        )
         dimensions = np.asarray(
             row.get("dimensions_m", [np.nan, np.nan, np.nan]), dtype=np.float64
-        )
-        orientation = np.asarray(
-            row.get("wxyz", [np.nan, np.nan, np.nan, np.nan]),
-            dtype=np.float64,
         )
         volume_m3 = (
             float(np.prod(dimensions))
@@ -3615,13 +3846,6 @@ class UnifiedViserViewer:
             (
                 f"**Размеры OBB:** {dimensions[0]:.3f} × {dimensions[1]:.3f} × "
                 f"{dimensions[2]:.3f} м · **объём OBB:** {volume_m3:.3f} м³"
-            ),
-            (
-                f"**Центр в world-metric:** ({center[0]:.3f}, {center[1]:.3f}, "
-                f"{center[2]:.3f}) м  \n"
-                f"**Ориентация OBB wxyz:** ({orientation[0]:.4f}, "
-                f"{orientation[1]:.4f}, {orientation[2]:.4f}, "
-                f"{orientation[3]:.4f})"
             ),
             (
                 f"**Доказательность:** "
@@ -3688,22 +3912,17 @@ class UnifiedViserViewer:
                     runtime.evidence_galleries[object_id] = gallery
                 self.evidence_image.image = compose_evidence_gallery(gallery)
                 icon = "⚠️" if gallery.provenance_warning else "✅"
+                cameras = sorted({str(frame.camera_id) for frame in gallery.frames})
+                provenance = (
+                    "review provenance: проверено при запуске, но не producer-signed"
+                    if gallery.provenance_warning
+                    else "producer-bound provenance"
+                )
                 gallery_lines = [
-                    f"{icon} {_markdown_text(gallery.provenance_note)}"
+                    f"{icon} **Показано ракурсов:** {len(gallery.frames)} · "
+                    f"камер: {len(cameras)}",
+                    f"Источник: {_markdown_text(provenance)}.",
                 ]
-                for index, frame in enumerate(gallery.frames, start=1):
-                    bbox = (
-                        "—"
-                        if frame.bbox_xyxy is None
-                        else ",".join(str(value) for value in frame.bbox_xyxy)
-                    )
-                    gallery_lines.append(
-                        f"{index}. кадр `{frame.image_id}` · камера "
-                        f"`{_markdown_text(frame.camera_id)}` · "
-                        f"score {frame.score:.3f} · bbox `{bbox}` · "
-                        f"{_markdown_text(frame.source_kind)} · "
-                        f"`{_markdown_text(frame.source_filename or 'встроенный')}`"
-                    )
                 _set_markdown(
                     self.evidence_markdown, "\n\n".join(gallery_lines)
                 )

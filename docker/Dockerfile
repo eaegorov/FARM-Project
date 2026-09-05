@@ -66,17 +66,19 @@ RUN /usr/local/bin/uv pip install \
         --python /home/${USER}/.venv/bin/python \
         --index-strategy unsafe-best-match \
         --extra-index-url https://download.pytorch.org/whl/cu128 \
-        torch torchvision torchaudio \
-        "transformers>=4.57.0" \
+        "torch==2.11.0+cu128" "torchvision==0.26.0+cu128" "torchaudio==2.11.0+cu128" \
+        "transformers==5.16.1" \
+        "kernels==0.16.1" \
         -e ./third_party/yoloe \
         -e ./third_party/yoloe/third_party/ml-mobileclip \
         opencv-python h5py huggingface_hub \
+        pycolmap==3.11.1 plyfile==1.1.3 \
         loguru numpy Pillow PyYAML requests \
         "networkx>=2.8" supervision tqdm timm \
         scikit-learn scipy transforms3d \
         "imageio[ffmpeg]" matplotlib pydantic "viser==1.0.30" \
-        "vllm>=0.20.0" accelerate safetensors \
-        "qwen-vl-utils>=0.0.14" \
+        "vllm==0.26.0" accelerate safetensors \
+        "qwen-vl-utils==0.0.14" \
         "setuptools<70" \
         -e . \
     && chown -R ${UID}:${GID} /home/${USER}/.venv

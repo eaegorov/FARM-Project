@@ -25,6 +25,7 @@ def _add_run_lookup(parser: argparse.ArgumentParser) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="farm-pipeline", description="Reproducible generic FARM pipeline runtime")
     commands = parser.add_subparsers(dest="subcommand", required=True)
+    commands.add_parser("quality", help="FARM discovery, lift and visual quality experiments")
     validate = commands.add_parser("validate-plan", help="Validate and print the resolved stage DAG")
     _add_config(validate, required=True)
     validate.add_argument("--json", action="store_true")
@@ -87,6 +88,10 @@ def _status(run_dir: Path) -> dict[str, Any]:
 
 
 def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv[:1] == ["quality"]:
+        from .quality.cli import main as quality_main
+        return quality_main(argv[1:])
     args = build_parser().parse_args(argv)
     try:
         if args.subcommand == "validate-plan":

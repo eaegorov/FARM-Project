@@ -15,16 +15,19 @@ _INSERTED_SCRIPTS = str(SCRIPTS) not in sys.path
 if _INSERTED_SCRIPTS:
     sys.path.insert(0, str(SCRIPTS))
 
-import analyze_farm_scene_quality as quality  # noqa: E402
-from build_farm_object_assemblies import _fit_gravity_obb  # noqa: E402
-from farm_geometry_axes import (  # noqa: E402
+from scripts.evaluation import analyze_farm_scene_quality as quality  # noqa: E402
+from scripts.geometry.build_farm_object_assemblies import _fit_gravity_obb  # noqa: E402
+from scripts.geometry.farm_geometry_axes import (  # noqa: E402
     horizontal_plane_basis,
     normalize_up_vector,
     resolve_up_policy,
     write_state_up_policy,
 )
-from refine_farm_compound_geometry import _fit_floor_obb  # noqa: E402
-from refine_farm_object_geometry import _fit_robust_obb  # noqa: E402
+from scripts.geometry.refine_farm_compound_geometry import _fit_floor_obb  # noqa: E402
+from scripts.geometry.refine_farm_object_geometry import (  # noqa: E402
+    _anchored_voxel_component,
+    _fit_robust_obb,
+)
 
 if _INSERTED_SCRIPTS:
     sys.path.remove(str(SCRIPTS))
@@ -60,6 +63,35 @@ def test_all_geometry_fitters_honor_each_axis(up: list[float]) -> None:
         fitted = np.asarray(result["rotation_matrix"], dtype=np.float64)[:, 2]
         np.testing.assert_allclose(fitted, up_np, atol=1.0e-7, rtol=0.0)
         assert float(result.get("gravity_tilt_degrees", 0.0)) < 1.0e-5
+
+
+def test_voxel_component_selection_anchors_to_rgbd_and_ignores_larger_floater() -> None:
+    voxel_size = 0.05
+    core_grid = np.stack(
+        np.meshgrid(np.arange(-2, 3), np.arange(-2, 3), np.arange(-2, 3)),
+        axis=-1,
+    ).reshape(-1, 3)
+    background_grid = np.stack(
+        np.meshgrid(np.arange(6), np.arange(6), np.arange(6)),
+        axis=-1,
+    ).reshape(-1, 3)
+    core = (core_grid + 0.5) * voxel_size
+    background = (background_grid + 0.5) * voxel_size + np.asarray([3.0, 0.0, 0.0])
+    base = {
+        "center": np.zeros(3, dtype=np.float32),
+        "dimensions": np.full(3, 0.35, dtype=np.float32),
+        "rotation_matrix": np.eye(3, dtype=np.float32),
+    }
+    selected, diagnostics = _anchored_voxel_component(
+        np.vstack((core, background)),
+        base,
+        voxel_size_m=voxel_size,
+    )
+    assert diagnostics["component_count"] == 2
+    assert diagnostics["largest_component_fraction"] > 0.5
+    assert diagnostics["selected_component_points"] == core.shape[0]
+    assert diagnostics["selected_component_anchor_points"] > 0
+    assert float(np.max(np.abs(selected[:, 0]))) < 0.2
 
 
 def test_oblique_up_vector_is_exact_and_persisted_without_axis_rounding() -> None:

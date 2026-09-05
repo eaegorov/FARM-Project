@@ -135,19 +135,54 @@ size и SHA-256. Все 17 стадий, finalizer и report запускают�
 RUN=/absolute/output/farm_pipeline/my_scene/runs/my-scene-production-v1
 PLY=/absolute/data/my_scene/scene.ply
 LIFT=/absolute/output/farm_gaussian_lift/my_scene/my-scene-production-v1
+PRELIFT=/absolute/output/pre_lift_selection/selection.json
+OBJECT_IDS=/absolute/output/pre_lift_selection/pre_lift_eligible_object_ids.txt
+FULL_COLMAP_FOLDS=/absolute/output/full_colmap_folds/fold_manifest.json
 
 "$FARM_PY" tools/farm_shaper_bridge/run_gaussian_lift.py \
   --run "$RUN" --ply "$PLY" --output "$LIFT" \
-  --config configs/gaussian_lift.v1.yaml --gpu 0 --plan-only
+  --config configs/gaussian_lift.v1.yaml --gpu 0 --plan-only \
+  --object-id-file "$OBJECT_IDS" --pre-lift-selection "$PRELIFT" \
+  --full-colmap-fold-manifest "$FULL_COLMAP_FOLDS"
 
 "$FARM_PY" tools/farm_shaper_bridge/run_gaussian_lift.py \
   --run "$RUN" --ply "$PLY" --output "$LIFT" \
-  --config configs/gaussian_lift.v1.yaml --gpu 0
+  --config configs/gaussian_lift.v1.yaml --gpu 0 \
+  --object-id-file "$OBJECT_IDS" --pre-lift-selection "$PRELIFT" \
+  --full-colmap-fold-manifest "$FULL_COLMAP_FOLDS"
 ```
 
 `LIFT` должен быть новым/пустым. Конфиг обязан побайтно совпасть с копией в
-run snapshot. Output сохраняет исходный порядок и все поля PLY; неизвестные и
-не прошедшие held-out объекты остаются `-1`.
+run snapshot. Для release обязательна точная пара
+`--object-id-file + --pre-lift-selection`: selection должен иметь schema
+`farm.pre-lift-eligibility-selection.v1` и status `PASS`, а ID-файл — побайтно
+совпадать с описанным в selection артефактом и с `eligible_object_ids`. Все
+`provenance.consumed_artifacts` монтируются read-only и повторно проверяются по
+bytes/SHA256 внутри signed lift-кода. Несортированные, повторные либо неактивные
+`eligible_object_ids` отклоняются. Неактивные rejected audit rows и активные
+presentation IDs, отсутствующие в полном train-refinement universe, фиксируются
+раздельно и принудительно исключаются; Gaussian owners вне allowlist запрещены.
+
+Smoke `--smoke-object-id` несовместим с release allowlist. Legacy run может
+использовать эту пару для scoped evaluation, но всегда остаётся non-release.
+Запуск без пары также явно non-release. Output сохраняет исходный порядок и все
+поля PLY; неизвестные, исключённые allowlist и не прошедшие held-out объекты
+остаются `-1`.
+
+Если точный pinned prep image недоступен, пересобранный образ разрешается только
+как явно non-release результат. Код lift всё равно исполняется из проверенного
+source snapshot исходного run, а фактический image digest записывается в
+provenance:
+
+```bash
+"$FARM_PY" tools/farm_shaper_bridge/run_gaussian_lift.py \
+  --run "$RUN" --ply "$PLY" --output "$LIFT" \
+  --config configs/gaussian_lift.v1.yaml --gpu 0 \
+  --allow-rebuilt-image-nonrelease
+```
+
+Такой запуск обязан завершиться маркером `_NONRELEASE_SUCCESS.json` и не может
+выдаваться за воспроизводимый canonical release.
 
 ## 8. ShapeR (опционально)
 

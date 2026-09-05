@@ -1,0 +1,32 @@
+FROM farm-prep:portability-v2@sha256:cc040a3d19c048a828a927fe62f4157acbfdab88a437d0cb664afa7fa4cc958d
+
+ARG TORCH_CUDA_ARCH_LIST=8.9
+ENV TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST} \
+    CUDA_HOME=/usr/local/cuda \
+    PIP_NO_CACHE_DIR=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+# The portability base defaults to an unprivileged runtime user.  Extension
+# builds need a writable source tree and environment site-packages; runtime is
+# still launched explicitly with the caller's UID/GID.
+USER root
+
+# Build only the two official Gaussian Grouping CUDA extensions.  The FARM
+# adapter and the upstream repository are mounted read-only at runtime, so the
+# image contains no scene data, checkpoints, or mutable project checkout.
+COPY submodules/diff-gaussian-rasterization /opt/gaussian-grouping-build/diff-gaussian-rasterization
+COPY submodules/simple-knn /opt/gaussian-grouping-build/simple-knn
+
+RUN python -m pip install --no-build-isolation --no-deps \
+      /opt/gaussian-grouping-build/diff-gaussian-rasterization \
+      /opt/gaussian-grouping-build/simple-knn \
+    && python -c "import diff_gaussian_rasterization, simple_knn" \
+    && rm -rf /opt/gaussian-grouping-build
+
+LABEL org.opencontainers.image.title="FARM Gaussian Grouping identity-only runtime" \
+      org.opencontainers.image.description="Frozen-geometry Gaussian Grouping CUDA extensions for FARM evaluation" \
+      org.opencontainers.image.source="https://github.com/lkeab/gaussian-grouping" \
+      ai.goldengait.farm.gaussian_grouping_revision="0ab60afed3385b717c985af1d30a20f7b0884c89"
+
+WORKDIR /project
+ENTRYPOINT ["python"]

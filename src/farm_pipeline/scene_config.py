@@ -88,6 +88,7 @@ class CameraGroupingPolicy:
 class CameraPolicy:
     accepted_models: Tuple[str, ...] = ("PINHOLE", "SIMPLE_PINHOLE")
     require_virtual_pinhole: bool = True
+    rgb_alignment: str = "off"
 
 
 @dataclass(frozen=True)
@@ -101,6 +102,9 @@ class SelectionPolicy:
     min_shared_tracks: int = 20
     min_overlap_ratio: float = 0.015
     output_views: Tuple[str, ...] = ()
+    anchor_views: Tuple[str, ...] = ()
+    view_policy: str = "fixed"
+    views_per_sensor: int = 1
 
 
 @dataclass(frozen=True)
@@ -284,9 +288,12 @@ def _build_config(raw: Mapping[str, Any], config_path: Path) -> SceneConfig:
     camera_raw = _mapping(raw.get("camera"), "camera")
     accepted = camera_raw.get("accepted_models", ("PINHOLE", "SIMPLE_PINHOLE"))
     camera = CameraPolicy(
+        rgb_alignment=str(camera_raw.get("rgb_alignment", "off")),
         accepted_models=tuple(item.upper() for item in _tuple_str(accepted, "camera.accepted_models")),
         require_virtual_pinhole=bool(camera_raw.get("require_virtual_pinhole", True)),
     )
+    if camera.rgb_alignment not in ("off", "rig"):
+        raise SceneConfigError("camera.rgb_alignment must be off or rig")
     if not camera.accepted_models:
         raise SceneConfigError("camera.accepted_models cannot be empty")
 
@@ -301,7 +308,14 @@ def _build_config(raw: Mapping[str, Any], config_path: Path) -> SceneConfig:
         min_shared_tracks=int(selection_raw.get("min_shared_tracks", 20)),
         min_overlap_ratio=float(selection_raw.get("min_overlap_ratio", 0.015)),
         output_views=_tuple_str(selection_raw.get("output_views"), "selection.output_views"),
+        anchor_views=_tuple_str(selection_raw.get("anchor_views"), "selection.anchor_views"),
+        view_policy=str(selection_raw.get("view_policy", "fixed")),
+        views_per_sensor=int(selection_raw.get("views_per_sensor", 1)),
     )
+    if selection.view_policy not in ("fixed", "balanced") or selection.views_per_sensor < 1:
+        raise SceneConfigError("selection.view_policy must be fixed/balanced and views_per_sensor positive")
+    if selection.view_policy == "balanced" and not selection.output_views:
+        raise SceneConfigError("balanced selection requires explicit output_views")
     if selection.target_timestamps < 2 or selection.max_timestamps < selection.target_timestamps:
         raise SceneConfigError("selection requires 2 <= target_timestamps <= max_timestamps")
     selection_thresholds = {

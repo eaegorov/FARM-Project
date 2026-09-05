@@ -40,6 +40,9 @@ COLMAP + RGB + 3DGS
 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md). Если нужно понять, можно ли отдавать
 результат руководству — с [docs/QUALITY.md](docs/QUALITY.md).
 
+Текущая разработка quality pipeline: [FARM V12](docs/FARM_QUALITY_V12_RU.md).
+Структура инструментов: [scripts/README.md](scripts/README.md).
+
 Состояние на 2026-08-24:
 
 | Сцена | Cold run | Final / presentation | Release lift |

@@ -12,8 +12,9 @@ SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
-from prepare_farm_presentation import (  # noqa: E402
+from scripts.geometry.prepare_farm_presentation import (  # noqa: E402
     build_demo_state,
+    build_presentation_catalog,
     cloud_export_contract,
     export_cloud,
     main as presentation_main,
@@ -32,6 +33,9 @@ def _state(path: Path) -> None:
         "object_supercategory": [""],
         "object_caption_decision": [""],
         "object_key_attributes": [[]],
+        "object_box_centers_m": torch.tensor([[1.0, 2.0, 3.0]]),
+        "object_box_dimensions_m": torch.tensor([[0.4, 0.5, 0.6]]),
+        "object_box_wxyz": torch.tensor([[1.0, 0.0, 0.0, 0.0]]),
         "image_positions": [torch.tensor([1.0, 2.0, 3.2])],
     }
     torch.save({"state": state, "meta": {}}, path)
@@ -86,6 +90,73 @@ def test_presentation_provenance_can_be_stored_as_portable_paths(tmp_path):
     assert metadata["source_scene_state"] == "../scene_state.pt"
     assert metadata["reviewed_catalog"] == "../../qa/semantics/consensus/catalog.json"
     assert str(tmp_path.resolve()) not in json.dumps(metadata)
+
+
+def test_presentation_catalog_is_bound_to_filtered_state_geometry(tmp_path):
+    source = tmp_path / "source.pt"
+    filtered = tmp_path / "filtered.pt"
+    catalog = tmp_path / "catalog.json"
+    output = tmp_path / "presentation_catalog.json"
+    _state(source)
+    catalog.write_text(json.dumps([{
+        "id": 7,
+        "category": "stool",
+        "description": "Low rectangular stool.",
+        "semantic_tier": "probable",
+        "semantic_status": "contextual_dual_panel_reviewed",
+        "review_decision": "keep",
+    }]), encoding="utf-8")
+    build_demo_state(
+        source, filtered, reviewed_catalog=catalog, min_observations=3,
+        resolved_only=True, max_camera_distance_m=0.0,
+    )
+
+    summary = build_presentation_catalog(filtered, catalog, output)
+    rows = json.loads(output.read_text(encoding="utf-8"))
+
+    assert summary["visible_objects"] == 1
+    assert rows == [{
+        "id": 7,
+        "category": "stool",
+        "description": "Low rectangular stool.",
+        "semantic_tier": "probable",
+        "semantic_status": "contextual_dual_panel_reviewed",
+        "review_decision": "keep",
+        "center_m": [1.0, 2.0, 3.0],
+        "dimensions_m": pytest.approx([0.4, 0.5, 0.6]),
+        "wxyz": [1.0, 0.0, 0.0, 0.0],
+        "observation_count": 3,
+        "presentation_visible": True,
+    }]
+
+
+
+def test_presentation_catalog_excludes_suppressed_active_object(tmp_path):
+    source = tmp_path / "source.pt"
+    filtered = tmp_path / "filtered.pt"
+    catalog = tmp_path / "catalog.json"
+    output = tmp_path / "presentation_catalog.json"
+    _state(source)
+    catalog.write_text(json.dumps([{
+        "id": 7,
+        "category": "stool",
+        "description": "Low rectangular stool.",
+        "semantic_tier": "probable",
+        "semantic_status": "contextual_dual_panel_reviewed",
+        "review_decision": "keep",
+    }]), encoding="utf-8")
+    build_demo_state(
+        source, filtered, reviewed_catalog=catalog, min_observations=3,
+        resolved_only=True, max_camera_distance_m=0.0,
+    )
+    payload = torch.load(filtered, map_location="cpu", weights_only=False)
+    payload["state"]["object_display_status"] = ["duplicate_suppressed"]
+    torch.save(payload, filtered)
+
+    with pytest.raises(ValueError, match="no active objects"):
+        build_presentation_catalog(filtered, catalog, output)
+
+
 
 
 def _ply(path: Path) -> None:

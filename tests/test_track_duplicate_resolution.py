@@ -11,8 +11,8 @@ SCRIPTS = str(ROOT / "scripts")
 if SCRIPTS not in sys.path:
     sys.path.insert(0, SCRIPTS)
 
-import resolve_farm_track_duplicates as dedup_module
-from resolve_farm_track_duplicates import (
+from scripts.geometry import resolve_farm_track_duplicates as dedup_module
+from scripts.geometry.resolve_farm_track_duplicates import (
     SameFrameMaskEvidence,
     TrackSplitEvidence,
     _classify_geometry_overwhelming_duplicate,

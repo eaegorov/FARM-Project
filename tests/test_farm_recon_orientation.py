@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 
 
-SCRIPT = Path(__file__).parents[1] / "scripts/refine_farm_recon_orientation.py"
+SCRIPT = Path(__file__).parents[1] / "scripts/geometry/refine_farm_recon_orientation.py"
 SPEC = importlib.util.spec_from_file_location("refine_farm_recon_orientation", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
 MODULE = importlib.util.module_from_spec(SPEC)

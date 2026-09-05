@@ -27,6 +27,10 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(_ROOT))
     sys.path.insert(0, str(_ROOT / "src"))
 
+from farm_runtime.obb_release_evidence import (  # noqa: E402
+    validate_serialized_obb_release_evidence,
+)
+
 from tools.farm_shaper_bridge.common import (  # noqa: E402
     CONFIG_SCHEMA,
     UNKNOWN_ID,
@@ -59,6 +63,11 @@ from tools.farm_shaper_bridge.lift_refinement import (  # noqa: E402
     apply_provisional_geometry_gate,
     refine_connected_claims,
 )
+
+
+PRE_LIFT_SELECTION_SCHEMA = "farm.pre-lift-eligibility-selection.v1"
+PRE_LIFT_IDS_FILENAME = "pre_lift_eligible_object_ids.txt"
+PRE_LIFT_SCOPE_SCHEMA = "farm.gaussian-lift.object-scope.v1"
 
 
 @dataclass
@@ -96,6 +105,37 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--plan-only", action="store_true")
     parser.add_argument("--smoke-object-id", type=int, action="append", default=[])
     parser.add_argument("--allow-legacy-run", action="store_true")
+    parser.add_argument(
+        "--object-id-file",
+        type=Path,
+        help=(
+            "Exact sorted unique release object IDs emitted by the pre-lift "
+            "eligibility selector; requires --pre-lift-selection"
+        ),
+    )
+    parser.add_argument(
+        "--pre-lift-selection",
+        type=Path,
+        help=(
+            "PASS farm.pre-lift-eligibility-selection.v1 report that owns "
+            "--object-id-file"
+        ),
+    )
+    parser.add_argument(
+        "--pre-lift-provenance-artifact",
+        type=Path,
+        action="append",
+        default=[],
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--full-colmap-fold-manifest",
+        type=Path,
+        help=(
+            "Optional external full-COLMAP train/heldout authority. When supplied, "
+            "every frame actually consumed by this lift must belong to its train fold."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -178,6 +218,11 @@ def _require_sections(config: Mapping[str, Any]) -> None:
     for key in ("obb_padding_m", "obb_padding_fraction", "depth_absolute_tolerance_m",
                 "depth_relative_tolerance", "radius_tolerance_multiplier"):
         finite("candidate", key, minimum=0)
+    if config["candidate"].get("domain", "obb") not in ("obb", "obb_mask_surface"):
+        raise ValueError("candidate.domain must be obb or obb_mask_surface")
+    if config["candidate"].get("domain", "obb") == "obb_mask_surface":
+        integer("candidate", "surface_pixel_stride", minimum=1)
+        finite("candidate", "surface_voxel_m", minimum=0, minimum_open=True)
     finite("candidate", "minimum_opacity", minimum=0, maximum=1)
     finite("candidate", "maximum_radius_m", minimum=0, minimum_open=True)
 
@@ -572,6 +617,509 @@ def make_split(run: RunData, config: Mapping[str, Any]) -> dict[str, Any]:
     return split
 
 
+def _exact_object_ids(
+    value: Any,
+    *,
+    label: str,
+    allow_empty: bool = False,
+) -> list[int]:
+    if not isinstance(value, list) or any(
+        isinstance(item, bool) or not isinstance(item, int) for item in value
+    ):
+        raise ValueError(f"{label} must be a sorted unique JSON integer list")
+    normalized = list(value)
+    if any(item < 0 for item in normalized):
+        raise ValueError(f"{label} contains a negative object ID")
+    if normalized != sorted(set(normalized)):
+        raise ValueError(f"{label} must be sorted and unique")
+    if not allow_empty and not normalized:
+        raise ValueError(f"{label} must not be empty for a release lift")
+    return normalized
+
+
+def _load_exact_object_id_artifact(path: Path) -> list[int]:
+    resolved = Path(path).expanduser().resolve(strict=True)
+    if not resolved.is_file():
+        raise ValueError(f"object ID artifact is not a regular file: {resolved}")
+    try:
+        text = resolved.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        raise ValueError("object ID artifact is not valid UTF-8") from exc
+    lines = text.splitlines()
+    values: list[int] = []
+    for line_number, line in enumerate(lines, start=1):
+        if not line or not line.isdecimal():
+            raise ValueError(
+                f"object ID artifact line {line_number} is not canonical decimal"
+            )
+        value = int(line)
+        if line != str(value):
+            raise ValueError(
+                f"object ID artifact line {line_number} is not canonical decimal"
+            )
+        values.append(value)
+    normalized = _exact_object_ids(values, label="object ID artifact")
+    canonical = "".join(f"{value}\n" for value in normalized)
+    if text != canonical:
+        raise ValueError(
+            "object ID artifact must contain exactly one canonical ID per line "
+            "and end with a newline"
+        )
+    return normalized
+
+
+def _sha256_value(value: Any, *, label: str) -> str:
+    digest = str(value or "")
+    if len(digest) != 64 or any(
+        character not in "0123456789abcdef" for character in digest
+    ):
+        raise ValueError(f"{label} is not a lowercase SHA256")
+    return digest
+
+
+def _artifact_descriptor_with_path(path: Path) -> dict[str, Any]:
+    resolved = Path(path).expanduser().resolve(strict=True)
+    return {
+        "path": str(resolved),
+        "bytes": resolved.stat().st_size,
+        "sha256": sha256_file(resolved),
+    }
+
+
+def _normalized_provenance_spec(
+    value: Any,
+    *,
+    label: str,
+) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{label} must be an object")
+    role = str(value.get("role") or "")
+    raw_path = str(value.get("path") or "")
+    if not role or not raw_path or not Path(raw_path).is_absolute():
+        raise ValueError(f"{label} must have a role and absolute source path")
+    raw_bytes = value.get("bytes")
+    if isinstance(raw_bytes, bool) or not isinstance(raw_bytes, int) or raw_bytes < 0:
+        raise ValueError(f"{label}.bytes must be a non-negative integer")
+    spec: dict[str, Any] = {
+        "role": role,
+        "path": raw_path,
+        "bytes": raw_bytes,
+        "sha256": _sha256_value(value.get("sha256"), label=f"{label}.sha256"),
+    }
+    if "input_index" in value:
+        raw_index = value.get("input_index")
+        if (
+            isinstance(raw_index, bool)
+            or not isinstance(raw_index, int)
+            or raw_index < 0
+        ):
+            raise ValueError(f"{label}.input_index must be non-negative")
+        spec["input_index"] = raw_index
+    return spec
+
+
+def validate_release_object_scope(
+    run: RunData,
+    selection_path: Path,
+    object_id_path: Path,
+    provenance_artifact_paths: Sequence[Path],
+) -> dict[str, Any]:
+    """Bind one exact pre-lift allowlist to the active FARM object universe.
+
+    The launcher mounts every source artifact declared by the selector at an
+    isolated read-only path. The signed lift implementation re-hashes those
+    mounts here, so stale or substituted eligibility evidence cannot authorize
+    Gaussian owners.
+    """
+
+    selection_resolved = Path(selection_path).expanduser().resolve(strict=True)
+    ids_resolved = Path(object_id_path).expanduser().resolve(strict=True)
+    if not selection_resolved.is_file() or not ids_resolved.is_file():
+        raise ValueError("pre-lift selection and object ID artifact must be files")
+    try:
+        selection = json.loads(selection_resolved.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError("pre-lift selection is not valid UTF-8 JSON") from exc
+    if not isinstance(selection, Mapping):
+        raise ValueError("pre-lift selection must be a JSON object")
+    if selection.get("schema") != PRE_LIFT_SELECTION_SCHEMA:
+        raise ValueError(
+            f"pre-lift selection schema must be {PRE_LIFT_SELECTION_SCHEMA}"
+        )
+    if selection.get("status") != "PASS":
+        raise ValueError("pre-lift selection status must be PASS")
+    if (
+        selection.get("selection_kind") != "pre_lift_eligibility_only"
+        or selection.get("gaussian_mask_improvement_proven") is not False
+    ):
+        raise ValueError("pre-lift selection kind/proof contract is invalid")
+
+    integrity = selection.get("integrity")
+    policy = selection.get("policy")
+    if (
+        not isinstance(integrity, Mapping)
+        or integrity.get("physical_timestamp_sets_disjoint") is not True
+        or integrity.get("train_heldout_physical_timestamp_overlap") != []
+        or not isinstance(policy, Mapping)
+        or policy.get("geometry_release_evidence_required") is not True
+        or policy.get(
+            "legacy_geometry_pass_without_release_evidence_is_not_publishable"
+        ) is not True
+        or policy.get("heldout_state_fit_authorized") is not False
+        or policy.get("train_heldout_physical_timestamp_overlap_forbidden")
+        is not True
+        or policy.get("post_lift_gaussian_mask_qc_required") is not True
+        or policy.get(
+            "pre_lift_eligibility_is_not_gaussian_mask_improvement_proof"
+        )
+        is not True
+    ):
+        raise ValueError("pre-lift selection fold/policy contract is incomplete")
+
+    eligible_ids = _exact_object_ids(
+        selection.get("eligible_object_ids"),
+        label="selection eligible_object_ids",
+    )
+    rejected_ids = _exact_object_ids(
+        selection.get("rejected_object_ids"),
+        label="selection rejected_object_ids",
+        allow_empty=True,
+    )
+    if set(eligible_ids).intersection(rejected_ids):
+        raise ValueError("selection eligible/rejected object IDs overlap")
+    rows = selection.get("objects")
+    if not isinstance(rows, list):
+        raise ValueError("pre-lift selection objects must be a list")
+    row_ids: list[int] = []
+    derived_eligible: list[int] = []
+    derived_rejected: list[int] = []
+    selection_rows_by_id: dict[int, Mapping[str, Any]] = {}
+    for index, row in enumerate(rows):
+        if not isinstance(row, Mapping):
+            raise ValueError(f"pre-lift selection object row {index} is invalid")
+        object_id = row.get("object_id")
+        if (
+            isinstance(object_id, bool)
+            or not isinstance(object_id, int)
+            or object_id < 0
+            or not isinstance(row.get("eligible"), bool)
+        ):
+            raise ValueError(f"pre-lift selection object row {index} is invalid")
+        row_ids.append(object_id)
+        selection_rows_by_id[object_id] = row
+        if row["eligible"]:
+            evidence_failures = validate_serialized_obb_release_evidence(
+                row.get("geometry_release_evidence")
+            )
+            if (
+                row.get("geometry_status") != "geometry_pass"
+                or row.get("reasons") != []
+                or evidence_failures
+            ):
+                raise ValueError(
+                    f"eligible object {object_id} lacks passed OBB release evidence"
+                )
+        (derived_eligible if row["eligible"] else derived_rejected).append(object_id)
+    if row_ids != sorted(set(row_ids)):
+        raise ValueError("pre-lift selection object rows must be sorted and unique")
+    if derived_eligible != eligible_ids or derived_rejected != rejected_ids:
+        raise ValueError(
+            "selection eligible/rejected IDs contradict its object rows"
+        )
+
+    exact_ids = _load_exact_object_id_artifact(ids_resolved)
+    if exact_ids != eligible_ids:
+        raise ValueError(
+            "object ID artifact does not exactly equal eligible_object_ids"
+        )
+    outputs = selection.get("outputs")
+    exact_output = (
+        outputs.get("exact_object_ids") if isinstance(outputs, Mapping) else None
+    )
+    if not isinstance(exact_output, Mapping):
+        raise ValueError("pre-lift selection lacks exact object ID output provenance")
+    relative = Path(str(exact_output.get("relative_path") or ""))
+    if (
+        relative.as_posix() != PRE_LIFT_IDS_FILENAME
+        or ids_resolved != (selection_resolved.parent / relative).resolve(strict=True)
+        or exact_output.get("format") != "one_decimal_object_id_per_line"
+        or isinstance(exact_output.get("bytes"), bool)
+        or exact_output.get("bytes") != ids_resolved.stat().st_size
+        or _sha256_value(
+            exact_output.get("sha256"), label="object ID artifact SHA256"
+        )
+        != sha256_file(ids_resolved)
+    ):
+        raise ValueError("object ID artifact does not match selection provenance")
+
+    active_ids = sorted(obj.object_id for obj in run.objects)
+    if active_ids != sorted(set(active_ids)):
+        raise ValueError("active FARM object universe is not unique")
+    inactive_eligible = sorted(set(eligible_ids).difference(active_ids))
+    if inactive_eligible:
+        raise ValueError(
+            f"eligible object IDs are inactive/absent: {inactive_eligible}"
+        )
+    active_ids_not_in_selection = sorted(set(active_ids).difference(row_ids))
+    forced_exclusion_audit = [
+        {
+            "object_id": object_id,
+            "eligible": False,
+            "reason": "missing_from_full_train_refinement_universe",
+        }
+        for object_id in active_ids_not_in_selection
+    ]
+    scope_audited_ids = set(row_ids).union(
+        row["object_id"] for row in forced_exclusion_audit
+    )
+    unaudited_active = sorted(set(active_ids).difference(scope_audited_ids))
+    if unaudited_active:
+        raise ValueError(
+            f"active FARM object IDs are not audited by selection: {unaudited_active}"
+        )
+
+    provenance = selection.get("provenance")
+    inputs = provenance.get("inputs") if isinstance(provenance, Mapping) else None
+    consumed = (
+        provenance.get("consumed_artifacts")
+        if isinstance(provenance, Mapping)
+        else None
+    )
+    if not isinstance(inputs, list) or not inputs:
+        raise ValueError("pre-lift selection lacks source input provenance")
+    if not isinstance(consumed, list) or not consumed:
+        raise ValueError("pre-lift selection lacks consumed artifact provenance")
+    consumed_specs = [
+        _normalized_provenance_spec(value, label=f"consumed artifact {index}")
+        for index, value in enumerate(consumed)
+    ]
+    if consumed_specs != sorted(
+        consumed_specs, key=lambda spec: (spec["role"], spec["path"])
+    ):
+        raise ValueError("consumed artifact provenance is not canonically sorted")
+    declared_paths = [spec["path"] for spec in consumed_specs]
+    if len(declared_paths) != len(set(declared_paths)):
+        raise ValueError("consumed artifact provenance contains duplicate paths")
+    mounted = [
+        Path(path).expanduser().resolve(strict=True)
+        for path in provenance_artifact_paths
+    ]
+    if len(mounted) != len(consumed_specs):
+        raise ValueError(
+            "mounted provenance artifact count does not match selection"
+        )
+    for index, (spec, path) in enumerate(zip(consumed_specs, mounted, strict=True)):
+        if not path.is_file():
+            raise ValueError(f"mounted provenance artifact {index} is not a file")
+        if path.stat().st_size != spec["bytes"]:
+            raise ValueError(f"source input size mismatch: {spec['path']}")
+        if sha256_file(path) != spec["sha256"]:
+            raise ValueError(f"source input SHA256 mismatch: {spec['path']}")
+
+    input_specs = [
+        _normalized_provenance_spec(value, label=f"source input {index}")
+        for index, value in enumerate(inputs)
+    ]
+    consumed_by_path = {
+        spec["path"]: (spec, mounted[index])
+        for index, spec in enumerate(consumed_specs)
+    }
+    for spec in input_specs:
+        consumed_match = consumed_by_path.get(spec["path"])
+        if consumed_match is None or consumed_match[0] != spec:
+            raise ValueError("source input provenance is not exactly consumed")
+    by_role: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for spec in input_specs:
+        by_role[spec["role"]].append(spec)
+    expected_roles = {
+        "train_refinement_result",
+        "geometry_audit",
+        "heldout_reference_result",
+    }
+    if set(by_role) != expected_roles:
+        raise ValueError("pre-lift source input roles are incomplete or unknown")
+    if (
+        len(by_role["train_refinement_result"]) != 1
+        or by_role["train_refinement_result"][0].get("input_index") != 0
+        or len(by_role["geometry_audit"]) != 1
+        or by_role["geometry_audit"][0].get("input_index") != 0
+        or [
+            spec.get("input_index")
+            for spec in by_role["heldout_reference_result"]
+        ]
+        != list(range(len(by_role["heldout_reference_result"])))
+    ):
+        raise ValueError("pre-lift source input indices are not canonical")
+
+    train_spec = by_role["train_refinement_result"][0]
+    train_mount = consumed_by_path[train_spec["path"]][1]
+    try:
+        train_payload = json.loads(train_mount.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError("train refinement source input is not valid JSON") from exc
+    train_rows = (
+        train_payload.get("objects") if isinstance(train_payload, Mapping) else None
+    )
+    if (
+        not isinstance(train_payload, Mapping)
+        or train_payload.get("schema") != "farm.full-colmap-mask-refinement.v1"
+        or train_payload.get("status") != "PASS"
+        or train_payload.get("refinement_role") != "train_fit"
+        or not isinstance(train_rows, list)
+    ):
+        raise ValueError("train refinement source contract is invalid")
+    train_ids: list[int] = []
+    for row in train_rows:
+        if not isinstance(row, Mapping):
+            raise ValueError("train refinement object universe is invalid")
+        object_id = row.get("object_id")
+        if (
+            isinstance(object_id, bool)
+            or not isinstance(object_id, int)
+            or object_id < 0
+        ):
+            raise ValueError("train refinement object universe is invalid")
+        train_ids.append(object_id)
+    if len(train_ids) != len(set(train_ids)) or sorted(train_ids) != row_ids:
+        raise ValueError(
+            "selection object universe is not bound to train refinement input"
+        )
+
+    geometry_spec = by_role["geometry_audit"][0]
+    geometry_mount = consumed_by_path[geometry_spec["path"]][1]
+    try:
+        geometry_payload = json.loads(geometry_mount.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError("geometry audit source input is not valid JSON") from exc
+    geometry_rows = (
+        geometry_payload.get("objects")
+        if isinstance(geometry_payload, Mapping)
+        else None
+    )
+    if (
+        not isinstance(geometry_payload, Mapping)
+        or geometry_payload.get("schema") != "farm.object-geometry-audit.v3"
+        or not isinstance(geometry_rows, list)
+    ):
+        raise ValueError("geometry audit source contract is invalid")
+    geometry_by_id: dict[int, Mapping[str, Any]] = {}
+    for row in geometry_rows:
+        if not isinstance(row, Mapping):
+            raise ValueError("geometry audit object rows are invalid")
+        object_id = row.get("object_id")
+        if (
+            isinstance(object_id, bool)
+            or not isinstance(object_id, int)
+            or object_id < 0
+            or object_id in geometry_by_id
+        ):
+            raise ValueError("geometry audit object rows are invalid")
+        geometry_by_id[object_id] = row
+    for object_id in eligible_ids:
+        geometry_row = geometry_by_id.get(object_id)
+        selection_evidence = selection_rows_by_id[object_id].get(
+            "geometry_release_evidence"
+        )
+        if (
+            geometry_row is None
+            or geometry_row.get("status") != "geometry_pass"
+            or validate_serialized_obb_release_evidence(
+                geometry_row.get("train_geometry_evidence")
+            )
+            or geometry_row.get("train_geometry_evidence") != selection_evidence
+        ):
+            raise ValueError(
+                f"eligible object {object_id} is not bound to passed geometry audit evidence"
+            )
+    for spec in input_specs:
+        payload_path = consumed_by_path[spec["path"]][1]
+        try:
+            payload = json.loads(payload_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            continue
+        if (
+            isinstance(payload, Mapping)
+            and payload.get("scene_id") is not None
+            and str(payload.get("scene_id")) != run.scene_id
+        ):
+            raise ValueError(
+                f"source input scene_id mismatch for role {spec['role']}"
+            )
+
+    return {
+        "schema": PRE_LIFT_SCOPE_SCHEMA,
+        "status": "PASS",
+        "mode": "pre_lift_release_allowlist",
+        "active_object_ids": eligible_ids,
+        "excluded_active_object_ids": sorted(
+            set(active_ids).difference(eligible_ids)
+        ),
+        "inactive_rejected_object_ids": sorted(
+            set(rejected_ids).difference(active_ids)
+        ),
+        "active_ids_not_in_selection": active_ids_not_in_selection,
+        "forced_exclusion_audit": forced_exclusion_audit,
+        "source_active_object_ids": active_ids,
+        "selection_object_ids": row_ids,
+        "source_active_object_universe_sha256": canonical_sha256(
+            {"object_ids": active_ids}
+        ),
+        "selection_object_universe_sha256": canonical_sha256(
+            {"object_ids": row_ids}
+        ),
+        "artifacts": {
+            "object_id_file": _artifact_descriptor_with_path(ids_resolved),
+            "pre_lift_selection": _artifact_descriptor_with_path(
+                selection_resolved
+            ),
+        },
+        "source_inputs": input_specs,
+        "consumed_artifact_count": len(consumed_specs),
+        "consumed_artifacts_sha256": canonical_sha256(consumed_specs),
+    }
+
+
+def restrict_release_scope(
+    run: RunData,
+    split: Mapping[str, Any],
+    scope: Mapping[str, Any],
+) -> tuple[RunData, dict[str, Any]]:
+    selected = set(
+        _exact_object_ids(
+            scope.get("active_object_ids"),
+            label="release scope active_object_ids",
+        )
+    )
+    scoped_objects = tuple(obj for obj in run.objects if obj.object_id in selected)
+    scoped_split = dict(split)
+    scoped_split["objects"] = [
+        dict(row) for row in split["objects"] if int(row["object_id"]) in selected
+    ]
+    if len(scoped_objects) != len(selected) or len(scoped_split["objects"]) != len(selected):
+        raise AssertionError("release scope is not one-to-one with full-run split rows")
+    scoped_split["scope"] = "release_allowlist_subset_of_canonical_full_split"
+    scoped_split["full_object_count"] = len(run.objects)
+    scoped_split["active_object_ids"] = sorted(selected)
+    return replace(run, objects=scoped_objects), scoped_split
+
+
+def assert_gaussian_owner_scope(
+    labels: np.ndarray,
+    active_object_ids: Sequence[int],
+    *,
+    label: str,
+) -> None:
+    allowed = {int(value) for value in active_object_ids}
+    owners = {
+        int(value)
+        for value in np.unique(np.asarray(labels, dtype=np.int64))
+        if int(value) != UNKNOWN_ID
+    }
+    unexpected = sorted(owners.difference(allowed))
+    if unexpected:
+        raise AssertionError(f"{label} contains excluded Gaussian owners: {unexpected}")
+
+
 def restrict_smoke_scope(
     run: RunData,
     split: Mapping[str, Any],
@@ -639,6 +1187,13 @@ def build_candidates(
             indices = np.sort(approximate[inside])
         else:
             indices = np.zeros(0, dtype=np.int64)
+        obb_count = len(indices)
+        expansion = {"domain": policy.get("domain", "obb"), "obb_candidates": obb_count}
+        if policy.get("domain", "obb") == "obb_mask_surface":
+            surface_ids, surface_audit = mask_surface_candidates(run, obj, gaussians, split, config)
+            indices = np.union1d(indices, surface_ids)
+            expansion.update(surface_audit)
+            expansion["added_outside_obb"] = len(indices) - obb_count
         count = len(indices)
         evidence[obj.object_id] = ObjectEvidence(
             obj=obj,
@@ -658,10 +1213,46 @@ def build_candidates(
             "object_id": obj.object_id,
             "category": obj.category,
             "candidate_gaussians": count,
+            "search": expansion,
             "obb_padding_m": padding.astype(float).tolist(),
         })
     del tree
     return evidence, rows
+
+
+def mask_surface_candidates(run, obj, gaussians, split, config):
+    from tools.farm_shaper_bridge.lift_candidates import backproject_mask_surface, surface_candidate_indices
+    policy = config["candidate"]
+    # The same global physical-timestamp split owns both candidate construction
+    # and VJP fitting. Per-object observations cannot override the heldout fold.
+    allowed = set(split["build_timestamps"])
+    grouped = defaultdict(list)
+    for observation in obj.observations:
+        frame = run.frame(observation.image_id)
+        if frame.physical_timestamp in allowed:
+            grouped[frame.image_id].append(observation)
+    seeds, sources = [], []
+    max_depth, max_spacing = 0., 0.
+    for image_id, observations in sorted(grouped.items()):
+        frame = run.frame(image_id)
+        decoded, _, audit, depth_audit = _load_view_masks(run, frame, {obj.object_id: observations}, config)
+        depth = np.load(frame.depth_path, mmap_mode="r")
+        mask = decoded[obj.object_id]["raw"] & _surface_interior(depth, run, config)
+        points, far_depth, spacing = backproject_mask_surface(mask, depth, frame.K, frame.T_world_cam,
+            stride=int(policy["surface_pixel_stride"]), depth_min=float(run.rgbd_config["depth_min_m"]),
+            depth_max=float(run.rgbd_config["depth_max_m"]))
+        seeds.append(points)
+        max_depth, max_spacing = max(max_depth, far_depth), max(max_spacing, spacing)
+        sources.append({"image_id": image_id, "physical_timestamp": frame.physical_timestamp,
+                        "seed_points": len(points), "masks": audit, "depth": depth_audit})
+    seeds_array = np.concatenate(seeds) if seeds else np.empty((0, 3))
+    tolerance = float(policy["depth_absolute_tolerance_m"]) + float(policy["depth_relative_tolerance"])*max_depth + max_spacing
+    indices, audit = surface_candidate_indices(gaussians.means_m, gaussians.radius_m, gaussians.opacity_cpu,
+        seeds_array, minimum_opacity=float(policy["minimum_opacity"]), maximum_radius=float(policy["maximum_radius_m"]),
+        radius_multiplier=float(policy["radius_tolerance_multiplier"]), surface_tolerance=tolerance,
+        voxel_size=float(policy["surface_voxel_m"]))
+    return indices, {**audit, "surface_candidates": len(indices), "source_views": sources,
+                     "heldout_consumed": False, "ownership": "requires unchanged exact VJP and multiview gates"}
 
 
 def _surface_interior(depth: np.ndarray, run: RunData, config: Mapping[str, Any]) -> np.ndarray:
@@ -742,7 +1333,7 @@ def _load_view_masks(
         item["positive_weight"] = positive * normalizer
         item["negative_weight"] = negative.astype(np.float32) * normalizer
     depth_audit = {
-        "path": frame.depth_path.relative_to(run.run_dir).as_posix(),
+        "path": (frame.depth_path.relative_to(run.run_dir).as_posix() if frame.depth_path.is_relative_to(run.run_dir) else frame.depth_path.as_posix()),
         "bytes": frame.depth_path.stat().st_size,
         "sha256": sha256_file(frame.depth_path),
     }
@@ -1347,15 +1938,73 @@ def save_final(
     return artifacts, csr
 
 
+def release_scope_can_publish(
+    run: RunData,
+    external_fit_contract: Mapping[str, Any] | None,
+    release_scope: Mapping[str, Any] | None,
+    *,
+    smoke: bool,
+) -> bool:
+    """Return the provenance-only release predicate, independent of quality."""
+
+    return bool(
+        not run.legacy
+        and external_fit_contract is not None
+        and release_scope is not None
+        and not smoke
+    )
+
+
 def execute(args: argparse.Namespace) -> dict[str, Any] | None:
     started = time.perf_counter()
+    smoke_ids = list(getattr(args, "smoke_object_id", []))
+    smoke = bool(smoke_ids)
+    object_id_path = getattr(args, "object_id_file", None)
+    selection_path = getattr(args, "pre_lift_selection", None)
+    provenance_paths = list(
+        getattr(args, "pre_lift_provenance_artifact", [])
+    )
+    if (object_id_path is None) != (selection_path is None):
+        raise ValueError(
+            "--object-id-file and --pre-lift-selection must be supplied together"
+        )
+    if smoke and selection_path is not None:
+        raise ValueError(
+            "--smoke-object-id is incompatible with the release object allowlist"
+        )
+
+    if selection_path is None and provenance_paths:
+        raise ValueError(
+            "--pre-lift-provenance-artifact requires --pre-lift-selection"
+        )
+
     config, config_sha = load_config(args.config)
     run = load_run(args.run, allow_legacy=bool(args.allow_legacy_run))
+    release_scope: dict[str, Any] | None = None
+    if selection_path is not None and object_id_path is not None:
+        release_scope = validate_release_object_scope(
+            run,
+            selection_path,
+            object_id_path,
+            provenance_paths,
+        )
+    external_fit_contract: dict[str, Any] | None = None
+    if args.full_colmap_fold_manifest is not None:
+        from tools.farm_shaper_bridge.full_colmap_fit_contract import (
+            validate_full_colmap_train_fit,
+        )
+
+        external_fit_contract = validate_full_colmap_train_fit(
+            run, args.full_colmap_fold_manifest
+        )
     # Freeze the global physical-timestamp partition against every final FARM
-    # object before an optional non-release smoke scope is applied.
+    # object before an optional scoped run is applied.
     split = make_split(run, config)
-    if args.smoke_object_id:
-        run, split = restrict_smoke_scope(run, split, args.smoke_object_id)
+    if release_scope is not None:
+        run, split = restrict_release_scope(run, split, release_scope)
+    elif smoke:
+        run, split = restrict_smoke_scope(run, split, smoke_ids)
+    active_object_ids = sorted(obj.object_id for obj in run.objects)
     table = open_graphdeco_ply(args.ply)
     preflight_fingerprint = verify_run_ply_fingerprint(run, table.path)
     prep_summary = json.loads((run.run_dir / "rgbd" / "prep_summary.json").read_text(encoding="utf-8"))
@@ -1365,10 +2014,13 @@ def execute(args: argparse.Namespace) -> dict[str, Any] | None:
         "schema_version": "farm.gaussian-lift.plan.v1",
         "scene_id": run.scene_id,
         "legacy_run": run.legacy,
-        "smoke_object_ids": sorted(set(args.smoke_object_id)),
+        "smoke_object_ids": sorted(set(smoke_ids)),
+        "active_object_ids": active_object_ids,
+        "object_scope": release_scope,
         "release_eligible": (
-            not run.legacy
-            and not bool(args.smoke_object_id)
+            release_scope_can_publish(
+                run, external_fit_contract, release_scope, smoke=smoke
+            )
             and config["release"].get("calibrated") is True
             and os.environ.get("FARM_BRIDGE_SOURCE_DIRTY") == "false"
             and bool(os.environ.get("FARM_BRIDGE_SOURCE_COMMIT"))
@@ -1384,6 +2036,8 @@ def execute(args: argparse.Namespace) -> dict[str, Any] | None:
         "build_timestamps": len(split["build_timestamps"]),
         "heldout_timestamps": len(split["heldout_timestamps"]),
         "config_sha256": config_sha,
+        "frozen_full_colmap_fit_contract": external_fit_contract,
+        "release_object_allowlist": release_scope,
         "split": split,
     }
     if args.plan_only:
@@ -1466,6 +2120,9 @@ def execute(args: argparse.Namespace) -> dict[str, Any] | None:
     )
     conflicts.update(geometry_gate_audit)
     refinement_seconds = time.perf_counter() - refinement_started
+    assert_gaussian_owner_scope(
+        provisional, active_object_ids, label="provisional labels"
+    )
     provisional_artifacts = save_provisional(
         output, provisional, provisional_confidence, provisional_support
     )
@@ -1474,6 +2131,8 @@ def execute(args: argparse.Namespace) -> dict[str, Any] | None:
         "schema_version": "farm.gaussian-lift.build.v1",
         "status": "frozen_pending_heldout",
         "scene_id": run.scene_id,
+        "active_object_ids": active_object_ids,
+        "object_scope": release_scope,
         "created_utc": utc_now(),
         "config_sha256": config_sha,
         "source_ply_sha256": source_sha,
@@ -1509,6 +2168,8 @@ def execute(args: argparse.Namespace) -> dict[str, Any] | None:
         "schema_version": "farm.gaussian-lift.heldout-qc.v1",
         "status": "complete",
         "scene_id": run.scene_id,
+        "active_object_ids": active_object_ids,
+        "object_scope": release_scope,
         "created_utc": utc_now(),
         "config_sha256": config_sha,
         "frozen_build_manifest_sha256": frozen_manifest_sha,
@@ -1534,8 +2195,15 @@ def execute(args: argparse.Namespace) -> dict[str, Any] | None:
     labels, confidence, support, status = finalize_dense(
         provisional, provisional_confidence, provisional_support, object_qc
     )
+    assert_gaussian_owner_scope(
+        labels, active_object_ids, label="verified labels"
+    )
     final_artifacts, csr = save_final(output, labels, confidence, support, status)
-    smoke = bool(args.smoke_object_id)
+    assert_gaussian_owner_scope(
+        np.asarray(csr["object_ids"], dtype=np.int64),
+        active_object_ids,
+        label="verified instance bank",
+    )
     labeled_manifest: dict[str, Any] | None = None
     if not smoke:
         labeled_manifest = write_full_labeled_ply(
@@ -1571,6 +2239,8 @@ def execute(args: argparse.Namespace) -> dict[str, Any] | None:
     )
     release_policy = config["release"]
     quality_reasons: list[str] = []
+    if release_scope is None:
+        quality_reasons.append("pre_lift_release_selection_missing")
     if bool(inventory.get("runtime_interpreter_fallback")):
         quality_reasons.append("legacy_runtime_interpreter_fallback")
     if release_policy.get("calibrated") is not True:
@@ -1583,7 +2253,11 @@ def execute(args: argparse.Namespace) -> dict[str, Any] | None:
         quality_reasons.append("verified_strict_fraction_below_release_threshold")
     quality_pass = not quality_reasons
     release_eligible = (
-        not run.legacy and not smoke and clean_snapshot and quality_pass
+        release_scope_can_publish(
+            run, external_fit_contract, release_scope, smoke=smoke
+        )
+        and clean_snapshot
+        and quality_pass
     )
     result = {
         "schema_version": "farm.gaussian-lift.result.v1",
@@ -1605,7 +2279,10 @@ def execute(args: argparse.Namespace) -> dict[str, Any] | None:
         },
         "release_eligible": release_eligible,
         "scene_id": run.scene_id,
+        "active_object_ids": active_object_ids,
+        "object_scope": release_scope,
         "created_utc": utc_now(),
+        "frozen_full_colmap_fit_contract": external_fit_contract,
         "inputs": {
             "farm_run": str(run.run_dir),
             "farm_success_sha256": run.success_sha256,
@@ -1619,8 +2296,23 @@ def execute(args: argparse.Namespace) -> dict[str, Any] | None:
             "source_gaussian_count": table.count,
             "config": str(args.config.expanduser().resolve()),
             "config_sha256": config_sha,
+            "object_id_file": (
+                str(Path(object_id_path).expanduser().resolve())
+                if object_id_path is not None else None
+            ),
+            "pre_lift_selection": (
+                str(Path(selection_path).expanduser().resolve())
+                if selection_path is not None else None
+            ),
+            "full_colmap_fold_manifest": (
+                str(args.full_colmap_fold_manifest.expanduser().resolve())
+                if args.full_colmap_fold_manifest is not None
+                else None
+            ),
         },
         "contracts": {
+            "release_object_allowlist_validated": release_scope is not None,
+            "excluded_objects_cannot_own_gaussians": True,
             "exact_pinned_gsplat_contributor_vjp": True,
             "native_frame_resolution": True,
             "global_physical_timestamp_holdout": True,
@@ -1686,6 +2378,10 @@ def execute(args: argparse.Namespace) -> dict[str, Any] | None:
         "status": "success",
         "release_eligible": release_eligible,
         "scene_id": run.scene_id,
+        "active_object_ids": active_object_ids,
+        "object_scope_artifacts": (
+            release_scope["artifacts"] if release_scope is not None else None
+        ),
         "result": "result.json",
         "result_sha256": sha256_file(output / "result.json"),
         "source_ply_sha256": source_sha,

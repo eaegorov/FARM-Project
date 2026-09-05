@@ -12,12 +12,14 @@ import yaml
 
 from farm_runtime.config import canonical_json
 from farm_runtime.unified_viewer import (
+    OBJECT_SELECTOR_PLACEHOLDER,
     SceneValidationFailure,
     UnifiedViserViewer,
     UnifiedViewerError,
     _canonical_sampled_sha256,
     _markdown_text,
     camera_presets,
+    filter_object_gaussian_splats,
     focus_pose,
     is_loopback_host,
     load_bridge_instances,
@@ -26,11 +28,55 @@ from farm_runtime.unified_viewer import (
     load_farm_preview,
     load_gaussian_splat_arrays,
     load_registry,
+    object_axis_pose,
+    object_id_from_selector,
+    object_selector_options,
     open_binary_ply,
     sha256_file,
     validate_registry,
     viewer_exposure_warning,
 )
+
+
+def test_filter_object_gaussian_splats_preserves_alignment() -> None:
+    centers = np.arange(15, dtype=np.float32).reshape(5, 3)
+    covariances = np.repeat(np.eye(3, dtype=np.float32)[None], 5, axis=0)
+    rgbs = np.arange(15, dtype=np.uint8).reshape(5, 3)
+    opacities = np.linspace(0.1, 0.5, 5, dtype=np.float32).reshape(5, 1)
+    labels = np.asarray([4, 8, 4, 9, 4], dtype=np.int32)
+    selected = filter_object_gaussian_splats(
+        centers, covariances, rgbs, opacities, labels, 4
+    )
+    assert selected[0].shape == (3, 3)
+    assert np.array_equal(selected[0], centers[[0, 2, 4]])
+    assert np.array_equal(selected[4], [4, 4, 4])
+    assert all(array.flags.c_contiguous for array in selected)
+    with pytest.raises(UnifiedViewerError, match="absent for object #7"):
+        filter_object_gaussian_splats(
+            centers, covariances, rgbs, opacities, labels, 7
+        )
+
+
+def test_object_selector_options_are_stable_and_parse_ids() -> None:
+    options = object_selector_options([
+        {"id": 185, "category": "pallet"},
+        {"id": 16, "category": "cleaning\nmachine"},
+    ])
+    assert options == (
+        OBJECT_SELECTOR_PLACEHOLDER,
+        "#16 · cleaning machine",
+        "#185 · pallet",
+    )
+    assert object_id_from_selector(options[1]) == 16
+    assert object_id_from_selector(OBJECT_SELECTOR_PLACEHOLDER) is None
+
+
+def test_object_selector_rejects_duplicate_ids() -> None:
+    with pytest.raises(UnifiedViewerError, match="duplicate object id"):
+        object_selector_options([
+            {"id": 4, "category": "cabinet"},
+            {"id": 4, "category": "server"},
+        ])
 
 
 def _write_json(path: Path, value: object) -> None:
@@ -391,6 +437,30 @@ def _make_dense_lift(root: Path, run: Path, source: Path) -> None:
         "source_ply_sha256": sha256_file(source),
         "config_sha256": "1" * 64,
     })
+
+
+def _make_calibrated_provenance_nonrelease_lift(
+    root: Path, run: Path, source: Path
+) -> None:
+    _make_dense_lift(root, run, source)
+    result_path = root / "result.json"
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    result["release_eligible"] = False
+    result["contracts"]["clean_versioned_source_snapshot"] = False
+    result["quality_gate"] = {
+        "calibrated": True,
+        "passed": True,
+        "reasons": [],
+    }
+    result["runtime"] = {"source_dirty": "true"}
+    _write_json(result_path, result)
+
+    canonical_marker = root / "_SUCCESS.json"
+    marker = json.loads(canonical_marker.read_text(encoding="utf-8"))
+    marker["release_eligible"] = False
+    marker["result_sha256"] = sha256_file(result_path)
+    _write_json(root / "_NONRELEASE_SUCCESS.json", marker)
+    canonical_marker.unlink()
 
 
 def _make_legacy_bridge(root: Path, run: Path, source: Path) -> None:
@@ -778,6 +848,50 @@ def test_canonical_dense_lift_requires_exact_run_source_and_original_indices(tmp
     assert "different FARM" in scene.layers["dense_lift"].reason
 
 
+def test_calibrated_provenance_nonrelease_dense_lift_is_review_only(
+    tmp_path: Path,
+) -> None:
+    run, source = _make_run(tmp_path)
+    dense = tmp_path / "dense"
+    _make_calibrated_provenance_nonrelease_lift(dense, run, source)
+    registry = _write_registry(tmp_path, run, source, dense_roots=[dense])
+
+    validation = validate_registry(registry, verify_full_source=True)
+
+    assert validation.ok
+    scene = validation.ready_scenes[0]
+    assert scene.review_lift is not None
+    assert not scene.review_lift.release_eligible
+    assert not scene.layers["dense_lift"].ready
+    assert scene.layers["exact_lift_review"].ready
+    assert scene.layers["exact_lift_review"].warning
+    assert "calibrated quality PASS; provenance nonrelease" in (
+        scene.layers["exact_lift_review"].reason
+    )
+
+
+def test_calibrated_nonrelease_without_dirty_provenance_fails_closed(
+    tmp_path: Path,
+) -> None:
+    run, source = _make_run(tmp_path)
+    dense = tmp_path / "dense"
+    _make_calibrated_provenance_nonrelease_lift(dense, run, source)
+    result_path = dense / "result.json"
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    result["runtime"]["source_dirty"] = "false"
+    _write_json(result_path, result)
+    marker_path = dense / "_NONRELEASE_SUCCESS.json"
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    marker["result_sha256"] = sha256_file(result_path)
+    _write_json(marker_path, marker)
+    registry = _write_registry(tmp_path, run, source, dense_roots=[dense])
+
+    scene = validate_registry(registry).ready_scenes[0]
+
+    assert not scene.layers["exact_lift_review"].ready
+    assert "neither an explicit uncalibrated result" in scene.layers["exact_lift_review"].reason
+
+
 @pytest.mark.parametrize(
     ("case", "message"),
     [
@@ -851,6 +965,20 @@ def test_dense_verified_csr_cross_checks_hashed_source_order_sidecars(
     scene = validate_registry(registry).ready_scenes[0]
     assert not scene.layers["dense_lift"].ready
     assert message in scene.layers["dense_lift"].reason
+
+
+def test_object_axis_pose_frames_selected_object_deterministically() -> None:
+    bounds = np.asarray([[1.0, 2.0, 3.0], [3.0, 4.0, 7.0]], dtype=np.float32)
+    front = object_axis_pose(bounds, [0.0, -1.0, 0.0], "front")
+    side = object_axis_pose(bounds, [0.0, -1.0, 0.0], "side")
+    top = object_axis_pose(bounds, [0.0, -1.0, 0.0], "top")
+    for pose in (front, side, top):
+        assert np.allclose(pose[1], [2.0, 3.0, 5.0])
+        assert np.isfinite(np.concatenate(pose)).all()
+    assert not np.allclose(front[0], side[0])
+    assert not np.allclose(side[0], top[0])
+    with pytest.raises(UnifiedViewerError, match="unsupported object axis view"):
+        object_axis_pose(bounds, [0.0, -1.0, 0.0], "diagonal")
 
 
 def test_registry_schema_camera_presets_and_focus_are_deterministic(tmp_path: Path) -> None:

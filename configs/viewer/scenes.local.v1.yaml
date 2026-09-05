@@ -7,8 +7,8 @@ schema_version: farm.unified-viewer-registry.v1
 scenes:
   - scene_id: factory
     label: Factory
-    farm_run: ../../../output/farm_pipeline/factory/latest
-    source_ply: ../../../data/factory_scene_last.ply
+    farm_run: ../../../output/farm_pipeline/factory/runs/factory-production-v7-rescue
+    source_ply: ../../../data/factory_3dgs_scene.ply
     source_fingerprint:
       algorithm: sha256
       digest: fdc6fc3fff65812234ee663bd8d42d48ba5a524ea0a9a429b4269e624bd3fe92
@@ -19,19 +19,3 @@ scenes:
       - ../../../output/farm_gaussian_lift/factory
     shaper_roots:
       - ../../../output/farm_shaper_bridge/factory
-
-  - scene_id: knaack
-    label: Knaack
-    legacy_review_mode: false
-    farm_run: ../../../output/farm_pipeline/knaack/latest
-    source_ply: ../../../gcloud_splatica/pipeline-9389769e-9863-4c72-bb87-02d1ad9b3cdd/uuid500/gaussian_result/point_cloud_last.ply
-    source_fingerprint:
-      algorithm: sha256
-      digest: aaca9f5b2929a359ac78545e4eada0248e0dfd60c8bc58a84dc89565827654f2
-      size_bytes: 2089536274
-    bridge_roots:
-      - ../../../output/farm_shaper_bridge/knaack
-    dense_lift_roots:
-      - ../../../output/farm_gaussian_lift/knaack
-    shaper_roots:
-      - ../../../output/farm_shaper_bridge/knaack

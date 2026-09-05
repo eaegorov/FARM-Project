@@ -20,10 +20,14 @@ CANONICAL_PREP_PYTHON = "/opt/conda/envs/rest3d/bin/python"
 IMAGE_ID_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 GPU_RE = re.compile(r"^[0-9]+(?:,[0-9]+)*$")
 COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
+PRE_LIFT_SELECTION_SCHEMA = "farm.pre-lift-eligibility-selection.v1"
+PRE_LIFT_IDS_FILENAME = "pre_lift_eligible_object_ids.txt"
 REQUIRED_LIFT_SOURCE = (
     "tools/farm_shaper_bridge/common.py",
     "tools/farm_shaper_bridge/gaussian_lift.py",
+    "tools/farm_shaper_bridge/full_colmap_fit_contract.py",
     "tools/farm_shaper_bridge/lift_refinement.py",
+    "tools/farm_shaper_bridge/lift_candidates.py",
     "configs/gaussian_lift.v1.yaml",
 )
 
@@ -42,6 +46,31 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--plan-only", action="store_true")
     parser.add_argument("--smoke-object-id", type=int, action="append", default=[])
     parser.add_argument("--allow-legacy-run", action="store_true")
+    parser.add_argument(
+        "--object-id-file",
+        type=Path,
+        help=(
+            "Exact sorted unique IDs emitted by --pre-lift-selection; both "
+            "arguments are required for a release-grade lift"
+        ),
+    )
+    parser.add_argument(
+        "--pre-lift-selection",
+        type=Path,
+        help=(
+            "PASS farm.pre-lift-eligibility-selection.v1 provenance report; "
+            "requires --object-id-file"
+        ),
+    )
+    parser.add_argument("--full-colmap-fold-manifest", type=Path)
+    parser.add_argument(
+        "--allow-rebuilt-image-nonrelease",
+        action="store_true",
+        help=(
+            "Allow an installed prep image whose digest differs from the source run; "
+            "the lift is forcibly marked non-release"
+        ),
+    )
     parser.add_argument("--print-command", action="store_true")
     return parser.parse_args(argv)
 
@@ -133,6 +162,124 @@ def _mount(source: Path, target: str, *, readonly: bool) -> str:
     return value + (",readonly" if readonly else "")
 
 
+def _host_artifact(path: Path) -> dict[str, Any]:
+    resolved = path.expanduser().resolve(strict=True)
+    return {
+        "path": str(resolved),
+        "bytes": resolved.stat().st_size,
+        "sha256": _sha256_file(resolved),
+    }
+
+
+def prepare_release_selection_inputs(
+    object_id_file: Path | None,
+    pre_lift_selection: Path | None,
+) -> dict[str, Any] | None:
+    """Resolve and preflight exact release selection inputs for Docker mounts."""
+
+    if (object_id_file is None) != (pre_lift_selection is None):
+        raise ValueError(
+            "--object-id-file and --pre-lift-selection must be supplied together"
+        )
+    if object_id_file is None or pre_lift_selection is None:
+        return None
+    selection_path = pre_lift_selection.expanduser().resolve(strict=True)
+    ids_path = object_id_file.expanduser().resolve(strict=True)
+    if not selection_path.is_file() or not ids_path.is_file():
+        raise ValueError("pre-lift selection and object ID artifact must be files")
+    selection = _read_json(selection_path)
+    if selection.get("schema") != PRE_LIFT_SELECTION_SCHEMA:
+        raise ValueError(
+            f"pre-lift selection schema must be {PRE_LIFT_SELECTION_SCHEMA}"
+        )
+    if selection.get("status") != "PASS":
+        raise ValueError("pre-lift selection status must be PASS")
+    outputs = selection.get("outputs")
+    exact_ids = outputs.get("exact_object_ids") if isinstance(outputs, Mapping) else None
+    if not isinstance(exact_ids, Mapping):
+        raise ValueError("pre-lift selection lacks exact object ID provenance")
+    relative = Path(str(exact_ids.get("relative_path") or ""))
+    expected_ids_path = (selection_path.parent / relative).resolve(strict=True)
+    expected_digest = str(exact_ids.get("sha256") or "")
+    if (
+        relative.as_posix() != PRE_LIFT_IDS_FILENAME
+        or ids_path != expected_ids_path
+        or exact_ids.get("format") != "one_decimal_object_id_per_line"
+        or isinstance(exact_ids.get("bytes"), bool)
+        or exact_ids.get("bytes") != ids_path.stat().st_size
+        or not re.fullmatch(r"[0-9a-f]{64}", expected_digest)
+        or _sha256_file(ids_path) != expected_digest
+    ):
+        raise ValueError("object ID artifact does not match selection provenance")
+
+    provenance = selection.get("provenance")
+    consumed = (
+        provenance.get("consumed_artifacts")
+        if isinstance(provenance, Mapping)
+        else None
+    )
+    if not isinstance(consumed, list) or not consumed:
+        raise ValueError("pre-lift selection lacks consumed artifact provenance")
+    mounts: list[tuple[Path, str]] = []
+    summaries: list[dict[str, Any]] = []
+    sort_keys: list[tuple[str, str]] = []
+    declared_paths: set[str] = set()
+    for index, spec in enumerate(consumed):
+        if not isinstance(spec, Mapping):
+            raise ValueError(f"consumed artifact {index} is not an object")
+        role = str(spec.get("role") or "")
+        declared = str(spec.get("path") or "")
+        expected_sha = str(spec.get("sha256") or "")
+        expected_bytes = spec.get("bytes")
+        if (
+            not role
+            or not declared
+            or not Path(declared).is_absolute()
+            or not re.fullmatch(r"[0-9a-f]{64}", expected_sha)
+            or isinstance(expected_bytes, bool)
+            or not isinstance(expected_bytes, int)
+            or expected_bytes < 0
+        ):
+            raise ValueError(f"consumed artifact {index} descriptor is invalid")
+        if declared in declared_paths:
+            raise ValueError("consumed artifact provenance contains duplicate paths")
+        declared_paths.add(declared)
+        source = Path(declared).resolve(strict=True)
+        if not source.is_file():
+            raise ValueError(f"consumed artifact is not a regular file: {source}")
+        if source.stat().st_size != expected_bytes:
+            raise ValueError(f"consumed artifact size mismatch: {source}")
+        if _sha256_file(source) != expected_sha:
+            raise ValueError(f"consumed artifact SHA256 mismatch: {source}")
+        target = f"/farm/pre_lift_provenance/{index:06d}"
+        mounts.append((source, target))
+        summaries.append({
+            "role": role,
+            "declared_path": declared,
+            "bytes": expected_bytes,
+            "sha256": expected_sha,
+            "container_path": target,
+        })
+        sort_keys.append((role, declared))
+    if sort_keys != sorted(sort_keys):
+        raise ValueError("consumed artifact provenance is not canonically sorted")
+
+    return {
+        "selection": selection_path,
+        "object_ids": ids_path,
+        "container_selection": "/farm/pre_lift_selection/selection.json",
+        "container_object_ids": (
+            f"/farm/pre_lift_selection/{PRE_LIFT_IDS_FILENAME}"
+        ),
+        "provenance_mounts": mounts,
+        "provenance_artifacts": summaries,
+        "artifacts": {
+            "pre_lift_selection": _host_artifact(selection_path),
+            "object_id_file": _host_artifact(ids_path),
+        },
+    }
+
+
 def _execution_source(
     run: Path,
     live_repo: Path,
@@ -209,6 +356,23 @@ def build_command(args: argparse.Namespace) -> tuple[list[str], dict[str, Any]]:
     run = args.run.expanduser().resolve(strict=True)
     ply = args.ply.expanduser().resolve(strict=True)
     config = args.config.expanduser().resolve(strict=True)
+    raw_fold_manifest = getattr(args, "full_colmap_fold_manifest", None)
+    fold_manifest = (
+        raw_fold_manifest.expanduser().resolve(strict=True)
+        if raw_fold_manifest is not None
+        else None
+    )
+    smoke_ids = list(getattr(args, "smoke_object_id", []))
+    smoke = bool(smoke_ids)
+    release_inputs = prepare_release_selection_inputs(
+        getattr(args, "object_id_file", None),
+        getattr(args, "pre_lift_selection", None),
+    )
+    if smoke and release_inputs is not None:
+        raise ValueError(
+            "--smoke-object-id is incompatible with the release object allowlist"
+        )
+
     output = args.output.expanduser().resolve()
     if not run.is_dir() or not ply.is_file() or not config.is_file():
         raise ValueError("--run must be a directory; --ply and --config must be files")
@@ -232,14 +396,18 @@ def build_command(args: argparse.Namespace) -> tuple[list[str], dict[str, Any]]:
         allow_legacy_interpreter_fallback=bool(args.allow_legacy_run),
     )
     installed_image_id = _docker_image_id(image_tag)
-    if installed_image_id != expected_image_id:
+    allow_rebuilt_nonrelease = bool(
+        getattr(args, "allow_rebuilt_image_nonrelease", False)
+    )
+    runtime_image_drift = installed_image_id != expected_image_id
+    if runtime_image_drift and not allow_rebuilt_nonrelease:
         raise RuntimeError(
             f"prep image drift: run pins {expected_image_id}, Docker resolves {installed_image_id}"
         )
+    runtime_image_id = installed_image_id if runtime_image_drift else expected_image_id
 
     launcher_commit, launcher_dirty = _git_snapshot(repo)
-    smoke = bool(args.smoke_object_id)
-    if launcher_dirty and not args.plan_only and not smoke:
+    if launcher_dirty and not args.plan_only and not smoke and not allow_rebuilt_nonrelease:
         raise RuntimeError(
             "canonical lift requires a clean committed launcher checkout; "
             "use --plan-only or --smoke-object-id while developing"
@@ -280,10 +448,13 @@ def build_command(args: argparse.Namespace) -> tuple[list[str], dict[str, Any]]:
         "--env", "XDG_CACHE_HOME=/tmp/cache",
         "--env", "MPLCONFIGDIR=/tmp/matplotlib",
         "--env", f"FARM_BRIDGE_SOURCE_COMMIT={source['commit'] or ''}",
-        "--env", f"FARM_BRIDGE_SOURCE_DIRTY={'true' if source['dirty'] else 'false'}",
+        "--env", (
+            "FARM_BRIDGE_SOURCE_DIRTY="
+            + ("true" if source["dirty"] or allow_rebuilt_nonrelease else "false")
+        ),
         "--env", f"FARM_BRIDGE_SOURCE_TREE_SHA256={source['tree_sha256'] or ''}",
         "--env", f"FARM_BRIDGE_IMAGE={image_tag}",
-        "--env", f"FARM_BRIDGE_IMAGE_ID={expected_image_id}",
+        "--env", f"FARM_BRIDGE_IMAGE_ID={runtime_image_id}",
         "--env", (
             "FARM_BRIDGE_RUNTIME_INTERPRETER_FALLBACK="
             + ("true" if interpreter_fallback else "false")
@@ -294,6 +465,23 @@ def build_command(args: argparse.Namespace) -> tuple[list[str], dict[str, Any]]:
         "--mount", _mount(ply, "/farm/source.ply", readonly=True),
         "--mount", _mount(config, "/farm/config.yaml", readonly=True),
     ]
+    if fold_manifest is not None:
+        command.extend([
+            "--mount", _mount(fold_manifest.parent, "/farm/full_colmap_folds", readonly=True),
+        ])
+    if release_inputs is not None:
+        command.extend([
+            "--mount",
+            _mount(
+                release_inputs["selection"].parent,
+                "/farm/pre_lift_selection",
+                readonly=True,
+            ),
+        ])
+        for source_path, target_path in release_inputs["provenance_mounts"]:
+            command.extend([
+                "--mount", _mount(source_path, target_path, readonly=True),
+            ])
     if not args.plan_only:
         command.extend([
             "--gpus", f"device={args.gpu}",
@@ -301,7 +489,7 @@ def build_command(args: argparse.Namespace) -> tuple[list[str], dict[str, Any]]:
         ])
     command.extend([
         "--entrypoint", prep_python,
-        expected_image_id,
+        runtime_image_id,
         "/opt/farm-src/tools/farm_shaper_bridge/gaussian_lift.py",
         "--run", container_run,
         "--ply", "/farm/source.ply",
@@ -312,7 +500,21 @@ def build_command(args: argparse.Namespace) -> tuple[list[str], dict[str, Any]]:
         command.append("--plan-only")
     if args.allow_legacy_run:
         command.append("--allow-legacy-run")
-    for object_id in args.smoke_object_id:
+    if release_inputs is not None:
+        command.extend([
+            "--object-id-file",
+            release_inputs["container_object_ids"],
+            "--pre-lift-selection",
+            release_inputs["container_selection"],
+        ])
+        for _source_path, target_path in release_inputs["provenance_mounts"]:
+            command.extend(["--pre-lift-provenance-artifact", target_path])
+    if fold_manifest is not None:
+        command.extend([
+            "--full-colmap-fold-manifest",
+            f"/farm/full_colmap_folds/{fold_manifest.name}",
+        ])
+    for object_id in smoke_ids:
         command.extend(["--smoke-object-id", str(int(object_id))])
 
     metadata = {
@@ -326,17 +528,29 @@ def build_command(args: argparse.Namespace) -> tuple[list[str], dict[str, Any]]:
         "ply": str(ply),
         "config": str(config),
         "config_sha256": config_sha256,
+        "release_object_allowlist": (
+            {
+                "artifacts": release_inputs["artifacts"],
+                "provenance_artifacts": release_inputs["provenance_artifacts"],
+            }
+            if release_inputs is not None else None
+        ),
+        "full_colmap_fold_manifest": str(fold_manifest) if fold_manifest else None,
         "output": str(output),
         "image": image_tag,
-        "image_id": expected_image_id,
+        "image_id": runtime_image_id,
+        "source_run_image_id": expected_image_id,
+        "runtime_image_drift": runtime_image_drift,
+        "explicit_rebuilt_image_nonrelease": allow_rebuilt_nonrelease,
         "python": prep_python,
         "runtime_interpreter_fallback": interpreter_fallback,
         "nonrelease_warnings": (
-            ["legacy_resource_preflight_missing_prep_interpreter"]
-            if interpreter_fallback else []
+            (["legacy_resource_preflight_missing_prep_interpreter"] if interpreter_fallback else [])
+            + (["explicit_rebuilt_image_nonrelease_mode"] if allow_rebuilt_nonrelease else [])
+            + (["rebuilt_prep_image_differs_from_source_run"] if runtime_image_drift else [])
         ),
         "plan_only": bool(args.plan_only),
-        "smoke_object_ids": sorted(set(int(value) for value in args.smoke_object_id)),
+        "smoke_object_ids": sorted(set(int(value) for value in smoke_ids)),
         "legacy": bool(args.allow_legacy_run),
     }
     return command, metadata

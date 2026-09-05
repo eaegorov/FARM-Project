@@ -9,6 +9,8 @@ from scene_graph.captioning.evidence import crop_evidence_manifest
 from scene_graph.captioning.label_contract import (
     OPEN_VOCABULARY_LABEL_SCHEMA,
     adaptive_alternate_plan,
+    assess_open_vocabulary_identity,
+    assess_whole_object_readiness,
     assess_open_vocabulary_label,
     parse_open_vocabulary_label,
 )
@@ -116,6 +118,80 @@ def test_complete_diagnostic_whole_object_is_usable() -> None:
     assert result["category"] == "storage rack"
     assert result["maximum_semantic_tier"] == "confirmed"
 
+def test_obvious_open_noun_spelling_error_is_normalized() -> None:
+    contract = _contract("palet", form_hypernym="container")
+    assert contract["category"] == "pallet"
+    assert assess_open_vocabulary_label(contract)["category"] == "pallet"
+
+
+def test_whole_object_readiness_requires_explicit_complete_mask_evidence() -> None:
+    legacy = assess_whole_object_readiness(_contract())
+    assert legacy["ready"] is False
+    assert "missing_whole_object_evidence" in legacy["reason_codes"]
+
+    contract = _contract()
+    contract.update({
+        "context_sufficient": True,
+        "visible_target_coverage": 0.94,
+        "missing_visible_parts": [],
+        "included_non_target": [],
+    })
+    parsed = parse_open_vocabulary_label(contract)
+    result = assess_whole_object_readiness(parsed)
+    assert parsed["whole_object_evidence_complete"] is True
+    assert result["ready"] is True
+
+
+def test_partial_mask_keeps_identity_only_for_targeted_refinement() -> None:
+    contract = _contract(topology="partial_unbounded", complete_bounded=False)
+    contract.update({
+        "context_sufficient": True,
+        "visible_target_coverage": 0.52,
+        "missing_visible_parts": ["lower frame", "rear uprights"],
+        "included_non_target": [],
+    })
+    parsed = parse_open_vocabulary_label(contract)
+    identity = assess_open_vocabulary_identity(parsed)
+    whole = assess_whole_object_readiness(parsed)
+    assert identity["usable"] is True
+    assert identity["category"] == "storage rack"
+    assert identity["presentation_safe"] is False
+    assert identity["maximum_semantic_tier"] == "probable"
+    assert identity["description"]
+    assert whole["ready"] is False
+    assert "visible_target_coverage_below_threshold" in whole["reason_codes"]
+    assert "mask_missing_visible_target_parts" in whole["reason_codes"]
+
+
+def test_partial_identity_survives_adjudication_at_probable_only() -> None:
+    semantic = _load_script(
+        "farm_open_vocab_adjudicate_partial_identity",
+        "scripts/semantics/adjudicate_farm_semantics.py",
+    )
+    contract = _contract(
+        topology="partial_unbounded", complete_bounded=False,
+    )
+    contract.update({
+        "context_sufficient": True,
+        "visible_target_coverage": 0.55,
+        "missing_visible_parts": ["rear uprights"],
+        "included_non_target": [],
+    })
+    events = [
+        _event("blind_pass_a", contract, (1, 2, 3), (0, 20, 40)),
+        _event("blind_pass_c", contract, (4, 5, 6), (120, 140, 160)),
+    ]
+    tier, chosen, reason, negatives = semantic.adaptive_open_vocabulary_decision(
+        events, 0.90
+    )
+    assert tier == "probable"
+    assert chosen is not None and chosen["category"] == "storage rack"
+    assert chosen["confirmation_eligible"] is False
+    assert reason == "correlated_exact_open_vocabulary_agreement"
+    assert negatives == []
+
+
+
 
 def test_unsupported_specific_identity_downgrades_to_explicit_form() -> None:
     result = assess_open_vocabulary_label(_contract(
@@ -142,7 +218,7 @@ def test_lexical_agreement_cannot_rescue_context_only_identity() -> None:
     )
     semantic = _load_script(
         "farm_open_vocab_adjudicate_bad_identity",
-        "scripts/adjudicate_farm_semantics.py",
+        "scripts/semantics/adjudicate_farm_semantics.py",
     )
     events = [
         _event("blind_pass_a", contract, (1, 2, 3), (0, 20, 40)),
@@ -207,7 +283,7 @@ def test_missing_contract_fields_fail_closed() -> None:
 def test_diverse_exact_blind_events_confirm() -> None:
     semantic = _load_script(
         "farm_open_vocab_adjudicate_diverse",
-        "scripts/adjudicate_farm_semantics.py",
+        "scripts/semantics/adjudicate_farm_semantics.py",
     )
     contract = _contract()
     events = [
@@ -226,7 +302,7 @@ def test_diverse_exact_blind_events_confirm() -> None:
 def test_disjoint_ids_with_near_duplicate_poses_do_not_confirm() -> None:
     semantic = _load_script(
         "farm_open_vocab_adjudicate_correlated",
-        "scripts/adjudicate_farm_semantics.py",
+        "scripts/semantics/adjudicate_farm_semantics.py",
     )
     contract = _contract()
     events = [
@@ -241,7 +317,7 @@ def test_disjoint_ids_with_near_duplicate_poses_do_not_confirm() -> None:
 def test_disagreement_uses_only_explicit_shared_form_hypernym() -> None:
     semantic = _load_script(
         "farm_open_vocab_adjudicate_hypernym",
-        "scripts/adjudicate_farm_semantics.py",
+        "scripts/semantics/adjudicate_farm_semantics.py",
     )
     left = _contract("storage rack", form_hypernym="support frame")
     right = _contract("equipment stand", form_hypernym="support frame")
@@ -260,7 +336,7 @@ def test_disagreement_uses_only_explicit_shared_form_hypernym() -> None:
 def test_shared_form_hypernym_survives_pipeline_at_probable_only() -> None:
     adjudicator = _load_script(
         "farm_open_vocab_adjudicate_hypernym_e2e",
-        "scripts/adjudicate_farm_semantics.py",
+        "scripts/semantics/adjudicate_farm_semantics.py",
     )
     left = _contract("storage rack", form_hypernym="support frame")
     right = _contract("equipment stand", form_hypernym="support frame")
@@ -284,7 +360,7 @@ def test_shared_form_hypernym_survives_pipeline_at_probable_only() -> None:
 
     reconciler = _load_script(
         "farm_open_vocab_reconcile_hypernym_e2e",
-        "scripts/reconcile_farm_semantics.py",
+        "scripts/semantics/reconcile_farm_semantics.py",
     )
     evidence = reconciler._candidate_evidence(ensemble, {})
     reconciled = reconciler._strict_current_resolution(ensemble, evidence, {})
@@ -294,7 +370,7 @@ def test_shared_form_hypernym_survives_pipeline_at_probable_only() -> None:
 
     finalizer = _load_script(
         "farm_open_vocab_finalizer_hypernym_e2e",
-        "scripts/finalize_farm_semantic_consensus.py",
+        "scripts/semantics/finalize_farm_semantic_consensus.py",
     )
     category, _ = finalizer.choose_category({}, {}, ensemble, reconciled, {})
     final_evidence = finalizer.collect_semantic_evidence(
@@ -330,7 +406,7 @@ def test_adaptive_planner_requests_only_low_or_pose_confirmable() -> None:
 def test_finalizer_requires_exact_strict_head_and_honors_tier_cap() -> None:
     finalizer = _load_script(
         "farm_open_vocab_finalizer",
-        "scripts/finalize_farm_semantic_consensus.py",
+        "scripts/semantics/finalize_farm_semantic_consensus.py",
     )
     contract = _contract(
         "mobile carrier",
@@ -359,7 +435,7 @@ def test_finalizer_requires_exact_strict_head_and_honors_tier_cap() -> None:
 def test_finalizer_never_resurrects_prior_after_strict_failure() -> None:
     finalizer = _load_script(
         "farm_open_vocab_finalizer_fail_closed",
-        "scripts/finalize_farm_semantic_consensus.py",
+        "scripts/semantics/finalize_farm_semantic_consensus.py",
     )
     rejected = _contract(
         topology="attached_component",
@@ -397,7 +473,7 @@ def test_strict_failure_nested_only_stays_fail_closed_across_boundaries() -> Non
 
     adjudicator = _load_script(
         "farm_open_vocab_adjudicate_nested_failure",
-        "scripts/adjudicate_farm_semantics.py",
+        "scripts/semantics/adjudicate_farm_semantics.py",
     )
     ensemble = adjudicator.output_row(
         {"id": 11},
@@ -412,7 +488,7 @@ def test_strict_failure_nested_only_stays_fail_closed_across_boundaries() -> Non
 
     reconciler = _load_script(
         "farm_open_vocab_reconcile_nested_failure",
-        "scripts/reconcile_farm_semantics.py",
+        "scripts/semantics/reconcile_farm_semantics.py",
     )
     evidence = reconciler._candidate_evidence(
         ensemble,
@@ -429,7 +505,7 @@ def test_strict_failure_nested_only_stays_fail_closed_across_boundaries() -> Non
 
     finalizer = _load_script(
         "farm_open_vocab_finalizer_nested_failure",
-        "scripts/finalize_farm_semantic_consensus.py",
+        "scripts/semantics/finalize_farm_semantic_consensus.py",
     )
     category, reason = finalizer.choose_category(
         {"category": "legacy machine"},

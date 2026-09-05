@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import json
 import random
 import math
 from pathlib import Path
 
 from scene_graph.captioning.evidence import (
     crop_evidence_manifest,
+    evidence_camera_poses,
     evidence_view_overlap,
     partition_crop_candidates,
     select_independent_evidence,
@@ -472,3 +474,88 @@ def test_manifest_preserves_additive_crop_selection_diagnostics() -> None:
     )
 
     assert manifest["crop_selection_diagnostics"] == diagnostics
+
+
+def test_persisted_pose_fingerprint_is_not_changed_by_re_normalization() -> None:
+    # This non-axis-aligned direction normalizes to a vector whose serialized
+    # norm is not bit-exactly 1.0.  The verifier must validate, not normalize a
+    # second time, because the producer fingerprint covers the stored floats.
+    manifest = crop_evidence_manifest(
+        7,
+        [_crop(34), _crop(74), _crop(197)],
+        frame_pose_index={
+            34: {
+                "camera_center_world_m": [1.25, -2.5, 0.75],
+                "camera_forward_world": [-0.314159265, 0.271828182, 0.577215664],
+            },
+            74: {
+                "camera_center_world_m": [-2.0, 1.5, 1.25],
+                "camera_forward_world": [0.707106781, -0.4, 0.23],
+            },
+            197: {
+                "camera_center_world_m": [0.5, 3.0, -0.25],
+                "camera_forward_world": [-0.13, -0.91, 0.37],
+            },
+        },
+        object_position_world_m=[0.0, 0.0, 0.0],
+    )
+
+    persisted = json.loads(json.dumps(manifest))
+    verified = evidence_camera_poses(persisted)
+
+    assert verified is not None
+    assert [row["image_id"] for row in verified[1]] == [34, 74, 197]
+
+
+def test_persisted_pose_fingerprints_retain_event_independence() -> None:
+    def persisted_event(source: str, image_ids: list[int], offset: float) -> dict:
+        poses = {}
+        for image_id, base_angle in zip(image_ids, (0.0, 120.0, 240.0)):
+            angle = math.radians(base_angle + offset)
+            center = [10.0 * math.cos(angle), 10.0 * math.sin(angle), 0.0]
+            poses[image_id] = {
+                "camera_center_world_m": center,
+                "camera_forward_world": [
+                    -center[0] / 10.0,
+                    -center[1] / 10.0,
+                    0.0,
+                ],
+            }
+        event = {
+            "source": source,
+            "event_id": source,
+            "confirmation_eligible": True,
+            **crop_evidence_manifest(
+                7,
+                [_crop(image_id) for image_id in image_ids],
+                frame_pose_index=poses,
+                object_position_world_m=[0.0, 0.0, 0.0],
+            ),
+        }
+        return json.loads(json.dumps(event))
+
+    overlap = evidence_view_overlap(
+        persisted_event("initial_blind_review", [10, 11, 12], 0.0),
+        persisted_event("independent_verification", [20, 21, 22], 25.0),
+    )
+
+    assert overlap["independent"] is True
+    assert overlap["reason"] == "independent_image_ids_and_camera_poses"
+    assert overlap["pose_diversity"]["pose_independent"] is True
+
+
+def test_pose_fingerprint_still_rejects_non_unit_or_tampered_direction() -> None:
+    manifest = crop_evidence_manifest(
+        7,
+        [_crop(1)],
+        frame_pose_index={
+            1: {
+                "camera_center_world_m": [1.0, 0.0, 0.0],
+                "camera_forward_world": [-1.0, 0.0, 0.0],
+            }
+        },
+        object_position_world_m=[0.0, 0.0, 0.0],
+    )
+    manifest["crop_camera_poses"][0]["camera_forward_world"] = [-2.0, 0.0, 0.0]
+
+    assert evidence_camera_poses(manifest) is None

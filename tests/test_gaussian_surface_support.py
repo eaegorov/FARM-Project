@@ -2,7 +2,7 @@ import math
 
 import pytest
 
-from scripts.audit_farm_gaussian_support import gaussian_support_gate
+from scripts.geometry.audit_farm_gaussian_support import gaussian_support_gate
 
 
 def test_supported_raw_and_scale_aware_voxels_pass() -> None:

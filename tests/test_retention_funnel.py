@@ -10,7 +10,7 @@ import torch
 
 ROOT = Path(__file__).resolve().parents[1]
 SPEC = importlib.util.spec_from_file_location(
-    "build_farm_retention_funnel", ROOT / "scripts/build_farm_retention_funnel.py"
+    "build_farm_retention_funnel", ROOT / "scripts/evaluation/build_farm_retention_funnel.py"
 )
 assert SPEC and SPEC.loader
 funnel = importlib.util.module_from_spec(SPEC)

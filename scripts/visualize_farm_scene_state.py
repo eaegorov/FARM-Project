@@ -31,9 +31,9 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 from matplotlib.patches import Polygon  # noqa: E402
 try:
-    from farm_geometry_axes import horizontal_plane_basis, normalize_up_vector
+    from scripts.geometry.farm_geometry_axes import horizontal_plane_basis, normalize_up_vector
 except ModuleNotFoundError:  # package import
-    from scripts.farm_geometry_axes import horizontal_plane_basis, normalize_up_vector
+    from scripts.geometry.farm_geometry_axes import horizontal_plane_basis, normalize_up_vector
 
 
 BG = (7, 9, 14)

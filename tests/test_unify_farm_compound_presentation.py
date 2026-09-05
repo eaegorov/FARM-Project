@@ -8,7 +8,7 @@ SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
-from unify_farm_compound_presentation import unify_compound_boxes  # noqa: E402
+from scripts.geometry.unify_farm_compound_presentation import unify_compound_boxes  # noqa: E402
 
 
 def _box(center, support=0.96):

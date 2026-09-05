@@ -27,7 +27,7 @@ from farm_pipeline.final_acceptance import (  # noqa: E402
     runtime_budget_seconds,
     validated_assembly_semantic_row,
 )
-from scripts.build_farm_tiered_state import main as build_tiered_state
+from scripts.geometry.build_farm_tiered_state import main as build_tiered_state
 
 
 def _state(ids: list[int], categories: list[str] | None = None) -> dict:

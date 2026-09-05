@@ -4,132 +4,512 @@
   "title": "FARM COLMAP + 3DGS scene",
   "type": "object",
   "additionalProperties": false,
-  "required": ["scene_id", "inputs"],
+  "required": [
+    "scene_id",
+    "inputs"
+  ],
   "properties": {
-    "schema_version": {"const": "farm.scene.v1", "default": "farm.scene.v1"},
-    "scene_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$"},
+    "schema_version": {
+      "const": "farm.scene.v1",
+      "default": "farm.scene.v1"
+    },
+    "scene_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$"
+    },
     "inputs": {
-      "type": "object", "additionalProperties": false,
-      "required": ["colmap_model", "image_root", "gaussian_ply"],
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "colmap_model",
+        "image_root",
+        "gaussian_ply"
+      ],
       "properties": {
-        "colmap_model": {"type": "string", "minLength": 1},
-        "image_root": {"type": "string", "minLength": 1},
-        "gaussian_ply": {"type": "string", "minLength": 1}
+        "colmap_model": {
+          "type": "string",
+          "minLength": 1
+        },
+        "image_root": {
+          "type": "string",
+          "minLength": 1
+        },
+        "gaussian_ply": {
+          "type": "string",
+          "minLength": 1
+        }
       }
     },
-    "output_root": {"type": "string", "minLength": 1, "default": "output"},
+    "output_root": {
+      "type": "string",
+      "minLength": 1,
+      "default": "output"
+    },
     "camera": {
-      "type": "object", "additionalProperties": false,
+      "type": "object",
+      "additionalProperties": false,
       "properties": {
-        "accepted_models": {"type": "array", "minItems": 1, "items": {"type": "string"}, "default": ["PINHOLE", "SIMPLE_PINHOLE"]},
-        "require_virtual_pinhole": {"type": "boolean", "default": true}
+        "accepted_models": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "PINHOLE",
+            "SIMPLE_PINHOLE"
+          ]
+        },
+        "require_virtual_pinhole": {
+          "type": "boolean",
+          "default": true
+        },
+        "rgb_alignment": {
+          "type": "string",
+          "enum": [
+            "off",
+            "rig"
+          ],
+          "default": "off"
+        }
       }
     },
     "camera_grouping": {
-      "type": "object", "additionalProperties": false,
+      "type": "object",
+      "additionalProperties": false,
       "properties": {
-        "mode": {"enum": ["auto", "single", "regex", "manifest"], "default": "auto"},
-        "pattern": {"type": ["string", "null"]},
-        "timestamp_group": {"type": "string", "default": "timestamp"},
-        "member_group": {"type": "string", "default": "camera"},
-        "view_group": {"type": "string", "default": "view"},
-        "required_members": {"type": "array", "uniqueItems": true, "items": {"type": "string"}},
-        "required_views": {"type": "array", "uniqueItems": true, "items": {"type": "string"}}
+        "mode": {
+          "enum": [
+            "auto",
+            "single",
+            "regex",
+            "manifest"
+          ],
+          "default": "auto"
+        },
+        "pattern": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "timestamp_group": {
+          "type": "string",
+          "default": "timestamp"
+        },
+        "member_group": {
+          "type": "string",
+          "default": "camera"
+        },
+        "view_group": {
+          "type": "string",
+          "default": "view"
+        },
+        "required_members": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string"
+          }
+        },
+        "required_views": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string"
+          }
+        }
       }
     },
     "selection": {
-      "type": "object", "additionalProperties": false,
+      "type": "object",
+      "additionalProperties": false,
       "properties": {
-        "target_timestamps": {"type": "integer", "minimum": 2, "default": 160},
-        "max_timestamps": {"type": "integer", "minimum": 2, "default": 180},
-        "rotation_weight_m_per_rad": {"type": "number", "minimum": 0, "default": 0.5},
-        "max_motion_gap": {"type": "number", "exclusiveMinimum": 0, "default": 1.35},
-        "max_translation_gap_m": {"type": "number", "exclusiveMinimum": 0, "default": 1.3},
-        "max_rotation_gap_deg": {"type": "number", "exclusiveMinimum": 0, "default": 50.0},
-        "min_shared_tracks": {"type": "integer", "minimum": 0, "default": 20},
-        "min_overlap_ratio": {"type": "number", "minimum": 0, "maximum": 1, "default": 0.015},
-        "output_views": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string"}}
+        "target_timestamps": {
+          "type": "integer",
+          "minimum": 2,
+          "default": 160
+        },
+        "max_timestamps": {
+          "type": "integer",
+          "minimum": 2,
+          "default": 180
+        },
+        "rotation_weight_m_per_rad": {
+          "type": "number",
+          "minimum": 0,
+          "default": 0.5
+        },
+        "max_motion_gap": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "default": 1.35
+        },
+        "max_translation_gap_m": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "default": 1.3
+        },
+        "max_rotation_gap_deg": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "default": 50.0
+        },
+        "min_shared_tracks": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 20
+        },
+        "min_overlap_ratio": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "default": 0.015
+        },
+        "output_views": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string"
+          }
+        },
+        "anchor_views": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string"
+          }
+        },
+        "view_policy": {
+          "enum": [
+            "fixed",
+            "balanced"
+          ],
+          "default": "fixed"
+        },
+        "views_per_sensor": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 1
+        }
       }
     },
     "resources": {
-      "type": "object", "additionalProperties": false,
+      "type": "object",
+      "additionalProperties": false,
       "properties": {
-        "profile": {"type": "string", "default": "auto"},
-        "gpu": {"type": "string", "pattern": "^(?:[0-9]+|GPU-[A-Za-z0-9-]+)$", "default": "0"},
-        "model_manifest": {"type": ["string", "null"], "minLength": 1},
-        "secrets_file": {"type": ["string", "null"], "minLength": 1},
-        "render_resolution": {"type": "integer", "minimum": 64, "default": 896},
-        "max_vram_gb": {"type": ["number", "null"], "exclusiveMinimum": 0},
-        "max_cpu_workers": {"type": ["integer", "null"], "minimum": 1},
-        "depth_batch_size": {"type": "integer", "minimum": 1, "default": 1},
-        "mapping_batch_size": {"type": "integer", "minimum": 1, "default": 5}
+        "profile": {
+          "type": "string",
+          "default": "auto"
+        },
+        "gpu": {
+          "type": "string",
+          "pattern": "^(?:[0-9]+|GPU-[A-Za-z0-9-]+)$",
+          "default": "0"
+        },
+        "model_manifest": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "secrets_file": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "render_resolution": {
+          "type": "integer",
+          "minimum": 64,
+          "default": 896
+        },
+        "max_vram_gb": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "exclusiveMinimum": 0
+        },
+        "max_cpu_workers": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1
+        },
+        "depth_batch_size": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 1
+        },
+        "mapping_batch_size": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 5
+        }
       }
     },
     "models": {
-      "type": "object", "additionalProperties": false,
+      "type": "object",
+      "additionalProperties": false,
       "properties": {
-        "segmentation": {"type": "string", "default": "yoloe-v8l"},
-        "visual_features": {"type": "string", "default": "dinov3-vits16plus"},
-        "caption": {"type": "string", "default": "Qwen/Qwen3-VL-8B-Instruct"},
-        "text_embeddings": {"type": ["string", "null"]},
-        "offline": {"type": "boolean", "default": true}
+        "segmentation": {
+          "type": "string",
+          "default": "yoloe-v8l"
+        },
+        "visual_features": {
+          "type": "string",
+          "default": "dinov3-vits16plus"
+        },
+        "caption": {
+          "type": "string",
+          "default": "Qwen/Qwen3-VL-8B-Instruct"
+        },
+        "text_embeddings": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "offline": {
+          "type": "boolean",
+          "default": true
+        }
       }
     },
     "viewer": {
-      "type": "object", "additionalProperties": false,
+      "type": "object",
+      "additionalProperties": false,
       "properties": {
-        "host": {"type": "string", "default": "127.0.0.1"},
-        "port": {"type": "integer", "minimum": 1, "maximum": 65535, "default": 8080},
-        "scene_point_size_m": {"type": "number", "exclusiveMinimum": 0, "default": 0.004},
-        "max_context_points": {"type": "integer", "minimum": 1, "default": 1500000},
-        "open_browser": {"type": "boolean", "default": false}
+        "host": {
+          "type": "string",
+          "default": "127.0.0.1"
+        },
+        "port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535,
+          "default": 8080
+        },
+        "scene_point_size_m": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "default": 0.004
+        },
+        "max_context_points": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 1500000
+        },
+        "open_browser": {
+          "type": "boolean",
+          "default": false
+        }
       }
     },
     "metric_scale": {
-      "type": "object", "additionalProperties": false,
+      "type": "object",
+      "additionalProperties": false,
       "properties": {
-        "required": {"type": "boolean", "default": false},
-        "source": {"enum": ["auto", "unknown", "explicit", "declared_metric", "rig_baseline"], "default": "auto"},
-        "meters_per_colmap_unit": {"type": ["number", "null"], "exclusiveMinimum": 0},
-        "evidence": {"type": ["string", "null"]},
-        "expected_baseline_m": {"type": ["number", "null"], "exclusiveMinimum": 0},
-        "baseline_tolerance_m": {"type": "number", "exclusiveMinimum": 0, "default": 0.005},
-        "baseline_members": {"type": "array", "maxItems": 2, "uniqueItems": true, "items": {"type": "string"}},
-        "baseline_view": {"type": ["string", "null"]}
+        "required": {
+          "type": "boolean",
+          "default": false
+        },
+        "source": {
+          "enum": [
+            "auto",
+            "unknown",
+            "explicit",
+            "declared_metric",
+            "rig_baseline"
+          ],
+          "default": "auto"
+        },
+        "meters_per_colmap_unit": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "exclusiveMinimum": 0
+        },
+        "evidence": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "expected_baseline_m": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "exclusiveMinimum": 0
+        },
+        "baseline_tolerance_m": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "default": 0.005
+        },
+        "baseline_members": {
+          "type": "array",
+          "maxItems": 2,
+          "uniqueItems": true,
+          "items": {
+            "type": "string"
+          }
+        },
+        "baseline_view": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
       }
     },
     "gravity": {
-      "type": "object", "additionalProperties": false,
+      "type": "object",
+      "additionalProperties": false,
       "properties": {
-        "required": {"type": "boolean", "default": false},
-        "mode": {"enum": ["auto", "axis", "vector", "none"], "default": "auto"},
-        "axis": {"enum": ["x", "-x", "y", "-y", "z", "-z", null]},
-        "vector": {"type": ["array", "null"], "minItems": 3, "maxItems": 3, "items": {"type": "number"}},
-        "min_camera_consensus": {"type": "number", "minimum": 0, "maximum": 1, "default": 0.75}
+        "required": {
+          "type": "boolean",
+          "default": false
+        },
+        "mode": {
+          "enum": [
+            "auto",
+            "axis",
+            "vector",
+            "none"
+          ],
+          "default": "auto"
+        },
+        "axis": {
+          "enum": [
+            "x",
+            "-x",
+            "y",
+            "-y",
+            "z",
+            "-z",
+            null
+          ]
+        },
+        "vector": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "minItems": 3,
+          "maxItems": 3,
+          "items": {
+            "type": "number"
+          }
+        },
+        "min_camera_consensus": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "default": 0.75
+        }
       }
     },
     "preflight": {
-      "type": "object", "additionalProperties": false,
+      "type": "object",
+      "additionalProperties": false,
       "properties": {
-        "image_check": {"enum": ["all", "sample", "none"], "default": "all"},
-        "image_sample_count": {"type": "integer", "minimum": 1, "default": 512},
-        "require_3dgs_schema": {"type": "boolean", "default": true},
-        "min_registered_images": {"type": "integer", "minimum": 1, "default": 2},
-        "min_sparse_points": {"type": "integer", "minimum": 1, "default": 10},
-        "min_gaussians": {"type": "integer", "minimum": 1, "default": 10},
-        "full_hash_max_bytes": {"type": "integer", "minimum": 1, "default": 67108864},
-        "hash_chunk_bytes": {"type": "integer", "minimum": 1, "default": 1048576},
+        "image_check": {
+          "enum": [
+            "all",
+            "sample",
+            "none"
+          ],
+          "default": "all"
+        },
+        "image_sample_count": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 512
+        },
+        "require_3dgs_schema": {
+          "type": "boolean",
+          "default": true
+        },
+        "min_registered_images": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 2
+        },
+        "min_sparse_points": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 10
+        },
+        "min_gaussians": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 10
+        },
+        "full_hash_max_bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 67108864
+        },
+        "hash_chunk_bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 1048576
+        },
         "alignment": {
-          "type": "object", "additionalProperties": false,
+          "type": "object",
+          "additionalProperties": false,
           "properties": {
-            "sample_points": {"type": "integer", "minimum": 10, "default": 65536},
-            "nearest_neighbor_points": {"type": "integer", "minimum": 0, "default": 4096},
-            "pass_centroid_offset_ratio": {"type": "number", "exclusiveMinimum": 0, "default": 0.15},
-            "fail_centroid_offset_ratio": {"type": "number", "exclusiveMinimum": 0, "default": 0.75},
-            "pass_extent_ratio": {"type": "number", "minimum": 1, "default": 2.5},
-            "fail_extent_ratio": {"type": "number", "minimum": 1, "default": 20.0},
-            "pass_bbox_iou": {"type": "number", "minimum": 0, "maximum": 1, "default": 0.1},
-            "fail_bbox_iou": {"type": "number", "minimum": 0, "maximum": 1, "default": 0.001}
+            "sample_points": {
+              "type": "integer",
+              "minimum": 10,
+              "default": 65536
+            },
+            "nearest_neighbor_points": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 4096
+            },
+            "pass_centroid_offset_ratio": {
+              "type": "number",
+              "exclusiveMinimum": 0,
+              "default": 0.15
+            },
+            "fail_centroid_offset_ratio": {
+              "type": "number",
+              "exclusiveMinimum": 0,
+              "default": 0.75
+            },
+            "pass_extent_ratio": {
+              "type": "number",
+              "minimum": 1,
+              "default": 2.5
+            },
+            "fail_extent_ratio": {
+              "type": "number",
+              "minimum": 1,
+              "default": 20.0
+            },
+            "pass_bbox_iou": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1,
+              "default": 0.1
+            },
+            "fail_bbox_iou": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1,
+              "default": 0.001
+            }
           }
         }
       }

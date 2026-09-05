@@ -18,7 +18,7 @@ def _load(name: str, relative: str):
 
 
 def test_review_payload_caps_each_crop_without_dropping_views(monkeypatch) -> None:
-    review = _load("farm_review_budget", "scripts/review_farm_object_crops.py")
+    review = _load("farm_review_budget", "scripts/semantics/review_farm_object_crops.py")
     captured: dict = {}
 
     class Response:
@@ -54,7 +54,7 @@ def test_review_payload_caps_each_crop_without_dropping_views(monkeypatch) -> No
 
 
 def test_vl_embedding_payload_fits_pinned_context() -> None:
-    embeddings = _load("farm_embedding_budget", "scripts/enrich_farm_embeddings.py")
+    embeddings = _load("farm_embedding_budget", "scripts/semantics/enrich_farm_embeddings.py")
     payload = embeddings._vl_payload("model", "data:image/jpeg;base64,AA==")
 
     assert payload["mm_processor_kwargs"] == {"max_pixels": 262144}
@@ -64,7 +64,7 @@ def test_vl_embedding_payload_fits_pinned_context() -> None:
 
 
 def test_transport_failure_is_not_reinterpreted_as_semantic_unknown() -> None:
-    review = _load("farm_review_transport", "scripts/review_farm_object_crops.py")
+    review = _load("farm_review_transport", "scripts/semantics/review_farm_object_crops.py")
     report = {
         "initial_request_error_ids": [17],
         "verification_request_error_ids": [],
@@ -83,7 +83,7 @@ def test_transport_failure_is_not_reinterpreted_as_semantic_unknown() -> None:
 
 
 def test_review_retries_one_temporary_transport_failure(monkeypatch) -> None:
-    review = _load("farm_review_retry", "scripts/review_farm_object_crops.py")
+    review = _load("farm_review_retry", "scripts/semantics/review_farm_object_crops.py")
     calls = []
 
     class Response:
