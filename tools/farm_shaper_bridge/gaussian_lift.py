@@ -227,7 +227,11 @@ def _require_sections(config: Mapping[str, Any]) -> None:
     finite("candidate", "maximum_radius_m", minimum=0, minimum_open=True)
 
     integer("mask", "erosion_pixels", minimum=0)
-    integer("mask", "negative_ring_pixels", minimum=0)
+    ring = integer("mask", "negative_ring_pixels", minimum=0)
+    if "negative_guard_pixels" in config["mask"]:
+        guard = integer("mask", "negative_guard_pixels", minimum=0)
+        if guard > ring:
+            raise ValueError("mask.negative_guard_pixels exceeds negative ring")
     finite("mask", "raw_interior_weight", minimum=0, maximum=1)
     finite("mask", "inlier_weight", minimum=0, minimum_open=True)
     finite("mask", "depth_discontinuity_m", minimum=0)
@@ -238,6 +242,8 @@ def _require_sections(config: Mapping[str, Any]) -> None:
     for key in ("minimum_per_timestamp_purity", "minimum_global_purity",
                 "maximum_object_fraction"):
         finite("build", key, minimum=0, maximum=1)
+    if "minimum_visible_share" in config["build"]:
+        finite("build", "minimum_visible_share", minimum=0, maximum=1)
     integer("build", "minimum_gaussian_timestamps", minimum=1)
     integer("build", "minimum_timestamp_margin", minimum=0)
     finite("build", "score_log_weight", minimum=0)
@@ -286,7 +292,10 @@ def _require_sections(config: Mapping[str, Any]) -> None:
 
 def load_config(path: Path) -> tuple[dict[str, Any], str]:
     path = path.expanduser().resolve(strict=True)
-    payload = yaml.safe_load(path.read_text(encoding="utf-8"))
+    text = path.read_text(encoding="utf-8")
+    # Emitted JSON configs must round-trip scientific floats (YAML 1.1 can
+    # treat JSON numbers such as 1e-05 as strings).
+    payload = json.loads(text) if path.suffix.lower() == ".json" else yaml.safe_load(text)
     if not isinstance(payload, dict):
         raise TypeError("Gaussian lift config must be a YAML mapping")
     _require_sections(payload)
@@ -1271,6 +1280,22 @@ def _surface_interior(depth: np.ndarray, run: RunData, config: Mapping[str, Any]
     return valid_interior & (discontinuity <= float(config["mask"]["depth_discontinuity_m"]))
 
 
+def negative_mask_ring(raw, other, surface, ring_kernel, guard_pixels=0):
+    """Keep the uncertain boundary unknown instead of asserting background.
+
+    A zero guard exactly preserves the original hard-mask evidence policy.
+    Guard width is in the working mask grid, like erosion_pixels.
+    """
+    dilated = cv2.dilate(raw.astype(np.uint8), ring_kernel, iterations=1).astype(bool)
+    protected = raw
+    if guard_pixels:
+        kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (2 * guard_pixels + 1, 2 * guard_pixels + 1)
+        )
+        protected = cv2.dilate(raw.astype(np.uint8), kernel, iterations=1).astype(bool)
+    return dilated & ~protected & ~other & surface
+
+
 def _load_view_masks(
     run: RunData,
     frame: Frame,
@@ -1327,9 +1352,11 @@ def _load_view_masks(
         positive *= surface
         if int(np.count_nonzero(positive)) < int(config["mask"]["minimum_positive_pixels"]):
             positive = (raw & surface).astype(np.float32) * float(config["mask"]["raw_interior_weight"])
-        dilated = cv2.dilate(raw.astype(np.uint8), ring_kernel, iterations=1).astype(bool)
         other = all_raw & ~raw
-        negative = dilated & ~raw & ~other & surface
+        negative = negative_mask_ring(
+            raw, other, surface, ring_kernel,
+            int(config["mask"].get("negative_guard_pixels", 0)),
+        )
         item["positive_weight"] = positive * normalizer
         item["negative_weight"] = negative.astype(np.float32) * normalizer
     depth_audit = {
@@ -1540,6 +1567,11 @@ def make_claims(
             )
             & (purity >= float(policy["minimum_global_purity"]))
         )
+        # A narrow positive tail is insufficient when most weighted visible
+        # contribution is outside the object. Optional until scene calibration.
+        visible_supported = visible_share >= float(policy.get("minimum_visible_share", 0.0))
+        rejected_visible_share = int(np.count_nonzero(accepted & ~visible_supported))
+        accepted &= visible_supported
         indices = item.indices[accepted]
         support = item.positive_timestamps[accepted]
         scores = support.astype(np.float32) + float(policy["score_log_weight"]) * np.log1p(
@@ -1565,6 +1597,8 @@ def make_claims(
             "category": item.obj.category,
             "candidate_gaussians": int(len(item.indices)),
             "supported_claims_before_conflicts": int(len(indices)),
+            "claims_rejected_visible_share": rejected_visible_share,
+            "median_claim_visible_share": float(np.median(visible_share[accepted])) if len(indices) else 0.0,
             "build_timestamp_count": item.build_timestamp_count,
             "median_claim_purity": float(np.median(purity[accepted])) if len(indices) else 0.0,
             "median_claim_support": float(np.median(support)) if len(indices) else 0.0,

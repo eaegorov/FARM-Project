@@ -237,3 +237,50 @@ def test_scene_vocabulary_retains_separate_roles_and_validates_image_ids():
     assert result["views"][0]["objects"] == ["cabinet"]
     with pytest.raises(ValueError, match="image IDs"):
         validate_vocabulary(json.dumps(value), [2])
+
+
+def test_concept_confidence_is_not_tracker_iou_prediction():
+    from farm_runtime.segmentation_refinement import (
+        candidate_score,
+        consensus_score_passes,
+    )
+
+    concept = {"score_kind": "sam3_presence_instance", "model_score": 0.72}
+    tracker = {"predicted_iou": 0.72}
+    assert candidate_score(concept) == candidate_score(tracker)
+    assert consensus_score_passes(concept)
+    assert not consensus_score_passes(tracker)
+    with pytest.raises(ValueError, match="unknown segmentation score"):
+        candidate_score({"score_kind": "unsupported"})
+    with pytest.raises(ValueError, match="finite"):
+        candidate_score({"predicted_iou": float("nan")})
+
+
+def test_absent_concept_is_unknown_but_real_bad_mask_still_vetoes():
+    mask = np.ones((20, 20), bool)
+    candidates = [
+        dict(
+            key=f"c{i}",
+            score_kind="sam3_presence_instance",
+            model_score=0.9,
+            geometry_eligible=True,
+        )
+        for i in range(3)
+    ]
+    row = {"display_candidates": [{"key": "baseline"}] + candidates}
+    arrays = {f"c{i}": mask.copy() for i in range(3)}
+    candidates[0].update(
+        abstention="no_concept_instance", geometry_eligible=False, model_score=0.0
+    )
+    arrays["c0"][:] = False
+    assert select_mask_proposal(row, arrays)[0] == "c1"
+    candidates[1].update(
+        abstention="no_concept_instance", geometry_eligible=False, model_score=0.0
+    )
+    assert select_mask_proposal(row, arrays)[0] is None
+    del candidates[0]["abstention"]
+    candidates[0]["model_score"] = 0.9
+    candidates[1].update(geometry_eligible=True, model_score=0.9)
+    del candidates[1]["abstention"]
+    # Two agreeing masks do not excuse a third detected mask with bad core.
+    assert select_mask_proposal(row, arrays)[0] is None

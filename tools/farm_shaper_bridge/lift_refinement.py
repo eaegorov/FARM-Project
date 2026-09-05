@@ -198,7 +198,10 @@ def refine_connected_claims(
             )
             & (item.positive_weight >= float(policy["minimum_positive_weight"]))
             & (purity >= float(policy["minimum_global_purity"]))
-            & (visible_share >= float(policy["minimum_visible_share"]))
+            & (visible_share >= max(
+                float(policy["minimum_visible_share"]),
+                float(config["build"].get("minimum_visible_share", 0.0)),
+            ))
         )
         eligible_local = np.flatnonzero(eligible).astype(np.int64)
         grown_local, grown_step, grown_distance = _connected_growth(

@@ -151,15 +151,41 @@ def prepare(args):
 
 
 def sam(args):
-    from farm_runtime.segmentation_refinement import CachedSAMRefiner, prompt_variants
+    from farm_runtime.segmentation_refinement import (
+        CachedSAMRefiner,
+        prompt_variants,
+        candidate_score,
+    )
+    from farm_runtime.quality.mask_refinement import checked_file
     import torch
 
     evidence = json.loads(args.evidence.read_text())
+    if (
+        evidence.get("reserved_test_opened") is not False
+        or evidence.get("legacy_heldout_used") is not False
+    ):
+        raise ValueError("build-only development evidence required")
     args.output.mkdir(parents=True)
     (args.output / "masks").mkdir()
     (args.output / "visuals").mkdir()
     started = time.monotonic()
-    model = CachedSAMRefiner(args.model)
+    concepts = None
+    if args.backend == "concept":
+        from farm_runtime.concept_segmentation import CachedSAMConceptRefiner
+
+        if args.prompts is None:
+            raise ValueError("concept refinement requires an explicit prompt manifest")
+        concepts = json.loads(args.prompts.read_text())
+        if any(
+            not isinstance(v, list)
+            or len(v) != 3
+            or any(not isinstance(t, str) or not t.strip() for t in v)
+            for v in concepts.values()
+        ):
+            raise ValueError("three nonempty text concepts per object required")
+        model = CachedSAMConceptRefiner(args.model)
+    else:
+        model = CachedSAMRefiner(args.model)
     torch.cuda.synchronize()
     load_seconds = time.monotonic() - started
     rows, skipped = [], []
@@ -169,8 +195,8 @@ def sam(args):
             : args.limit
         ]
     for index, row in enumerate(chosen):
-        image = Image.open(row["crop"]["path"]).convert("RGB")
-        with np.load(row["seeds"]["path"], allow_pickle=False) as seeds:
+        image = Image.open(checked_file(row["crop"])).convert("RGB")
+        with np.load(checked_file(row["seeds"]), allow_pickle=False) as seeds:
             probability = seeds["probability"].astype(np.float32)
         variants = prompt_variants(probability)
         if not variants:
@@ -182,6 +208,11 @@ def sam(args):
                 )
             )
             continue
+        if concepts is not None:
+            variants = [
+                dict(name=f"concept_{i}", text=text)
+                for i, text in enumerate(concepts[str(row["object_id"])])
+            ]
         torch.cuda.reset_peak_memory_stats()
         tick = time.monotonic()
         candidates = model.predict(image, variants)
@@ -191,7 +222,8 @@ def sam(args):
         proposals = []
         core = probability >= max(0.2, 0.65 * float(probability.max()))
         for rank, candidate in enumerate(candidates):
-            mask = candidate.pop("logits") > 0
+            logits = candidate.pop("logits")
+            mask = logits > 0
             coverage = float((mask & core).sum() / max(1, core.sum()))
             ratio = float(mask.sum() / max(1, arrays["baseline"].sum()))
             candidate.update(
@@ -200,6 +232,8 @@ def sam(args):
                 area_ratio=ratio,
                 geometry_eligible=bool(coverage >= 0.9 and 0.3 <= ratio <= 3.0),
             )
+            candidate["soft_logit_key"] = candidate["key"] + "_logits"
+            arrays[candidate["soft_logit_key"]] = logits.astype(np.float16)
             arrays[candidate["key"]] = mask
             proposals.append(candidate)
         path = args.output / "masks" / (name + ".npz")
@@ -210,7 +244,7 @@ def sam(args):
             shown.append(
                 max(
                     candidates_v,
-                    key=lambda c: (c["geometry_eligible"], c["predicted_iou"]),
+                    key=lambda c: (c["geometry_eligible"], candidate_score(c)),
                 )
             )
         canvas = Image.new("RGB", (1600, 500), "#111827")
@@ -253,6 +287,9 @@ def sam(args):
             skipped=skipped,
             evidence=describe_file(args.evidence),
             model_config=describe_file(args.model / "config.json"),
+            backend=args.backend,
+            prompts=describe_file(args.prompts) if args.prompts else None,
+            model_weights=describe_file(args.model / "model.safetensors"),
             model_load_seconds=load_seconds,
             total_seconds=time.monotonic() - started,
             release_eligible=False,
@@ -475,7 +512,7 @@ def vlm(args):
         chosen = select_review_views(observations, args.views)
         images, sheets = [], []
         for row in chosen:
-            image = Image.open(row["crop"]["path"]).convert("RGB")
+            image = Image.open(checked_file(row["crop"])).convert("RGB")
             with np.load(row["masks"]["path"], allow_pickle=False) as archive:
                 arrays = {key: archive[key] for key in archive.files}
             canvas = Image.new("RGB", (1750, 400), "#111827")
@@ -574,6 +611,8 @@ def main(argv=None):
     for name in ("evidence", "model", "output"):
         p.add_argument("--" + name, type=Path, required=True)
     p.add_argument("--limit", type=int, default=0)
+    p.add_argument("--backend", choices=("tracker", "concept"), default="tracker")
+    p.add_argument("--prompts", type=Path)
     p.set_defaults(func=sam)
     p = sub.add_parser("materialize")
     for name in ("proposals", "output"):

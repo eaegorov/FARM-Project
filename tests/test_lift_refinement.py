@@ -152,3 +152,20 @@ def test_refinement_is_deterministic_in_source_row_order() -> None:
     for left, right in zip(first[:3], second[:3], strict=True):
         assert np.array_equal(left, right)
     assert first[3] == second[3]
+
+
+def test_growth_does_not_reintroduce_rejected_build_visible_share():
+    item = _evidence()
+    item.visible_weight[2:] = 5.0  # Share 0.2: passes weak 0.1, fails build 0.3.
+    labels = np.asarray([1, 1, UNKNOWN_ID, UNKNOWN_ID, UNKNOWN_ID], dtype=np.int32)
+    means = np.asarray([[0, 0, 0], [.01, 0, 0], [.014, 0, 0], [.015, 0, 0], [.2, 0, 0]])
+    config = _config()
+    config["build"]["minimum_visible_share"] = 0.3
+    result, _, _, audit = refine_connected_claims(
+        means, np.full(5, .001), {1: item}, labels.copy(),
+        np.where(labels >= 0, .9, 0).astype(np.float32),
+        np.where(labels >= 0, 2, 0).astype(np.uint16),
+        np.zeros(0, np.int64), config,
+    )
+    np.testing.assert_array_equal(result, labels)
+    assert audit["eligible"] == 0

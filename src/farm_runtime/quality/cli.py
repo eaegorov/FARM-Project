@@ -6,6 +6,8 @@ import sys
 
 ACTIONS = {
     "scene-vocabulary": "scene_vocabulary",
+    "concept-discovery": "concept_discovery",
+    "proposal-geometry": "proposal_geometry",
     "refinement": "refinement",
     "discovery": "discovery",
     "discovery-review": "discovery_review",

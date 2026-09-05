@@ -128,6 +128,25 @@ def mask_iou(a, b):
     return float((a & b).sum() / max(1, (a | b).sum()))
 
 
+def candidate_score(candidate):
+    """Keep SAM tracker IoU prediction distinct from concept detection confidence."""
+    kind = candidate.get("score_kind", "tracker_predicted_iou")
+    if kind == "tracker_predicted_iou":
+        score = float(candidate["predicted_iou"])
+    elif kind == "sam3_presence_instance":
+        score = float(candidate["model_score"])
+    else:
+        raise ValueError("unknown segmentation score kind")
+    if not np.isfinite(score):
+        raise ValueError("finite segmentation score required")
+    return score
+
+
+def consensus_score_passes(candidate):
+    threshold = 0.5 if candidate.get("score_kind") == "sam3_presence_instance" else 0.85
+    return candidate_score(candidate) >= threshold
+
+
 def select_mask_proposal(row, arrays, review_choice=None, reviewed=False):
     """Choose conservative consensus, with explicit per-view review precedence.
 
@@ -145,8 +164,17 @@ def select_mask_proposal(row, arrays, review_choice=None, reviewed=False):
             return None, "review_failed_core_guard"
         return selected["key"], "bounded_vlm_with_core_guard"
     candidates = shown[1:]
-    if len(candidates) != 3 or not all(
-        c["geometry_eligible"] and c["predicted_iou"] >= 0.85 for c in candidates
+    if len(candidates) != 3:
+        return None, "proposal_disagreement_or_low_score"
+    # A text query with no instance is unavailable evidence, not a conflicting
+    # mask. Detected but geometrically invalid alternatives still veto changes.
+    concept = all(c.get("score_kind") == "sam3_presence_instance" for c in candidates)
+    if concept:
+        candidates = [
+            c for c in candidates if c.get("abstention") != "no_concept_instance"
+        ]
+    if len(candidates) < (2 if concept else 3) or not all(
+        c["geometry_eligible"] and consensus_score_passes(c) for c in candidates
     ):
         return None, "proposal_disagreement_or_low_score"
     minimum_iou = min(
@@ -156,8 +184,9 @@ def select_mask_proposal(row, arrays, review_choice=None, reviewed=False):
     )
     if minimum_iou < 0.94:
         return None, "proposal_disagreement_or_low_score"
-    selected = max(candidates, key=lambda c: c["predicted_iou"])
-    return selected["key"], "three_prompt_consensus"
+    selected = max(candidates, key=candidate_score)
+    reason = "available_concept_consensus" if concept else "three_prompt_consensus"
+    return selected["key"], reason
 
 
 def restore_crop_mask(mask, row):

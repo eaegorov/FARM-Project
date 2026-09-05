@@ -697,3 +697,75 @@ def test_runner_legacy_missing_interpreter_uses_audited_nonrelease_fallback(
     assert "FARM_BRIDGE_RUNTIME_INTERPRETER_FALLBACK=true" in command
     assert command[command.index("--entrypoint") + 1] == "/opt/conda/envs/rest3d/bin/python"
     assert "--allow-legacy-run" in command
+
+
+def test_json_lift_config_roundtrips_scientific_float(tmp_path, monkeypatch):
+    from tools.farm_shaper_bridge import gaussian_lift
+
+    seen = []
+    monkeypatch.setattr(gaussian_lift, "_require_sections", seen.append)
+    monkeypatch.delenv("FARM_BRIDGE_CONFIG_SHA256", raising=False)
+    path = tmp_path / "config.json"
+    path.write_text('{"render": {"invariant_tolerance": 1e-05}}')
+    config, digest = gaussian_lift.load_config(path)
+    assert config["render"]["invariant_tolerance"] == 1e-5
+    assert seen == [config]
+    assert len(digest) == 64
+
+
+def test_negative_ring_keeps_boundary_other_objects_and_missing_surface_unknown():
+    import cv2
+    from tools.farm_shaper_bridge.gaussian_lift import negative_mask_ring
+    raw = np.zeros((21, 21), bool)
+    raw[8:13, 8:13] = True
+    other = np.zeros_like(raw)
+    other[10, 4] = True
+    surface = np.ones_like(raw)
+    surface[10, 16] = False
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (13, 13))
+    hard = negative_mask_ring(raw, other, surface, kernel)
+    guarded = negative_mask_ring(raw, other, surface, kernel, 2)
+    assert hard[10, 7] and not guarded[10, 7]
+    assert guarded[10, 5]  # Distant background remains negative.
+    assert not guarded[10, 4]  # Another object's pixels are not background.
+    assert not guarded[10, 16]  # Missing depth is unknown.
+    assert not np.any(guarded & raw)
+    assert np.all(~guarded | hard)
+    legacy = cv2.dilate(raw.astype(np.uint8), kernel).astype(bool) & ~raw & ~other & surface
+    np.testing.assert_array_equal(hard, legacy)
+
+
+
+def test_strong_claim_visible_share_rejects_background_tail_without_changing_default():
+    from types import SimpleNamespace
+    from tools.farm_shaper_bridge.gaussian_lift import make_claims
+
+    source = Path(__file__).resolve().parents[1] / "configs/gaussian_lift.v1.yaml"
+    config, _ = load_config(source)
+    config["refinement"]["enabled"] = False
+    config["build"].update(minimum_object_gaussians=1, maximum_object_fraction=1.0)
+    item = SimpleNamespace(
+        obj=SimpleNamespace(category="fixture"), indices=np.arange(3),
+        positive_weight=np.ones(3, np.float32), negative_weight=np.zeros(3, np.float32),
+        visible_weight=np.array([1.0, 20.0, 10.0], np.float32),
+        positive_timestamps=np.full(3, 2, np.uint16),
+        negative_timestamps=np.zeros(3, np.uint16), build_timestamp_count=2,
+    )
+    default = make_claims({7: item}, 10, config)
+    assert default[0][:3].tolist() == [7, 7, 7]
+    config["build"]["minimum_visible_share"] = 0.1
+    filtered = make_claims({7: item}, 10, config)
+    assert filtered[0][:3].tolist() == [7, UNKNOWN_ID, 7]
+    assert filtered[3][0]["claims_rejected_visible_share"] == 1
+    np.testing.assert_array_equal(filtered[1][[0, 2]], default[1][[0, 2]])
+
+
+@pytest.mark.parametrize("value", [-0.1, 1.1, float("nan"), float("inf")])
+def test_lift_config_rejects_invalid_visible_share(tmp_path, value):
+    source = Path(__file__).resolve().parents[1] / "configs/gaussian_lift.v1.yaml"
+    config, _ = load_config(source)
+    config["build"]["minimum_visible_share"] = value
+    path = tmp_path / "invalid.json"
+    path.write_text(json.dumps(config))
+    with pytest.raises(ValueError, match="build.minimum_visible_share"):
+        load_config(path)

@@ -1,0 +1,137 @@
+import numpy as np
+
+from farm_runtime.proposal_geometry import (
+    GeometryPolicy,
+    associate,
+    equivalent_masks,
+    project_evidence,
+    stable_depth,
+    surface_points,
+)
+
+
+def scene():
+    depth = np.full((40, 40), 2.0, dtype=np.float32)
+    K = np.array([[40.0, 0, 20], [0, 40.0, 20], [0, 0, 1.0]])
+    return dict(
+        depth=depth, K=K, T_world_cam=np.eye(4), excluded=np.zeros((40, 40), bool)
+    )
+
+
+def node(frame, mask, data, label="object"):
+    points, metrics = surface_points(mask, **data)
+    return dict(
+        frame=frame,
+        timestamp=frame,
+        mask=mask,
+        points=points,
+        labels=[label],
+        **metrics,
+    )
+
+
+def test_metric_backprojection_and_exclusion_are_not_background():
+    f = scene()
+    f["T_world_cam"][:3, 3] = [1.0, 2.0, 3.0]
+    mask = np.zeros((40, 40), bool)
+    mask[15:26, 15:26] = True
+    points, metrics = surface_points(mask, **f)
+    np.testing.assert_allclose(np.median(points, axis=0), [1.0, 2.0, 5.0])
+    f["excluded"][:] = True
+    points, metrics = surface_points(mask, **f)
+    assert len(points) == 0
+    assert metrics["excluded_pixels"] == 121
+
+
+def test_depth_discontinuity_is_not_a_surface_between_objects():
+    depth = np.full((20, 20), 2.0, np.float32)
+    depth[:, 10:] = 4.0
+    stable = stable_depth(depth)
+    assert not stable[:, 9:11].any()
+    assert stable[:, :9].all() and stable[:, 11:].all()
+
+
+def test_occlusion_missing_depth_and_exclusion_are_unknown():
+    f = scene()
+    points = np.array([[0.0, 0.0, 3.0]])
+    mask = np.zeros((40, 40), bool)
+    evidence = project_evidence(points, mask, **f)
+    assert evidence["occluded"] == 1
+    assert evidence["mask_opposed"] == 0
+    f["depth"][:] = 0
+    assert project_evidence(points, mask, **f)["known_depth"] == 0
+    f["depth"][:] = 3
+    f["excluded"][:] = True
+    assert project_evidence(points, mask, **f)["known_depth"] == 0
+
+
+def test_visible_surface_outside_mask_is_negative():
+    f = scene()
+    mask = np.zeros((40, 40), bool)
+    evidence = project_evidence(np.array([[0.0, 0.0, 2.0]]), mask, **f)
+    assert evidence["mask_opposed"] == 1
+    assert evidence["surface_visible"] == 1
+
+
+def test_duplicate_chain_cannot_bridge_different_masks():
+    masks = []
+    for shift in (0, 5, 10):
+        mask = np.zeros((1, 120), bool)
+        mask[:, shift : shift + 100] = True
+        masks.append(mask)
+    assert equivalent_masks(masks, [1.0, 0.9, 0.8], 0.90) == [[0, 1], [2]]
+
+
+def test_same_surface_matches_despite_conflicting_category_names():
+    f = scene()
+    mask = np.zeros((40, 40), bool)
+    mask[10:30, 10:30] = True
+    nodes = [node("a", mask, f, "extinguisher"), node("b", mask, f, "motor")]
+    groups, evidence = associate(nodes, {"a": f, "b": f})
+    assert groups == [[0, 1]]
+    assert evidence["mutual_edges"][0]["component_merge_allowed"]
+
+
+def test_same_label_and_pixels_at_remote_world_location_do_not_merge():
+    f, g = scene(), scene()
+    g["T_world_cam"][0, 3] = 10
+    mask = np.zeros((40, 40), bool)
+    mask[10:30, 10:30] = True
+    groups, _ = associate([node("a", mask, f), node("b", mask, g)], {"a": f, "b": g})
+    assert groups == [[0], [1]]
+
+
+def test_same_view_scope_alternatives_do_not_union():
+    f = scene()
+    mask = np.zeros((40, 40), bool)
+    mask[8:32, 8:32] = True
+    part = np.zeros_like(mask)
+    part[8:20, 8:32] = True
+    groups, evidence = associate([node("a", mask, f), node("a", part, f)], {"a": f})
+    assert groups == [[0], [1]]
+    assert len(evidence["scope_alternatives"]) == 1
+
+
+def test_component_cannot_link_survives_transitive_bridge(monkeypatch):
+    import farm_runtime.proposal_geometry as module
+
+    f = scene()
+    mask = np.zeros((40, 40), bool)
+    mask[10:30, 10:30] = True
+    nodes = [node("a", mask, f), node("b", mask, f), node("c", mask, f)]
+
+    def compare(a, b, frames, policy):
+        conflict = (a["frame"], b["frame"]) == ("a", "c")
+        return dict(
+            decision="separate" if conflict else "match",
+            reason="visible_mask_conflict" if conflict else "mutual_surface_support",
+            score=0.9 if a["frame"] == "a" else 0.8,
+        )
+
+    monkeypatch.setattr(module, "compare_surfaces", compare)
+    groups, evidence = associate(nodes, {name: f for name in "abc"})
+    assert groups == [[0, 1], [2]]
+    assert [e["component_merge_allowed"] for e in evidence["mutual_edges"]] == [
+        True,
+        False,
+    ]
