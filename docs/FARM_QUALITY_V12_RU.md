@@ -267,3 +267,14 @@ Official external Boxer: 37 boxes / 10 views за 5,41 с, однако част
 На трёх новых spatial groups 25/47/201 выбраны шесть RGB. У шкафа 107/4608 surface samples, у тележки 35/2648 получают минимум два отрицательных timestamp и отрицательный перевес. По RGB удаляемые группы лежат на отдельном верхнем ящике и окружающем полу/оборудовании. Fixed-orientation envelope тележки: 1,928×2,060×0,772 → 1,347×0,936×0,772 м; после diagnostic FARM PCA refit — 1,318×0,800×0,772 м. Физическая полнота этих размеров не подтверждена. У крана corroborated samples растут 1553→2528, но далёкие выбросы остаются unknown и не обрезаются.
 
 SAM3 6-view batch: 37,81 с, включая cold load 26,01 с; peak 3892,69 MiB. Дополнительный lexical probe 2 views: 7,85 с, без улучшения маски целой конструкции. Final CPU validation + 6 RGB sheets: 3,82 с. Проверены 17 сохранённых изображений/фигур; полный набор 1162 tests passed, затем 20 targeted tests после depth-integrity guard. Отчёт: V12 `09_surface_evidence/REVIEW_RU.md`. Native bank и production defaults не заменены; следующий шаг — адаптер этих observations к существующему exact Gaussian lift с exclusion/unknown слоями.
+
+
+## 14. Native observations и mixed-depth evidence
+
+Команды native-observations / native-review / native-evaluation переиспользуют exact FARM VJP, CSR, connected growth и heldout QC. Frozen input содержит source RGB/depth/camera/mask hashes. Observation exclusions убирают transient pixels из FG/BG/visibility/QC; полностью скрытая цель остаётся unobservable. Source row order сохранён. Cross-bundle split использует source frame_id, поскольку nominal timestamp_ns перенумеровывается.
+
+Opt-in policies: mask.positive_depth_policy / negative_depth_policy (stable default, valid experiment); mask.negative_domain (ring default, visible_background experiment); candidate.depth_gate_policy (surface default, not_behind experiment). Backprojection seeds всегда требуют stable depth. Два прежних depth gates удаляли видимую спираль тали. Согласованный rendered-contribution режим её восстанавливает; простое ослабление FG отдельно усиливает фон и отклонено.
+
+Новые groups 25/47/201: native build 4,069→4,888 с. Build-reference IoU 0,802→0,841 / 0,916→0,918 / 0,680→0,706. Тележка на двух новых timestamps: 0,568→0,629. Шкаф на одном виде со scope mismatch control housing: 0,629→0,582. Whole-crane control SAM не прошёл association. Это automatic consistency, не human gold. Пол/груз и scope остаются нерешёнными; default bank не заменён.
+
+V12 10_native_observations/REVIEW_RU.md содержит причинную диагностику, варианты, observed OBB, frozen control plan и визуальный вердикт. 16 новых RGBD views 23,20 с; SAM 5 controls 46,61 с с cold load 26,07 с; reverse QC двух banks 7,42 с. 1175 tests passed, затем 27 targeted checks и реальный control run после metadata fingerprint compatibility. Следующий этап — bounded build-crop refinement whole/part/content, затем legacy objects/Knaack и scene-wide runtime budget.

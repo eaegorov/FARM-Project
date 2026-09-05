@@ -46,6 +46,7 @@ from tools.farm_shaper_bridge.common import (  # noqa: E402
     canonical_sha256,
     diversity_metrics,
     load_mask_pair,
+    load_observation_exclusion,
     load_run,
     metric_c2w_to_scene_w2c,
     open_graphdeco_ply,
@@ -223,9 +224,16 @@ def _require_sections(config: Mapping[str, Any]) -> None:
     if config["candidate"].get("domain", "obb") == "obb_mask_surface":
         integer("candidate", "surface_pixel_stride", minimum=1)
         finite("candidate", "surface_voxel_m", minimum=0, minimum_open=True)
+    if config["candidate"].get("depth_gate_policy", "surface") not in ("surface", "not_behind"):
+        raise ValueError("candidate.depth_gate_policy must be surface or not_behind")
     finite("candidate", "minimum_opacity", minimum=0, maximum=1)
     finite("candidate", "maximum_radius_m", minimum=0, minimum_open=True)
 
+    if config["mask"].get("negative_domain", "ring") not in ("ring", "visible_background"):
+        raise ValueError("mask.negative_domain must be ring or visible_background")
+    for key in ("positive_depth_policy", "negative_depth_policy"):
+        if config["mask"].get(key, "stable") not in ("stable", "valid"):
+            raise ValueError(f"mask.{key} must be stable or valid")
     integer("mask", "erosion_pixels", minimum=0)
     ring = integer("mask", "negative_ring_pixels", minimum=0)
     if "negative_guard_pixels" in config["mask"]:
@@ -1244,9 +1252,14 @@ def mask_surface_candidates(run, obj, gaussians, split, config):
     max_depth, max_spacing = 0., 0.
     for image_id, observations in sorted(grouped.items()):
         frame = run.frame(image_id)
-        decoded, _, audit, depth_audit = _load_view_masks(run, frame, {obj.object_id: observations}, config)
+        decoded, surface_weight, audit, depth_audit = _load_view_masks(run, frame, {obj.object_id: observations}, config)
         depth = np.load(frame.depth_path, mmap_mode="r")
+        # Candidate backprojection retains stable depth even when foreground
+        # contribution evidence permits thin depth-discontinuous structures.
         mask = decoded[obj.object_id]["raw"] & _surface_interior(depth, run, config)
+        excluded, _ = load_observation_exclusion(run, frame)
+        if excluded is not None:
+            mask &= ~excluded
         points, far_depth, spacing = backproject_mask_surface(mask, depth, frame.K, frame.T_world_cam,
             stride=int(policy["surface_pixel_stride"]), depth_min=float(run.rgbd_config["depth_min_m"]),
             depth_max=float(run.rgbd_config["depth_max_m"]))
@@ -1280,13 +1293,18 @@ def _surface_interior(depth: np.ndarray, run: RunData, config: Mapping[str, Any]
     return valid_interior & (discontinuity <= float(config["mask"]["depth_discontinuity_m"]))
 
 
-def negative_mask_ring(raw, other, surface, ring_kernel, guard_pixels=0):
+def negative_mask_ring(raw, other, surface, ring_kernel, guard_pixels=0, *, domain="ring"):
     """Keep the uncertain boundary unknown instead of asserting background.
 
     A zero guard exactly preserves the original hard-mask evidence policy.
     Guard width is in the working mask grid, like erosion_pixels.
     """
-    dilated = cv2.dilate(raw.astype(np.uint8), ring_kernel, iterations=1).astype(bool)
+    if domain not in ("ring", "visible_background"):
+        raise ValueError("unknown negative evidence domain")
+    if not np.any(raw):
+        return np.zeros_like(raw, dtype=bool)
+    dilated = (np.ones_like(raw, dtype=bool) if domain == "visible_background" else
+               cv2.dilate(raw.astype(np.uint8), ring_kernel, iterations=1).astype(bool))
     protected = raw
     if guard_pixels:
         kernel = cv2.getStructuringElement(
@@ -1306,6 +1324,21 @@ def _load_view_masks(
     if depth.shape != frame.depth_size:
         raise ValueError(f"depth shape mismatch for image_id={frame.image_id}")
     surface = _surface_interior(depth, run, config)
+    excluded, exclusion_audit = load_observation_exclusion(run, frame)
+    if excluded is not None:
+        surface &= ~excluded
+    valid_surface = (np.isfinite(depth) &
+        (depth >= float(run.rgbd_config["depth_min_m"])) &
+        (depth <= float(run.rgbd_config["depth_max_m"])))
+    if excluded is not None:
+        valid_surface &= ~excluded
+    # Rendered contribution remains defined at mixed-depth boundaries; source
+    # backprojection still uses stable depth in mask_surface_candidates.
+    foreground_surface = (valid_surface if config["mask"].get(
+        "positive_depth_policy", "stable") == "valid" else surface)
+    background_surface = (valid_surface if config["mask"].get(
+        "negative_depth_policy", "stable") == "valid" else surface)
+    visible_surface = background_surface.copy()
     decoded: dict[int, dict[str, Any]] = {}
     audit: list[dict[str, Any]] = []
     for object_id, observations in observations_by_object.items():
@@ -1349,14 +1382,20 @@ def _load_view_masks(
         ).astype(bool)
         positive = eroded.astype(np.float32) * float(config["mask"]["raw_interior_weight"])
         positive[item["inlier"] & raw] = float(config["mask"]["inlier_weight"])
-        positive *= surface
+        positive *= foreground_surface
+        visible_surface |= raw & foreground_surface
         if int(np.count_nonzero(positive)) < int(config["mask"]["minimum_positive_pixels"]):
-            positive = (raw & surface).astype(np.float32) * float(config["mask"]["raw_interior_weight"])
+            positive = (raw & foreground_surface).astype(np.float32) * float(config["mask"]["raw_interior_weight"])
         other = all_raw & ~raw
         negative = negative_mask_ring(
-            raw, other, surface, ring_kernel,
+            raw, other, background_surface, ring_kernel,
             int(config["mask"].get("negative_guard_pixels", 0)),
+            domain=config["mask"].get("negative_domain", "ring"),
         )
+        if not np.any(raw & foreground_surface) and (
+            excluded is not None or config["mask"].get("negative_domain") == "visible_background"
+        ):
+            negative[:] = False
         item["positive_weight"] = positive * normalizer
         item["negative_weight"] = negative.astype(np.float32) * normalizer
     depth_audit = {
@@ -1364,7 +1403,9 @@ def _load_view_masks(
         "bytes": frame.depth_path.stat().st_size,
         "sha256": sha256_file(frame.depth_path),
     }
-    return decoded, surface.astype(np.float32) * normalizer, audit, depth_audit
+    if exclusion_audit is not None:
+        depth_audit["observation_exclusion"] = exclusion_audit
+    return decoded, visible_surface.astype(np.float32) * normalizer, audit, depth_audit
 
 
 def _depth_gate(
@@ -1395,10 +1436,17 @@ def _depth_gate(
         + float(config["candidate"]["depth_relative_tolerance"]) * reference,
         float(config["candidate"]["radius_tolerance_multiplier"]) * evidence.radius_m[selected],
     )
+    # Expected rendered depth can lie behind a thin visible foreground when
+    # the pixel also transmits background. This optional gate rejects hidden
+    # centres without rejecting that front contribution; VJP/multiview purity
+    # still decides ownership. It is not a change to backprojected surfaces.
+    residual = z[selected] - reference
+    compatible = (residual <= tolerance if config["candidate"].get(
+        "depth_gate_policy", "surface") == "not_behind" else np.abs(residual) <= tolerance)
     valid = (
         np.isfinite(reference)
         & (reference >= float(config["candidate"]["depth_absolute_tolerance_m"]))
-        & (np.abs(z[selected] - reference) <= tolerance)
+        & compatible
     )
     result[selected[valid]] = True
     return result
@@ -1799,6 +1847,9 @@ def heldout_qc(
             available = [object_id for object_id in sorted(decoded) if object_id in indices_by_id]
             depth = np.asarray(np.load(frame.depth_path, mmap_mode="r"), dtype=np.float32)
             surface = _surface_interior(depth, run, config)
+            excluded, _ = load_observation_exclusion(run, frame)
+            if excluded is not None:
+                surface &= ~excluded
             for start in range(0, len(available), maximum_objects):
                 batch_ids = available[start:start + maximum_objects]
                 torch.cuda.synchronize()
@@ -1812,7 +1863,22 @@ def heldout_qc(
                     target = decoded[object_id]["raw"]
                     soft = mass[..., column]
                     predicted = soft >= float(config["heldout"]["alpha_threshold"])
+                    excluded_target_pixels = 0
+                    if excluded is not None:
+                        excluded_target_pixels = int((target & excluded).sum())
+                        target = target & ~excluded
+                        if not target.any():
+                            view_audit[-1].setdefault("unobservable_object_ids", []).append(object_id)
+                            continue
+                        predicted = predicted & ~excluded
+                        soft = np.where(excluded, 0.0, soft)
                     metrics = binary_mask_metrics(predicted, target, soft)
+                    if excluded is not None:
+                        metrics.update({
+                            "evaluation_excluded_pixels": int(excluded.sum()),
+                            "target_excluded_pixels": excluded_target_pixels,
+                            "evaluation_domain": "pixels outside observation exclusions",
+                        })
                     valid_depth = (
                         predicted & target & surface
                         & np.isfinite(object_depth[..., column])

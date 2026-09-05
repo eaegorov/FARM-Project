@@ -460,6 +460,7 @@ class RunData:
     legacy: bool
     integrity: Mapping[str, Any] | None = None
     mask_overrides: Mapping[tuple[int, int], Path] | None = None
+    observation_exclusions: Mapping[int, Mapping[str, Any]] | None = None
 
     def frame(self, image_id: int) -> Frame:
         if image_id < 0 or image_id >= len(self.frames):
@@ -956,6 +957,29 @@ def resolve_mask_path(run: RunData, observation: MaskObservation) -> Path:
             f"image={observation.image_id}, basename={observation.basename}: {existing}"
         )
     return existing[0]
+
+
+def load_observation_exclusion(run: RunData, frame: Frame) -> tuple[np.ndarray | None, dict[str, Any] | None]:
+    """Load immutable per-view unknown pixels; absent input preserves legacy behavior.
+
+    Excluded pixels cannot supply positive, negative, visibility, or evaluation
+    evidence. The original scene depth and Gaussian identity remain unchanged.
+    """
+    records = getattr(run, "observation_exclusions", None)
+    if not records or frame.image_id not in records:
+        return None, None
+    record = records[frame.image_id]
+    path = Path(record["path"])
+    if not path.is_absolute():
+        path = run.run_dir / path
+    digest = sha256_file(path)
+    if digest != record.get("sha256") or path.stat().st_size != record.get("bytes"):
+        raise ValueError("observation exclusion artifact changed")
+    excluded = np.load(path, allow_pickle=False)
+    if excluded.shape != frame.depth_size or excluded.dtype != np.bool_:
+        raise ValueError("observation exclusion must be a boolean native-grid mask")
+    return excluded, {"path": str(path), "sha256": digest, "bytes": path.stat().st_size,
+                      "excluded_pixels": int(excluded.sum()), "interpretation": "unknown, never background"}
 
 
 def load_mask_pair(path: Path, expected_shape: tuple[int, int]) -> tuple[np.ndarray, np.ndarray, str]:
