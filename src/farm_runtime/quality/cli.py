@@ -11,6 +11,8 @@ ACTIONS = {
     "scope-evidence": "scope_evidence",
     "boxer": "boxer",
     "surface-obb": "surface_obb",
+    "surface-evidence": "surface_evidence",
+    "surface-validation": "surface_validation",
     "refinement": "refinement",
     "discovery": "discovery",
     "discovery-review": "discovery_review",

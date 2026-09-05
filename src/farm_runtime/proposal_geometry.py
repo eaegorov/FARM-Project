@@ -115,6 +115,7 @@ def project_evidence(
     policy=GeometryPolicy(),
     *,
     mask_is_dilated=False,
+    include_point_indices=False,
 ):
     """Evaluate only surface-visible points; occlusion/missing depth are unknown."""
     pose = np.asarray(T_world_cam)
@@ -145,7 +146,7 @@ def project_evidence(
     )
     supported = int(mask[y[visible], x[visible]].sum())
     total = int(visible.sum())
-    return {
+    result = {
         "source_points": len(points),
         "in_frame": int(inside.sum()),
         "known_depth": len(chosen),
@@ -157,6 +158,15 @@ def project_evidence(
         "visible_fraction": total / max(1, len(points)),
         "mask_agreement": supported / max(1, total),
     }
+
+    if include_point_indices:
+        result.update(
+            surface_indices=chosen[visible],
+            surface_pixels_xy=uv[chosen[visible]],
+            occluded_indices=chosen[z > surface_depth + tolerance],
+            in_front_of_surface_indices=chosen[foreground],
+        )
+    return result
 
 
 def compare_surfaces(a, b, frames, policy=GeometryPolicy()):
