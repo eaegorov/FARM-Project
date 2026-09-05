@@ -63,6 +63,16 @@ def fit_native_obb(points, weights, prior_rotation, *, tail_fraction=0.005):
     center = origin + ((lo + hi) * 0.5) @ rotation.T
     dimensions = np.maximum(hi - lo, 0.0)
     inside = np.all((local >= lo) & (local <= hi), axis=1)
+    probe_tail = max(tail_fraction, 0.025)
+    probe_extents = np.array(
+        [
+            weighted_quantile(local[:, axis], weights, [probe_tail, 1 - probe_tail])
+            for axis in range(3)
+        ]
+    )
+    probe_dimensions = np.maximum(probe_extents[:, 1] - probe_extents[:, 0], 0)
+    sensitivity = np.maximum(dimensions - probe_dimensions, 0)
+    relative = sensitivity / np.maximum(dimensions, 1e-12)
     return {
         "center_m": center.tolist(),
         "dimensions_m": dimensions.tolist(),
@@ -76,4 +86,15 @@ def fit_native_obb(points, weights, prior_rotation, *, tail_fraction=0.005):
         "size_semantics": "robust observed Gaussian-center envelope",
         "physical_hidden_extent_known": False,
         "minimum_size_padding_applied": False,
+        "extent_stability": {
+            "probe_tail_fraction": probe_tail,
+            "probe_dimensions_m": probe_dimensions.tolist(),
+            "sensitivity_m": sensitivity.tolist(),
+            "relative_sensitivity": relative.tolist(),
+            "sensitive_axes": np.flatnonzero(
+                (relative >= 0.20) & (sensitivity >= 0.01)
+            ).tolist(),
+            "interpretation": "tail-sensitivity diagnostic, not a physical confidence interval",
+            "physical_size_validated": False,
+        },
     }

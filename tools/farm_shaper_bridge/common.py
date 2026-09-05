@@ -459,6 +459,7 @@ class RunData:
     scene_preflight: Mapping[str, Any]
     legacy: bool
     integrity: Mapping[str, Any] | None = None
+    mask_overrides: Mapping[tuple[int, int], Path] | None = None
 
     def frame(self, image_id: int) -> Frame:
         if image_id < 0 or image_id >= len(self.frames):
@@ -940,6 +941,10 @@ def load_run(run_dir: Path, *, allow_legacy: bool) -> RunData:
 
 
 def resolve_mask_path(run: RunData, observation: MaskObservation) -> Path:
+    if run.mask_overrides:
+        override = run.mask_overrides.get((observation.object_id, observation.image_id))
+        if override is not None:
+            return override
     direct = run.run_dir / "mapping" / "masks" / f"object_{observation.object_id:06d}" / observation.basename
     assembly = run.run_dir / "qa" / "assemblies" / "masks" / f"object_{observation.object_id:06d}" / observation.basename
     hint = str(observation.record.get("path") or "").replace("\\", "/")

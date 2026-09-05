@@ -32,6 +32,14 @@ def main(argv=None):
         type=Path,
         help="Reviewed labels and native-support OBBs for display",
     )
+    p.add_argument(
+        "--baseline-ablation",
+        type=Path,
+        help="Compare the same domain before/after a development change",
+    )
+    p.add_argument(
+        "--domain", choices=("obb", "obb_mask_surface"), default="obb_mask_surface"
+    )
     args = p.parse_args(argv)
     if args.output.exists():
         raise ValueError("output must be new")
@@ -44,10 +52,24 @@ def main(argv=None):
         from farm_runtime.quality.camera_refinement import apply_camera_refinement
 
         run = apply_camera_refinement(run, Path(camera_refinement["path"]))
-    before, after = [
-        read_bank(args.ablation / d / "proposal_bank.npz")
-        for d in ("obb", "obb_mask_surface")
-    ]
+    if args.baseline_ablation:
+        baseline_comparison = json.loads(
+            (args.baseline_ablation / "comparison.json").read_text()
+        )
+        for field in ("split", "source_ply", "camera_refinement"):
+            if baseline_comparison[field] != comparison[field]:
+                raise ValueError(
+                    "before/after comparison must use identical split, source and cameras"
+                )
+        before = read_bank(args.baseline_ablation / args.domain / "proposal_bank.npz")
+        after = read_bank(args.ablation / args.domain / "proposal_bank.npz")
+        names = ("Before mask refinement", "After mask refinement")
+    else:
+        before, after = [
+            read_bank(args.ablation / d / "proposal_bank.npz")
+            for d in ("obb", "obb_mask_surface")
+        ]
+        names = ("OBB candidates", "Surface union")
     run = replace(
         run,
         objects=tuple(
@@ -62,15 +84,20 @@ def main(argv=None):
         }
     source = open_graphdeco_ply(args.ply)
     gs = lift.load_gaussians(source, run.meters_per_scene_unit)
-    qc = json.loads((args.ablation / "obb_mask_surface/report.json").read_text())[
-        "heldout_qc"
-    ]
+    qc = json.loads(
+        (
+            args.ablation
+            / (args.domain if args.baseline_ablation else "obb_mask_surface")
+            / "report.json"
+        ).read_text()
+    )["heldout_qc"]
     audit = []
     for obj in run.objects:
         ids_a, ids_b = before.get(obj.object_id, np.empty(0, np.int64)), after.get(
             obj.object_id, np.empty(0, np.int64)
         )
         added = np.setdiff1d(ids_b, ids_a)
+        removed = np.setdiff1d(ids_a, ids_b)
         rows = next(r for r in qc if r["object_id"] == obj.object_id)["views"]
         # Show two distinct legacy heldout timestamps, not two virtual views of one pose.
         chosen, timestamps = [], set()
@@ -111,8 +138,11 @@ def main(argv=None):
             for col, (mask, label) in enumerate(
                 (
                     (target, "Legacy 2D reference (not human gold)"),
-                    (a >= 0.1, f"OBB candidates: {len(ids_a)} Gaussians"),
-                    (b >= 0.1, f"Surface union: {len(ids_b)} Gaussians; +{len(added)}"),
+                    (a >= 0.1, f"{names[0]}: {len(ids_a)} Gaussians"),
+                    (
+                        b >= 0.1,
+                        f"{names[1]}: {len(ids_b)}; +{len(added)} / -{len(removed)}",
+                    ),
                 )
             ):
                 image = rgb.copy()
@@ -153,11 +183,12 @@ def main(argv=None):
         # Object-frame orthographic projections of actual source centers.
         local_a = (gs.means_m[ids_a] - obj.center_m) @ obj.rotation
         local_added = (gs.means_m[added] - obj.center_m) @ obj.rotation
+        local_removed = (gs.means_m[removed] - obj.center_m) @ obj.rotation
         canvas = Image.new("RGB", (1500, 550), "#111827")
         draw = ImageDraw.Draw(canvas)
         draw.text(
             (12, 10),
-            f"Object {obj.object_id}: native Gaussian centers; gray=baseline, green=added, orange=initial OBB; cyan=reviewed support OBB",
+            f"Object {obj.object_id}: native Gaussian centers; gray=baseline, green=added, red=removed; orange=initial OBB; cyan=reviewed OBB",
             fill="white",
         )
         for col, axes in enumerate(((0, 1), (0, 2), (1, 2))):
@@ -170,7 +201,11 @@ def main(argv=None):
                 q = (p[:, axes] - (lo + hi) / 2) * scale
                 return np.column_stack((col * 500 + 250 + q[:, 0], 285 - q[:, 1]))
 
-            for cloud, color in ((local_a, "#777777"), (local_added, "#32ff5a")):
+            for cloud, color in (
+                (local_a, "#777777"),
+                (local_added, "#32ff5a"),
+                (local_removed, "#ff625f"),
+            ):
                 for x, y in project(cloud):
                     draw.point((int(x), int(y)), fill=color)
             dims = obj.dimensions_m[list(axes)] * 0.5
@@ -211,6 +246,10 @@ def main(argv=None):
             "views": audit,
             "review_catalog": str(args.review_catalog) if args.review_catalog else None,
             "camera_refinement": camera_refinement,
+            "baseline_ablation": (
+                str(args.baseline_ablation) if args.baseline_ablation else None
+            ),
+            "domain": args.domain if args.baseline_ablation else "obb_vs_surface",
             "reserved_test_opened": False,
             "release_eligible": False,
         },

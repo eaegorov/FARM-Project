@@ -32,3 +32,15 @@ def test_zero_weight_outliers_cannot_expand_obb_even_at_extreme_quantiles():
     )
     with pytest.raises(ValueError, match="positive support"):
         weighted_quantile([1.0, 2.0], [0.0, 0.0], [0.5])
+
+
+def test_native_obb_flags_thickness_sensitive_to_small_outlier_population():
+    rng = np.random.default_rng(29)
+    plane = rng.uniform([-1, -0.5, -0.001], [1, 0.5, 0.001], (10000, 3))
+    plane[:200, 2] = rng.uniform(0.05, 0.2, 200)
+    obb = fit_native_obb(plane, np.ones(len(plane)), np.eye(3))
+    stability = obb["extent_stability"]
+    assert 2 in stability["sensitive_axes"]
+    assert stability["probe_dimensions_m"][2] < 0.003
+    assert obb["dimensions_m"][2] > 0.05
+    assert stability["physical_size_validated"] is False

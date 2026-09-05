@@ -2,14 +2,15 @@ schema_version: farm.scene.v1
 scene_id: knaack
 
 inputs:
-  colmap_model: ../../../data/knaack_colmap_pinhole/sparse/0
-  image_root: ../../../data/knaack_colmap_pinhole/images
-  gaussian_ply: ../../../gcloud_splatica/pipeline-9389769e-9863-4c72-bb87-02d1ad9b3cdd/uuid500/gaussian_result/point_cloud_last.ply
-output_root: ../../../output/farm_pipeline
+  colmap_model: ../../../../data/knaack_colmap_pinhole/sparse/0
+  image_root: ../../../../data/knaack_colmap_pinhole/images
+  gaussian_ply: ../../../../data/knaack_3dgs_scene.ply
+output_root: ../../../../output/farm_pipeline
 
 camera:
   accepted_models: [PINHOLE]
   require_virtual_pinhole: true
+  rgb_alignment: rig
 
 camera_grouping:
   mode: regex
@@ -40,7 +41,7 @@ resources:
   profile: auto
   gpu: "0"
   model_manifest: ../models/farm_models.v1.json
-  secrets_file: ../../../secrets.json
+  secrets_file: ../../../../secrets.json
   render_resolution: 896
   depth_batch_size: 1
   mapping_batch_size: 2

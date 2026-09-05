@@ -29,6 +29,8 @@ def main(argv=None):
     for key in ("run", "ply", "split", "config", "packet", "output"):
         p.add_argument("--" + key, type=Path, required=True)
     p.add_argument("--camera-refinement", type=Path)
+    p.add_argument("--mask-refinement", type=Path)
+    p.add_argument("--graph-pruning", action="store_true")
     args = p.parse_args(argv)
     if args.output.exists():
         raise ValueError("output must be new")
@@ -55,6 +57,12 @@ def main(argv=None):
         from farm_runtime.quality.camera_refinement import apply_camera_refinement
 
         run = apply_camera_refinement(run, args.camera_refinement)
+    if args.mask_refinement is not None:
+        from farm_runtime.quality.mask_refinement import apply_mask_refinement
+
+        run = apply_mask_refinement(
+            run, args.mask_refinement, args.split, args.camera_refinement
+        )
     args.output.mkdir(parents=True)
     table = open_graphdeco_ply(args.ply)
     if describe_file(args.ply)["sha256"] != packet["source_ply"]["sha256"]:
@@ -93,6 +101,26 @@ def main(argv=None):
             blocked,
             policy,
         )
+        graph_report = None
+        if args.graph_pruning:
+            from tools.farm_shaper_bridge.graph_refinement import prune_weak_claims
+
+            colors = np.clip(
+                np.column_stack([table.data[f"f_dc_{i}"] for i in range(3)])
+                * 0.28209479177387814
+                + 0.5,
+                0,
+                1,
+            )
+            owner, confidence, support, graph_report = prune_weak_claims(
+                gaussians.means_m,
+                colors,
+                gaussians.radius_m,
+                evidence,
+                owner,
+                confidence,
+                support,
+            )
         for row in object_rows:
             row["refinement"] = next(
                 r for r in refinement["objects"] if r["object_id"] == row["object_id"]
@@ -121,6 +149,7 @@ def main(argv=None):
             "conflicts": conflicts,
             "refinement": refinement,
             "geometry_gate": geometry,
+            "graph_pruning": graph_report,
             "heldout_qc": qc,
             "legacy_reference_pass_ids": sorted(accepted),
             "proposal_bank": describe_file(bank_path),
@@ -179,6 +208,10 @@ def main(argv=None):
                 if args.camera_refinement
                 else None
             ),
+            "mask_refinement": (
+                describe_file(args.mask_refinement) if args.mask_refinement else None
+            ),
+            "graph_pruning": args.graph_pruning,
             "legacy_mask_reference_only": True,
             "reserved_test_opened": False,
             "release_eligible": False,

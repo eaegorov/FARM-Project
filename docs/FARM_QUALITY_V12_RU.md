@@ -220,3 +220,22 @@ CPU helpers находятся в `farm_runtime`, эксперименты — �
 внеповерхностных выбросов перед OBB и multiview semantic evidence. Surface growth и angular selection
 не объявлены универсальными defaults: пилот выявил как улучшения, так и регрессии.
 Полный набор тестов: 1098 passed; после cache-правки выполнены дополнительные ingress tests и реальный RGB-D прогон.
+
+
+## 9. Object refinement и вторая сцена
+
+`farm quality refinement` объединяет `prepare`, `orient`, `sam`, `vlm`, `materialize`.
+`lift-ablation --mask-refinement` подключает только SHA-bound build observations;
+`lift-review --baseline-ablation --domain` сравнивает одинаковые источник/камеры/split.
+`lift-ablation --graph-pruning` — экспериментальная локальная очистка, выключена по умолчанию.
+
+`04_refinement/REVIEW_RU.md` в V12 содержит результаты 103 кропов, сравнение Qwen3-VL-8B
+с Qwen3.5-9B, оба graph-cut пилота и Knaack ingress (48/48 кадров, 59,49 с).
+SAM/VLM и graph cut пока не улучшают маски универсально; текущий reviewed bank сохранён.
+Новая геометрия экспортирует `extent_stability`: чувствительность размеров к хвостам
+распределения native centers не является физическим доверительным интервалом.
+
+Исправленная вертикаль принимает список и NumPy-вектор. Для кропов учитывается pinhole
+projection в луче самого объекта; обратный поворот маски сохраняет исходные координаты.
+Qwen checkpoint 3.5-9B доступен локально, но автоматический object scope пока не подтверждён.
+Следующий этап отделяет semantic RGB evidence от выбора масок и расширяет discovery.

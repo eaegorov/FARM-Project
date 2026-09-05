@@ -103,7 +103,11 @@ def balanced_view_selection(
 
 
 def upright_quarter_turns(
-    rotation_world_to_camera: np.ndarray, world_up: Sequence[float]
+    rotation_world_to_camera: np.ndarray,
+    world_up: Sequence[float],
+    *,
+    image_point=None,
+    intrinsics=None,
 ) -> dict[str, Any]:
     """Reuse FARM's pose/gravity normalization without interpolation.
 
@@ -117,14 +121,75 @@ def upright_quarter_turns(
         np.linalg.det(r), 1.0, atol=1e-5
     ):
         raise ValueError("camera rotation must be proper orthonormal")
-    return gravity_upright_orientation(
+    result = gravity_upright_orientation(
         0,
         frame_pose_index={
             0: {"camera_right_world": r[0].tolist(), "camera_down_world": r[1].tolist()}
         },
-        world_up_vector=world_up,
+        world_up_vector=np.asarray(world_up, dtype=float).tolist(),
         world_up_source="declared_scene_gravity",
     )
+    if (image_point is None) != (intrinsics is None):
+        raise ValueError("image_point and intrinsics must be supplied together")
+    if image_point is None:
+        return result
+    k = np.asarray(intrinsics, float)
+    uv = np.asarray(image_point, float)
+    if (
+        k.shape != (3, 3)
+        or uv.shape != (2,)
+        or not np.isfinite(k).all()
+        or not np.isfinite(uv).all()
+        or k[0, 0] <= 0
+        or k[1, 1] <= 0
+    ):
+        raise ValueError("valid pixel point and pinhole intrinsics required")
+    up = np.asarray(world_up, float)
+    if up.shape != (3,) or not np.isfinite(up).all() or np.linalg.norm(up) < 1e-12:
+        raise ValueError("finite nonzero world up required")
+    g = r @ (up / np.linalg.norm(up))
+    # Derivative of pinhole projection at this object's viewing ray. Omitting
+    # g_z is only valid at the principal point (or for orthographic cameras).
+    projected = np.array(
+        [
+            k[0, 0] * g[0] - (uv[0] - k[0, 2]) * g[2],
+            k[1, 1] * g[1] - (uv[1] - k[1, 2]) * g[2],
+        ]
+    )
+    magnitude = np.linalg.norm(projected)
+    if magnitude <= 1e-6:
+        result.update(
+            status="unavailable",
+            reason="world_up_parallel_to_object_ray",
+            applied_quarter_turns_ccw=0,
+            applied_rotation_degrees_ccw=0,
+        )
+        return result
+    x, y = projected / magnitude
+    candidates = [(0, -y), (1, x), (2, y), (3, -x)]
+    turns = max(candidates, key=lambda item: (item[1], -item[0]))[0]
+    corrected = (x, y)
+    for _ in range(turns):
+        corrected = (corrected[1], -corrected[0])
+    result.update(
+        status="applied" if turns else "already_upright",
+        applied_quarter_turns_ccw=turns,
+        applied_rotation_degrees_ccw=turns * 90,
+        projected_world_up_image_xy=[float(x), float(y)],
+        source_roll_degrees_clockwise=float(np.degrees(np.arctan2(x, -y))),
+        residual_roll_degrees=float(
+            np.degrees(np.arctan2(corrected[0], -corrected[1]))
+        ),
+        source_orientation={
+            0: "upright",
+            1: "clockwise_90",
+            2: "upside_down",
+            3: "counterclockwise_90",
+        }[turns],
+        reason="pinhole_world_up_at_object_ray",
+        image_point=uv.tolist(),
+    )
+    return result
 
 
 def rotate_image(values: np.ndarray, quarter_turns: int) -> np.ndarray:

@@ -1293,7 +1293,7 @@ def _load_view_masks(
             raw |= child_raw
             inlier |= child_inlier
             hashes.append({
-                "path": path.relative_to(run.run_dir).as_posix(),
+                "path": (path.relative_to(run.run_dir).as_posix() if path.is_relative_to(run.run_dir) else path.as_posix()),
                 "bytes": path.stat().st_size,
                 "sha256": digest,
             })

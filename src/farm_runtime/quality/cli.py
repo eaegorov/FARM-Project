@@ -5,6 +5,7 @@ import importlib
 import sys
 
 ACTIONS = {
+    "refinement": "refinement",
     "discovery": "discovery",
     "export-review": "export_review",
     "camera-refinement": "camera_refinement",
