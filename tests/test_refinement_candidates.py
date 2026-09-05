@@ -191,3 +191,49 @@ def test_refinement_adapter_binds_hashes_and_never_touches_heldout(tmp_path):
     mask_path.write_bytes(b"changed")
     with pytest.raises(ValueError, match="hash mismatch"):
         apply_mask_refinement(run, path, split_path, camera_path)
+
+
+def test_semantics_separates_roles_and_requires_evidence_for_function():
+    from farm_runtime.semantic_refinement import validate_semantics
+
+    result = dict(
+        label="enclosure",
+        caption="A black enclosure.",
+        functional_identity={"label": None, "direct_visual_evidence": ""},
+        integral_parts=["body"],
+        external_connections=["cable"],
+        supporting_objects=["pallet"],
+        contained_objects=[],
+        uncertainty=["function unknown"],
+        observed_image_ids=[7, 8],
+    )
+    assert (
+        validate_semantics(json.dumps(result), [7, 8])["functional_identity"]["label"]
+        is None
+    )
+    result["integral_parts"].append("cable")
+    with pytest.raises(ValueError, match="conflicting ownership"):
+        validate_semantics(json.dumps(result), [7, 8])
+    result["integral_parts"].remove("cable")
+    result["functional_identity"]["label"] = "server"
+    with pytest.raises(ValueError, match="direct visual evidence"):
+        validate_semantics(json.dumps(result), [7, 8])
+
+
+def test_scene_vocabulary_retains_separate_roles_and_validates_image_ids():
+    from farm_runtime.quality.scene_vocabulary import validate_vocabulary
+
+    value = {
+        "views": [
+            {
+                "image_id": 1,
+                "objects": ["Cabinet", "cabinet"],
+                "structures": ["wall"],
+                "transient": ["person"],
+            }
+        ]
+    }
+    result = validate_vocabulary(json.dumps(value), [1])
+    assert result["views"][0]["objects"] == ["cabinet"]
+    with pytest.raises(ValueError, match="image IDs"):
+        validate_vocabulary(json.dumps(value), [2])

@@ -16,6 +16,61 @@ No dimensions, brand guesses, or text not legible in the photo. Image IDs below 
 """
 
 
+SEMANTIC_PROMPT = """Describe the SAME physical target in these photographs. A thin yellow rectangle is only an approximate location cue. Inspect the original RGB appearance; no segmentation candidates are shown. The target is the main coherent object inside the cue, not every item touched by the rectangle.
+Return a conservative observable category and one factual appearance sentence. Do not infer hidden function, exact subtype, brand or mounting merely from common associations. Put a functional label only when distinct visible structure or clearly legible text establishes it; otherwise use null and state the uncertainty. A cabinet-shaped object with cables may have several possible functions.
+Describe ownership explicitly. Parts fixed inside the main enclosure, handles, doors and integral fittings belong to integral_parts. External building pipes and installation wiring belong to external_connections even when connected. A surface, shelf or pallet beneath the object is a supporting_object, not an integral part. A separate object inside a container belongs to contained_objects; the container remains the whole container. Do not list one item in two ownership groups. Only mention visible parts. Do not invent hidden or absent details. If grouping is uncertain, say so rather than forcing a merge.
+Return only this JSON schema:
+{"label": "observable English object category", "caption": "one factual English sentence", "functional_identity": {"label": null, "direct_visual_evidence": ""}, "integral_parts": ["part"], "external_connections": ["connection"], "supporting_objects": ["support"], "contained_objects": ["content"], "uncertainty": ["what is unresolved"], "observed_image_ids": [123, 456]}.
+Image IDs are identifiers, not category hints.
+"""
+
+
+def validate_semantics(text, image_ids):
+    text = text.strip()
+    if text.startswith("```"):
+        text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+    result = json.loads(text)
+    for field in ("label", "caption"):
+        if not isinstance(result.get(field), str) or not result[field].strip():
+            raise ValueError("nonempty label/caption required")
+    groups = (
+        "integral_parts",
+        "external_connections",
+        "supporting_objects",
+        "contained_objects",
+        "uncertainty",
+    )
+    ownership = set()
+    for group in groups:
+        if not isinstance(result.get(group), list) or not all(
+            isinstance(x, str) for x in result[group]
+        ):
+            raise ValueError(f"invalid semantic group {group}")
+        if group != "uncertainty":
+            normalized = {" ".join(x.lower().split()) for x in result[group]}
+            if ownership & normalized:
+                raise ValueError("component assigned to conflicting ownership groups")
+            ownership |= normalized
+    ids = result.get("observed_image_ids")
+    if (
+        not isinstance(ids, list)
+        or len(ids) != len(image_ids)
+        or set(ids) != set(image_ids)
+    ):
+        raise ValueError("wrong semantic evidence image IDs")
+    function = result.get("functional_identity")
+    if not isinstance(function, dict) or not isinstance(
+        function.get("direct_visual_evidence"), str
+    ):
+        raise ValueError("functional evidence required")
+    if function.get("label") is not None and (
+        not isinstance(function["label"], str)
+        or not function["direct_visual_evidence"].strip()
+    ):
+        raise ValueError("functional identity must cite direct visual evidence")
+    return result
+
+
 def select_review_views(rows, budget=2):
     """Select visible, distinct timestamps; never duplicate one timestamp's views."""
     if type(budget) is not int or not 1 <= budget <= 3:
@@ -99,11 +154,24 @@ class LocalObjectReviewer:
             attn_implementation="sdpa",
         ).eval()
 
-    def review(self, images, image_ids):
+    def review(self, images, image_ids, *, semantic_only=False):
+        return self.ask(
+            SEMANTIC_PROMPT if semantic_only else REVIEW_PROMPT,
+            images,
+            image_ids,
+            validate_semantics if semantic_only else validate_review,
+        )
+
+    def ask(self, prompt, images, image_ids, validator, *, max_new_tokens=500):
         if not 1 <= len(images) <= 3 or len(images) != len(image_ids):
             raise ValueError("one to three aligned image/ID pairs required")
         torch = self.torch
-        content = [{"type": "text", "text": REVIEW_PROMPT}]
+        content = [
+            {
+                "type": "text",
+                "text": prompt,
+            }
+        ]
         for image, image_id in zip(images, image_ids):
             content += [
                 {"type": "text", "text": f"Sheet image_id={image_id}"},
@@ -121,13 +189,15 @@ class LocalObjectReviewer:
         torch.cuda.synchronize()
         started = time.monotonic()
         with torch.inference_mode():
-            output = self.model.generate(**batch, max_new_tokens=500, do_sample=False)
+            output = self.model.generate(
+                **batch, max_new_tokens=max_new_tokens, do_sample=False
+            )
         torch.cuda.synchronize()
         raw = self.processor.decode(
             output[0, batch.input_ids.shape[1] :], skip_special_tokens=True
         )
         try:
-            parsed, error = validate_review(raw, image_ids), None
+            parsed, error = validator(raw, image_ids), None
         except (ValueError, TypeError, KeyError, AttributeError) as exc:
             parsed, error = None, str(exc)
         return dict(

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import logging
 import time
 from collections import OrderedDict
@@ -193,13 +194,38 @@ class YOLOESegmenter(SegmentationBackend):
     def _init_prompt_free_model(self) -> YOLOE:
         print(f"vocab file path: {self.vocab_file}")
         vocab_names = _load_vocab_list(self.vocab_file)
+        if not vocab_names:
+            raise ValueError("YOLOE vocabulary must contain at least one category")
         self._base_ckpt = _resolve_weights(self.model_id, prompt_free=False)
         base = YOLOE(str(self._base_ckpt))
-        vocab = base.get_vocab(vocab_names)
+        # get_vocab builds MobileCLIP on the base model device. Leaving the
+        # base on CPU makes the full open vocabulary a costly serial startup.
+        base.to(self.device)
+        base.eval()
+        # Reuse the checkpoint's text projection and final vocabulary-head
+        # fusion. The temporary backbone is never used for image inference.
+        with torch.inference_mode():
+            embeddings = torch.cat([
+                base.model.get_text_pe(vocab_names[start:start + 64], cache_clip_model=True)
+                for start in range(0, len(vocab_names), 64)
+            ], dim=1)
+            head = base.model.model[-1]
+            head.fuse(embeddings)
+            vocab = torch.nn.ModuleList([layer[-1] for layer in head.cv3])
+        del head
+        del embeddings
         del base
+        # Fused modules store bound forward methods; collect these cycles now
+        # so the temporary detector/text encoder do not retain device memory.
+        gc.collect()
         pf_ckpt = _resolve_weights(self.model_id, prompt_free=True)
         model = YOLOE(str(pf_ckpt))
-        model.set_vocab(vocab, names=vocab_names)
+        # Vocabulary heads and the warmup inside set_vocab must share a device.
+        model.to(self.device)
+        model.eval()
+        # set_vocab performs a dummy forward to populate detector anchors.
+        with torch.inference_mode():
+            model.set_vocab(vocab, names=vocab_names)
         head = model.model.model[-1]
         head.is_fused = True
         # Keep the internal head threshold very low and rely on

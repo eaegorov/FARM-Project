@@ -281,6 +281,10 @@ def materialize(args):
         checked_file(evidence["cameras"]),
     )
     review = json.loads(args.review.read_text()) if args.review else {"objects": []}
+    if args.review and review.get("schema") != "farm.local-object-review.v1":
+        raise ValueError(
+            "mask choices require a mask-review manifest, not semantic roles"
+        )
     if (
         args.review
         and review["proposals"]["sha256"] != describe_file(args.proposals)["sha256"]
@@ -450,12 +454,15 @@ def vlm(args):
         LocalObjectReviewer,
         select_review_views,
         REVIEW_PROMPT,
+        SEMANTIC_PROMPT,
     )
 
     proposals = json.loads(args.proposals.read_text())
     args.output.mkdir(parents=True)
     (args.output / "visuals").mkdir()
-    (args.output / "prompt.txt").write_text(REVIEW_PROMPT)
+    (args.output / "prompt.txt").write_text(
+        SEMANTIC_PROMPT if args.semantic_only else REVIEW_PROMPT
+    )
     started = time.monotonic()
     model = LocalObjectReviewer(args.model)
     torch.cuda.synchronize()
@@ -497,11 +504,23 @@ def vlm(args):
             path = (
                 args.output / "visuals" / f"{object_id:06d}_{row['image_id']:06d}.jpg"
             )
+            if args.semantic_only:
+                canvas = image.copy()
+                draw = ImageDraw.Draw(canvas)
+                yy, xx = np.where(arrays["baseline"])
+                if len(xx):
+                    draw.rectangle(
+                        (int(xx.min()), int(yy.min()), int(xx.max()), int(yy.max())),
+                        outline="#ffd84d",
+                        width=max(1, round(max(image.size) / 350)),
+                    )
             canvas.save(path, quality=94)
             images.append(canvas)
             sheets.append(describe_file(path))
         torch.cuda.reset_peak_memory_stats()
-        response = model.review(images, [r["image_id"] for r in chosen])
+        response = model.review(
+            images, [r["image_id"] for r in chosen], semantic_only=args.semantic_only
+        )
         result = dict(
             object_id=object_id,
             **response,
@@ -514,7 +533,11 @@ def vlm(args):
     write_json(
         args.output / "manifest.json",
         dict(
-            schema="farm.local-object-review.v1",
+            schema=(
+                "farm.local-object-semantics.v1"
+                if args.semantic_only
+                else "farm.local-object-review.v1"
+            ),
             objects=results,
             proposals=describe_file(args.proposals),
             model_config=describe_file(args.model / "config.json"),
@@ -566,6 +589,7 @@ def main(argv=None):
     for name in ("proposals", "model", "output"):
         p.add_argument("--" + name, type=Path, required=True)
     p.add_argument("--views", type=int, choices=(1, 2, 3), default=2)
+    p.add_argument("--semantic-only", action="store_true")
     p.set_defaults(func=vlm)
     args = parser.parse_args(argv)
     if args.output.exists():

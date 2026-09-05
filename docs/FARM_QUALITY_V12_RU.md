@@ -239,3 +239,10 @@ SAM/VLM и graph cut пока не улучшают маски универса�
 projection в луче самого объекта; обратный поворот маски сохраняет исходные координаты.
 Qwen checkpoint 3.5-9B доступен локально, но автоматический object scope пока не подтверждён.
 Следующий этап отделяет semantic RGB evidence от выбора масок и расширяет discovery.
+
+
+## 10. Scene-wide discovery и исправление startup
+
+Из исходного DINO import убрано глобальное включение cuDNN autotuning. YOLOE готовит текстовые признаки на выбранном устройстве пакетами по 64 категории и освобождает временную модель. В прямом L4 smoke startup + первые два кадра: 53,83 → 6,70 с; whole-process Torch peak: 21 443,98 → 1 355,62 MiB. На 48 development views сохранены 313 labels и масок (min paired IoU 0,98166). Изменение DINO включено в fingerprint mapping stage.
+
+Добавлены `farm quality scene-vocabulary`, `discovery --variant`, `discovery-review`, `refinement vlm --semantic-only`. Узкий VLM vocabulary потерял большую часть исходных proposals; union сохранил их, но новые наблюдения нуждаются в geometry/scope validation. Новый обзор 12 RGB и всех 29 изменений хранится в `05_discovery/REVIEW_RU.md` и SHA-bound `visual_review.json`. Полный checkpoint и тесты — в V12 `STATUS.json`. Default labels и native mask bank не подменены экспериментальным словарём.

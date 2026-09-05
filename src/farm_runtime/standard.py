@@ -63,6 +63,7 @@ STANDARD_STAGE_CODE_INPUTS: dict[str, tuple[str, ...]] = {
         "src/scene_graph/pipeline/orchestrator.py",
         "src/scene_graph/segmentation/overlap.py",
         "src/scene_graph/segmentation/yoloe.py",
+        "src/scene_graph/segmentation/dino.py",
         "ros/mapping/mapping/lib/parameters.py",
         "ros/mapping/mapping/nodes/streaming_mapper.py",
     ),

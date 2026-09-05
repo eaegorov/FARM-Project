@@ -15,7 +15,9 @@ from transformers import AutoImageProcessor, AutoModel
 torch.set_grad_enabled(False)
 
 # Favor fast CUDA kernels when available
-torch.backends.cudnn.benchmark = True
+# Leave cuDNN algorithm search unchanged on import. In particular,
+# exhaustive autotuning can consume almost all device memory on the first
+# YOLOE frame, even when DINO feature extraction is disabled.
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 try:

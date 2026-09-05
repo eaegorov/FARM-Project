@@ -5,8 +5,10 @@ import importlib
 import sys
 
 ACTIONS = {
+    "scene-vocabulary": "scene_vocabulary",
     "refinement": "refinement",
     "discovery": "discovery",
+    "discovery-review": "discovery_review",
     "export-review": "export_review",
     "camera-refinement": "camera_refinement",
     "lift-ablation": "lift_ablation",

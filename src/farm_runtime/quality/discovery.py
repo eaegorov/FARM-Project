@@ -185,6 +185,59 @@ def build_ablation(packet, colmap, *, sampling, timestamp_count, image_root):
     }
 
 
+def predictor_parity(model, plan, *, resolution=640):
+    """Compare the custom soft decoder to the pinned native YOLOE predictor."""
+    import torch
+    from ultralytics.models.yolo.segment.predict import SegmentationPredictor
+
+    rows = []
+    for name in plan["variants"][0]["views"][:2]:
+        with Image.open(plan["sources"][name]["source_image"]["path"]) as im:
+            image = im.convert("RGB")
+            image.thumbnail((resolution, resolution))
+        options = dict(
+            source=image,
+            imgsz=resolution,
+            conf=0.4,
+            iou=0.5,
+            agnostic_nms=True,
+            max_det=200,
+            device=0,
+            retina_masks=True,
+            verbose=False,
+            save=False,
+        )
+        model.predictor = None
+        native = model.predict(**options, predictor=SegmentationPredictor)[0]
+        native_boxes = native.boxes.data.detach().clone()
+        native_masks = (
+            None if native.masks is None else native.masks.data.detach().clone().bool()
+        )
+        model.predictor = None
+        soft = model.predict(**options, predictor=soft_mask_predictor())[0]
+        box_equal = native_boxes.shape == soft.boxes.data.shape and torch.allclose(
+            native_boxes, soft.boxes.data, atol=1e-4, rtol=1e-5
+        )
+        if native_masks is None:
+            mask_equal = soft.masks is None
+        else:
+            mask_equal = soft.masks is not None and torch.equal(
+                native_masks, soft.masks.data.bool()
+            )
+        rows.append(
+            dict(
+                source=name,
+                boxes_scores_classes_equal=bool(box_equal),
+                masks_equal=bool(mask_equal),
+                detections=len(native_boxes),
+            )
+        )
+        if not box_equal or not mask_equal:
+            raise ValueError("custom decoder differs from native YOLOE predictions")
+    model.predictor = None
+    return rows
+
+
 def infer(plan, output, *, model_root, vocabulary, world_up):
     import torch
     from scene_graph.segmentation.yoloe import YOLOESegmenter
@@ -200,6 +253,8 @@ def infer(plan, output, *, model_root, vocabulary, world_up):
     predictor = soft_mask_predictor()
     torch.cuda.synchronize()
     setup_seconds = time.monotonic() - started
+    setup_peak_allocated_mib = torch.cuda.max_memory_allocated() / 2**20
+    parity = predictor_parity(model, plan)
     results = []
     for variant in plan["variants"]:
         dest = output / variant["name"]
@@ -392,6 +447,8 @@ def infer(plan, output, *, model_root, vocabulary, world_up):
         "model": describe_file(model_root / "yoloe/yoloe-v8l-seg-pf.pt"),
         "vocabulary": describe_file(vocabulary),
         "setup_seconds": setup_seconds,
+        "setup_peak_allocated_mib": setup_peak_allocated_mib,
+        "native_predictor_parity": parity,
         "variants": results,
         "peak_process_rss_kib": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
         "test_opened": False,
@@ -413,6 +470,16 @@ def main(argv=None):
     p.add_argument("--timestamps", type=int, default=48)
     p.add_argument("--world-up", nargs=3, type=float, required=True)
     p.add_argument("--plan-only", action="store_true")
+    p.add_argument(
+        "--variant",
+        action="append",
+        choices=(
+            "center_raw",
+            "balanced_raw",
+            "balanced_upright",
+            "all_lowres_upright",
+        ),
+    )
     args = p.parse_args(argv)
     if args.output.exists() or args.timestamps < 2:
         raise ValueError("output must be new and timestamps >= 2")
@@ -424,6 +491,8 @@ def main(argv=None):
         timestamp_count=args.timestamps,
         image_root=args.images,
     )
+    if args.variant:
+        plan["variants"] = [v for v in plan["variants"] if v["name"] in args.variant]
     args.output.mkdir(parents=True)
     write_json(args.output / "plan.json", plan)
     if not args.plan_only:
