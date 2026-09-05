@@ -16,6 +16,7 @@ ACTIONS = {
     "native-observations": "native_observations",
     "native-review": "native_review",
     "native-evaluation": "native_evaluation",
+    "native-refinement": "native_refinement",
     "refinement": "refinement",
     "discovery": "discovery",
     "discovery-review": "discovery_review",

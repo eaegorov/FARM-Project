@@ -1,7 +1,7 @@
 # FARM V12: воспроизводимость и независимая оценка качества
 
 Документ содержит инфраструктуру F0/F1 и обновление реализации FARM от 2026-09-05.
-Текущий отчёт и изображения: `output/farm_pipeline/factory/experiments/factory-universal-v12-quality-v1/03_development/REVIEW_RU.md` относительно `3dgs_work`.
+Текущий отчёт и изображения: `output/farm_pipeline/factory/experiments/factory-universal-v12-quality-v1/11_scope_refinement/REVIEW_RU.md` относительно `3dgs_work`.
 Реализованы rig-preserving RGB↔3DGS registration, angular/upright discovery ablation,
 расширение exact-lift кандидатов по build surface, native-support OBB и финальный CSR allowlist export.
 Шесть объектов имеют проверяемые masks/labels/captions/scope. Универсальная точность,
@@ -278,3 +278,16 @@ Opt-in policies: mask.positive_depth_policy / negative_depth_policy (stable defa
 Новые groups 25/47/201: native build 4,069→4,888 с. Build-reference IoU 0,802→0,841 / 0,916→0,918 / 0,680→0,706. Тележка на двух новых timestamps: 0,568→0,629. Шкаф на одном виде со scope mismatch control housing: 0,629→0,582. Whole-crane control SAM не прошёл association. Это automatic consistency, не human gold. Пол/груз и scope остаются нерешёнными; default bank не заменён.
 
 V12 10_native_observations/REVIEW_RU.md содержит причинную диагностику, варианты, observed OBB, frozen control plan и визуальный вердикт. 16 новых RGBD views 23,20 с; SAM 5 controls 46,61 с с cold load 26,07 с; reverse QC двух banks 7,42 с. 1175 tests passed, затем 27 targeted checks и реальный control run после metadata fingerprint compatibility. Следующий этап — bounded build-crop refinement whole/part/content, затем legacy objects/Knaack и scene-wide runtime budget.
+
+## 15. Crop refinement по другим physical timestamps — 2026-09-05
+
+Отчёт: output/farm_pipeline/factory/experiments/factory-universal-v12-quality-v1/11_scope_refinement/REVIEW_RU.md.
+Добавлена команда farm quality native-refinement. Она использует существующие SAM crop proposals и exact FARM VJP, исключает проверяемый physical timestamp вместе со sibling views, сравнивает foreground coverage и background leakage, сохраняет ambiguous scope как отказ. Отсутствующие и конфликтующие native votes не становятся фоном.
+
+При недостаточном абсолютном покрытии исходного RGB новая маска должна сохранять исходное покрытие с отдельным identity floor. Сильно противоречивое object/view observation без подходящей замены исключается как unknown; другие объекты и минимум два timestamps сохраняются. Изменение crop не переписывает область за его пределами. Новый режим доступен только отдельной development-командой; глобальные параметры не изменены.
+
+Девять crops, 138 proposals: две замены и один исключённый вид. Тележка: native count 16923→14638; на двух уже открытых development controls IoU 0,6292→0,6553, precision 0,7221→0,7852, recall 0,8524→0,8155. Визуально очищены просветы рамы и верхний груз, но нижний груз/часть границ остаются. Шкаф 14788→14681 с почти неизменным control IoU; принадлежность левого housing нерешена. Кран сохраняет все 39114 native IDs и спираль. Физические размеры не валидированы.
+
+Tracker девять crops 18,00 с; concept 57,48 с (альтернативные диагностические ветви). Выбор по сохранённым proposals 9,77 с, native rebuild около 4,3 с. 46 изображений фактически просмотрены; 1182 tests passed, затем 34 targeted после provenance checks и проверка всех реальных proposals. Human gold и scene-wide runtime этими результатами не заменяются.
+
+Следующий шаг: перенос на legacy шесть Factory объектов и Knaack, затем общий scene-wide профиль с ограниченным бюджетом refinement; не расширять число эвристик на единственном примере.
