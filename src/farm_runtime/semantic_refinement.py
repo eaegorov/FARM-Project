@@ -25,6 +25,42 @@ Image IDs are identifiers, not category hints.
 """
 
 
+SCOPE_PROMPT = """Inspect one spatially associated target candidate across views. Each sheet has two panels: PHOTO shows the original RGB with an approximate yellow location rectangle; PROPOSAL shows the actual current cyan mask. A mask is a hypothesis, not truth. No detector category is provided. Check both RGB appearance and what the mask covers. The visible candidate may be a whole object, an integral part, a collection of separate objects, a covering, or a patch of a larger surface. Do not upgrade a door, handle, panel, wrapping sheet or covered contents into the full parent machine. A partial view at the image border is still valid evidence; do not invent unseen extent. If the views appear to refer to different objects, state that explicitly.
+Return a conservative observable label for the ACTUAL candidate scope and one factual appearance sentence. Hidden device function, brand and dimensions must not be guessed. Distinguish integral parts, external connections, supporting objects and contained objects. Report only visible components; no component may occur in two ownership lists. Wrapped objects can be distinct from their removable wrapping. Geometry containment alone does not establish ownership.
+Return only JSON:
+{"label":"observable English candidate category","caption":"one factual English sentence","functional_identity":{"label":null,"direct_visual_evidence":""},"integral_parts":[],"external_connections":[],"supporting_objects":[],"contained_objects":[],"uncertainty":[],"observed_image_ids":[123,456],"same_physical_target":true,"scope":{"kind":"whole_object|integral_part|object_collection|covering|surface_region|unclear","parent_description":null,"mask_coverage_issues":[]}}.
+Choose exactly one scope kind. same_physical_target is true, false, or null if identity is uncertain. parent_description is a visible possible larger parent or null; it does not authorize merging. mask_coverage_issues lists visible omissions or unrelated inclusions, or is empty. A valid JSON response is not proof of mask accuracy.
+"""
+
+
+def validate_scope(text, image_ids):
+    result = validate_semantics(text, image_ids)
+    if "same_physical_target" not in result or (
+        result["same_physical_target"] is not None
+        and type(result["same_physical_target"]) is not bool
+    ):
+        raise ValueError("explicit target identity verdict required")
+    scope = result.get("scope")
+    if not isinstance(scope, dict) or scope.get("kind") not in {
+        "whole_object",
+        "integral_part",
+        "object_collection",
+        "covering",
+        "surface_region",
+        "unclear",
+    }:
+        raise ValueError("invalid physical scope kind")
+    if "parent_description" not in scope or (
+        scope["parent_description"] is not None
+        and not isinstance(scope["parent_description"], str)
+    ):
+        raise ValueError("parent description must be a string or null")
+    issues = scope.get("mask_coverage_issues")
+    if not isinstance(issues, list) or not all(isinstance(x, str) for x in issues):
+        raise ValueError("mask coverage issues must be strings")
+    return result
+
+
 def validate_semantics(text, image_ids):
     text = text.strip()
     if text.startswith("```"):

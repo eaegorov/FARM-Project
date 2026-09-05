@@ -485,83 +485,138 @@ def orient(args):
     )
 
 
+def review_image(image, row, *, semantic_only=False, scope=False):
+    """Build the requested visual evidence without fabricated mask candidates."""
+    from farm_runtime.quality.mask_refinement import checked_file
+
+    with np.load(checked_file(row["masks"]), allow_pickle=False) as archive:
+        arrays = {key: archive[key] for key in archive.files}
+    if semantic_only or scope:
+        mask = arrays["baseline"]
+        if mask.dtype != np.bool_ or mask.shape != (image.height, image.width):
+            raise ValueError("baseline mask must match the RGB crop")
+        photo = image.copy()
+        yy, xx = np.where(mask)
+        if len(xx):
+            ImageDraw.Draw(photo).rectangle(
+                (int(xx.min()), int(yy.min()), int(xx.max()), int(yy.max())),
+                outline="#ffd84d",
+                width=max(1, round(max(image.size) / 350)),
+            )
+        if not scope:
+            return photo
+        rgb = np.asarray(image).copy()
+        rgb[mask] = (rgb[mask] * 0.6 + np.array([40, 210, 255]) * 0.4).astype(np.uint8)
+        canvas = Image.new("RGB", (1040, 550), "#111827")
+        draw = ImageDraw.Draw(canvas)
+        for col, tile in enumerate((photo, Image.fromarray(rgb))):
+            tile.thumbnail((508, 508))
+            canvas.paste(
+                tile,
+                (col * 520 + (508 - tile.width) // 2, 32 + (508 - tile.height) // 2),
+            )
+            draw.text(
+                (col * 520 + 8, 8), "PHOTO" if col == 0 else "PROPOSAL", fill="white"
+            )
+        return canvas
+    canvas = Image.new("RGB", (1750, 400), "#111827")
+    draw = ImageDraw.Draw(canvas)
+    for col in range(5):
+        rgb = np.asarray(image).copy()
+        if col:
+            mask = arrays[row["display_candidates"][col - 1]["key"]]
+            if mask.dtype != np.bool_ or mask.shape != rgb.shape[:2]:
+                raise ValueError("candidate mask must match the RGB crop")
+            rgb[mask] = (rgb[mask] * 0.6 + np.array([40, 210, 255]) * 0.4).astype(
+                np.uint8
+            )
+        tile = Image.fromarray(rgb)
+        tile.thumbnail((342, 360))
+        canvas.paste(
+            tile, (col * 350 + (342 - tile.width) // 2, 30 + (360 - tile.height) // 2)
+        )
+        draw.text(
+            (col * 350 + 8, 8), "PHOTO" if not col else str(col - 1), fill="white"
+        )
+    return canvas
+
+
 def vlm(args):
     import torch
+    from farm_runtime.quality.mask_refinement import checked_file
     from farm_runtime.semantic_refinement import (
         LocalObjectReviewer,
         select_review_views,
         REVIEW_PROMPT,
         SEMANTIC_PROMPT,
+        SCOPE_PROMPT,
+        validate_scope,
     )
 
     proposals = json.loads(args.proposals.read_text())
+    scope = getattr(args, "scope", False)
+    if scope and (
+        proposals.get("schema") != "farm.object-scope-evidence.v1"
+        or proposals.get("reserved_test_opened") is not False
+    ):
+        raise ValueError(
+            "scope review requires development-only spatial-group evidence"
+        )
+    prompt = (
+        SCOPE_PROMPT
+        if scope
+        else SEMANTIC_PROMPT if args.semantic_only else REVIEW_PROMPT
+    )
     args.output.mkdir(parents=True)
     (args.output / "visuals").mkdir()
-    (args.output / "prompt.txt").write_text(
-        SEMANTIC_PROMPT if args.semantic_only else REVIEW_PROMPT
-    )
+    (args.output / "prompt.txt").write_text(prompt)
     started = time.monotonic()
-    model = LocalObjectReviewer(args.model)
-    torch.cuda.synchronize()
-    load_seconds = time.monotonic() - started
     groups = defaultdict(list)
     for row in proposals["observations"]:
         groups[row["object_id"]].append(row)
-    results = []
+    # Verify and prepare every selected image before loading the large VLM.
+    prepared = []
     for object_id, observations in sorted(groups.items()):
-        chosen = select_review_views(observations, args.views)
+        if scope:
+            chosen = observations[: args.views]  # Already selected by scope-evidence.
+            if len({r["timestamp"] for r in chosen}) != len(chosen):
+                raise ValueError("scope review views must have distinct timestamps")
+        else:
+            chosen = select_review_views(observations, args.views)
         images, sheets = [], []
         for row in chosen:
-            image = Image.open(checked_file(row["crop"])).convert("RGB")
-            with np.load(row["masks"]["path"], allow_pickle=False) as archive:
-                arrays = {key: archive[key] for key in archive.files}
-            canvas = Image.new("RGB", (1750, 400), "#111827")
-            draw = ImageDraw.Draw(canvas)
-            for col in range(5):
-                rgb = np.asarray(image).copy()
-                if col:
-                    mask = arrays[row["display_candidates"][col - 1]["key"]]
-                    rgb[mask] = (
-                        rgb[mask] * 0.6 + np.array([40, 210, 255]) * 0.4
-                    ).astype(np.uint8)
-                tile = Image.fromarray(rgb)
-                tile.thumbnail((342, 360))
-                canvas.paste(
-                    tile,
-                    (
-                        col * 350 + (342 - tile.width) // 2,
-                        30 + (360 - tile.height) // 2,
-                    ),
-                )
-                draw.text(
-                    (col * 350 + 8, 8),
-                    "PHOTO" if not col else str(col - 1),
-                    fill="white",
-                )
+            with Image.open(checked_file(row["crop"])) as source:
+                image = source.convert("RGB")
+            canvas = review_image(
+                image, row, semantic_only=args.semantic_only, scope=scope
+            )
             path = (
                 args.output / "visuals" / f"{object_id:06d}_{row['image_id']:06d}.jpg"
             )
-            if args.semantic_only:
-                canvas = image.copy()
-                draw = ImageDraw.Draw(canvas)
-                yy, xx = np.where(arrays["baseline"])
-                if len(xx):
-                    draw.rectangle(
-                        (int(xx.min()), int(yy.min()), int(xx.max()), int(yy.max())),
-                        outline="#ffd84d",
-                        width=max(1, round(max(image.size) / 350)),
-                    )
             canvas.save(path, quality=94)
             images.append(canvas)
             sheets.append(describe_file(path))
+        prepared.append((object_id, chosen, images, sheets))
+    before_load = time.monotonic()
+    model = LocalObjectReviewer(args.model)
+    torch.cuda.synchronize()
+    load_seconds = time.monotonic() - before_load
+    results = []
+    for object_id, chosen, images, sheets in prepared:
         torch.cuda.reset_peak_memory_stats()
-        response = model.review(
-            images, [r["image_id"] for r in chosen], semantic_only=args.semantic_only
+        image_ids = [r["image_id"] for r in chosen]
+        response = (
+            model.ask(
+                SCOPE_PROMPT, images, image_ids, validate_scope, max_new_tokens=768
+            )
+            if scope
+            else model.review(images, image_ids, semantic_only=args.semantic_only)
         )
         result = dict(
             object_id=object_id,
             **response,
             sheets=sheets,
+            evidence_timestamps=[r["timestamp"] for r in chosen],
             peak_allocated_mib=torch.cuda.max_memory_allocated() / 2**20,
         )
         results.append(result)
@@ -571,9 +626,13 @@ def vlm(args):
         args.output / "manifest.json",
         dict(
             schema=(
-                "farm.local-object-semantics.v1"
-                if args.semantic_only
-                else "farm.local-object-review.v1"
+                "farm.local-object-scope.v1"
+                if scope
+                else (
+                    "farm.local-object-semantics.v1"
+                    if args.semantic_only
+                    else "farm.local-object-review.v1"
+                )
             ),
             objects=results,
             proposals=describe_file(args.proposals),
@@ -582,6 +641,7 @@ def vlm(args):
             model_load_seconds=load_seconds,
             total_seconds=time.monotonic() - started,
             human_labels_in_prompt=False,
+            detector_labels_in_prompt=False,
             reserved_test_opened=False,
             release_eligible=False,
         ),
@@ -628,7 +688,13 @@ def main(argv=None):
     for name in ("proposals", "model", "output"):
         p.add_argument("--" + name, type=Path, required=True)
     p.add_argument("--views", type=int, choices=(1, 2, 3), default=2)
-    p.add_argument("--semantic-only", action="store_true")
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument("--semantic-only", action="store_true")
+    mode.add_argument(
+        "--scope",
+        action="store_true",
+        help="Review actual proposal scope with clean RGB and its mask",
+    )
     p.set_defaults(func=vlm)
     args = parser.parse_args(argv)
     if args.output.exists():
