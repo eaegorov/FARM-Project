@@ -303,3 +303,11 @@ Knaack: Qwen4B 8 RGB 35,71 с; SAM3 12 RGB / 56 prompts 88,72 с; 540 proposals 
 VLM иногда принимает cyan overlay за защитную плёнку. Scope evidence теперь показывает отдельную бинарную схему и original RGB; copied schema placeholders и scope enums вместо label отклоняются. Бинарная схема устраняет эту цветовую примесь, но 4B/8B всё ещё ошибаются в смысле/материале малых crops. 8B не показала достаточного преимущества для автоматического принятия captions. Final full suite: 1191 passed / 70,53 с.
 
 Следующий приоритет: ограниченный добор зарегистрированных ракурсов по видимости уже найденных объектов → подтверждение singleton/occluded targets → contextual RGB semantics → единый scene profile с общим бюджетом. Не лечить недостаток наблюдений ослаблением native voting.
+
+## 17. Добор ракурсов с фиксированным бюджетом
+
+Отчёт V12: `13_adaptive_coverage/REVIEW_RU.md`. Новая команда `quality discovery-coverage` выбирает ограниченный batch ещё не сегментированных RGB по приросту геометрической видимости, с одним видом на physical timestamp. Она планирует segmentation, не создаёт foreground votes. Старые proposals переиспользуются.
+
+Knaack при одинаковых 8 дополнительных RGB: adaptive 40 multi-timestamp groups против uniform 18; исходно 6. SAM3 55,58 / 53,65 с, association 17,66 / 14,61 с; selection 2,35 с. Native build 40 кандидатов 17,78 с, после gates 36. Исходные 342 nodes сохранены. На тех же старых автоматических 2D references IoU группы 10 0,7871→0,9189 и 13 0,9011→0,9322; uniform их не меняет. Это согласие с build masks, не независимая accuracy. Тележка улучшена обоими доборами одинаково; фон и груз остаются.
+
+67 изображений просмотрены, точный список в visual_review.json. Новые проблемы: основание конуса и тонкие части кронштейна неполны; окно имеет неоднозначную физическую depth ownership; верх трубы 202 теряется в общем банке с конкурирующей part-гипотезой 210. Следующий шаг — изолировать конкуренцию whole/part до exclusive native ownership, затем contextual semantics и единый ограниченный scene profile. Full suite 1198 passed / 66,64 с; параметры production и reviewed Factory bank не заменены.

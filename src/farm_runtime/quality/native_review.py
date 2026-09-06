@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 import json
 from pathlib import Path
 import time
@@ -24,11 +25,19 @@ def main(argv=None):
     for name in ("input", "report", "config", "ply", "output"):
         parser.add_argument("--" + name, type=Path, required=True)
     parser.add_argument("--with-scene-render", action="store_true")
+    parser.add_argument("--object-id", type=int, action="append", default=[])
     args = parser.parse_args(argv)
     if args.output.exists():
         raise ValueError("new output required")
     started = time.monotonic()
     run, split, manifest = load_prepared(args.input)
+    if args.object_id:
+        requested = set(args.object_id)
+        if not requested <= {o.object_id for o in run.objects}:
+            raise ValueError("unknown requested object ID")
+        run = replace(
+            run, objects=tuple(o for o in run.objects if o.object_id in requested)
+        )
     role = manifest.get("observation_role", "build")
     report = json.loads(args.report.read_text())
     bank_path = checked_file(report["bank"])
