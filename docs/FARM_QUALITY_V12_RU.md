@@ -1,7 +1,7 @@
 # FARM V12: воспроизводимость и независимая оценка качества
 
-Документ содержит инфраструктуру F0/F1 и обновление реализации FARM от 2026-09-05.
-Текущий отчёт и изображения: `output/farm_pipeline/factory/experiments/factory-universal-v12-quality-v1/28_scope_propagation/REVIEW_RU.md` относительно `3dgs_work`.
+Документ содержит инфраструктуру F0/F1 и обновление реализации FARM по 2026-09-06.
+Текущий отчёт и изображения: `output/farm_pipeline/factory/experiments/factory-universal-v12-quality-v1/45_resolved_view_support/REVIEW_RU.md` относительно `3dgs_work`.
 Реализованы rig-preserving RGB↔3DGS registration, angular/upright discovery ablation,
 расширение exact-lift кандидатов по build surface, native-support OBB и финальный CSR allowlist export.
 Шесть объектов имеют проверяемые masks/labels/captions/scope. Универсальная точность,
@@ -493,3 +493,19 @@ Knaack native46,488с:37→38масок,63получил622IDs; все37стар
 Semantics retain-stage сохранил42/68ответов без VLM; refresh0,402/0,609с, catalogs2,258/2,704с. Каталоги V12/43_contributor_recovery/knaack/catalog_v1 иfactory/catalog_v1:42/38/42 и132/117/68. Labels/captions прежние, включая известные ошибки. Observed OBB трубы1,738×0,665×1,384м tail-sensitive, физические размеры не приняты. Отчёт V12/43_contributor_recovery/REVIEW_RU.md.
 
 Следующий приоритет — novelty при выборе recovery объектов: не тратить ранние слоты на уже покрытую панель490, проверить coverage для634и новых физических объектов без ручных ID. Затем ограниченный добор зарегистрированных ракурсов для неполных масок. Closed test не открыт, Project B/C не меняются.
+
+## 48. Новизна recovery-областей проверена в общем пайплайне (2026-09-06)
+
+Stage44,bc6256e,1412tests/67,21с. В прежних source/size strata score умножается на1−maximum same-frame multiview mask IoU; это приоритет, не merge/exclusion.490опущена1→232, Factory9дополнительных RGB вместо11.634поднялась219→174 и пока вне64кандидатов. Для Knaack очередь8групп,plan/concepts и72point arrays точны; новый inference не нужен.
+
+Factory15стадий/663,467с от готовой geometry,132/117/68.116из117прежних nonempty memberships точны,294возвращены2неназначенных IDs.392native JPEG побитово совпали соStage43.24SAM refinement requests reused,67annotations retained,1новый VLM для170. У170 native0/geometry reject и ошибочное wall corner; прирост принятого качества не заявлен.
+
+Просмотрены3source pages/11строк и сравнение слабых target masks. В17049pxмаски дают лишь4пригодных depth samples, в159—18; плотные source points ошибочно позволяли принимать такой target. Stage45 исправляет минимум на обоих концах и повторно проверяет готовые proposals. Затем: общий bounded camera recovery/coverage и устранение лишних промежуточных native visuals (измерено85,65с на Factory). Каталог и отчёт V12/44_novelty_schedule/factory/runs/novelty-v1/quality/catalog иREVIEW_RU.md. Физические размеры/универсальный release не приняты, closed test не открыт.
+
+## 49. Минимальная target-surface опора и проверка исправления (2026-09-06)
+
+Stage45,950bc59,1414tests/68,75с. Обычный recovery match теперь требует≥20пригодных target samples, как source geometry и partial-view ветвь. Плотные source points и completion preference не обходят минимум. На готовых proposals Factory170(4samples) перестал подтверждаться;159перешёл с87px/18samples на218px/44samples. Новых segmentation/VLM calls при повторной проверке0. Knaack accepted masks и56point arrays точны; новый native не запускался.
+
+Factory8stage continuation506,729с от готовых proposals:131/117/67.159:126→165IDs, все126сохранены; остальные116 memberships точны.390из392native JPEG точны. Обе изменившиеся native проекции иtarget mask comparison просмотрены: охват панели больше, но у нижнего края близкого вида есть небольшая примесь соседней панели. Полная маска не принята.24SAM requests reused,66annotations retained,1новый VLM; cabinet door/dark base всё ещё недостаточно подтверждены.
+
+Каталог V12/45_resolved_view_support/factory/runs/support-v1/quality/catalog, отчётREVIEW_RU.md. Физические размеры null, closed test не открыт. Следующий46: добор наблюдений для неполных multi-timestamp groups. У постера0timestamp-balanced unconfirmed fraction44,66%, но singleton-only очередь его исключает. CPU audit192Factory/40Knaack groups6,45/1,29с; автоматический выбор/дополнительные masks ещё не выполнены. Затем общий bounded raw-camera fallback для шкафа/контейнера.
