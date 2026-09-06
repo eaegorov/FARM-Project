@@ -645,20 +645,31 @@ def semantics(args):
             *(["--native-input", str(native_input)] if native_input else []),
         ]
     )
-    refinement.main(
-        [
-            "vlm",
-            "--proposals",
-            str(args.output / "evidence/manifest.json"),
-            "--model",
-            str(args.model),
-            "--compact-semantics",
-            "--views",
-            "2",
-            "--output",
-            str(args.output / "appearance"),
-        ]
-    )
+    previous_stage = getattr(args, "retain_stage", None)
+    if previous_stage:
+        from farm_runtime.quality.semantic_refresh import refresh_appearance
+
+        refresh_appearance(
+            previous_stage,
+            args.output / "evidence/manifest.json",
+            args.model,
+            args.output / "appearance",
+        )
+    else:
+        refinement.main(
+            [
+                "vlm",
+                "--proposals",
+                str(args.output / "evidence/manifest.json"),
+                "--model",
+                str(args.model),
+                "--compact-semantics",
+                "--views",
+                "2",
+                "--output",
+                str(args.output / "appearance"),
+            ]
+        )
     write_json(
         args.output / "manifest.json",
         dict(
@@ -1137,6 +1148,11 @@ def main(argv=None):
     q = command("apply-refinement", ["native", "selection"])
     q.add_argument("--alternatives", type=int, default=16)
     q = command("semantics", ["geometry", "model"])
+    q.add_argument(
+        "--retain-stage",
+        type=Path,
+        help="Preserve previous annotations on identical evidence; review changed objects only",
+    )
     q.add_argument("--native", type=Path)
     q.add_argument("--groups", type=int, default=64)
     q = command(
