@@ -380,12 +380,16 @@ def main(argv=None):
     for name in ("evidence", "visuals", "input/masks"):
         (args.output / name).mkdir(parents=True)
     write_json(args.output / "policy.json", POLICY)
-    gs = lift.load_gaussians(open_graphdeco_ply(args.ply), run.meters_per_scene_unit)
-    lift.alignment_guard(gs, run, config)
-    wanted = {oid for oid, _ in proposals}
-    candidates, votes, accumulation_seconds = collect_timestamp_votes(
-        gs, run, split, config, wanted
-    )
+    accumulation_seconds = 0.0
+    if proposals:
+        gs = lift.load_gaussians(
+            open_graphdeco_ply(args.ply), run.meters_per_scene_unit
+        )
+        lift.alignment_guard(gs, run, config)
+        wanted = {oid for oid, _ in proposals}
+        candidates, votes, accumulation_seconds = collect_timestamp_votes(
+            gs, run, split, config, wanted
+        )
     objects = {obj.object_id: obj for obj in run.objects}
     output_manifest = json.loads(json.dumps(manifest))
     output_objects = {row["object_id"]: row for row in output_manifest["objects"]}

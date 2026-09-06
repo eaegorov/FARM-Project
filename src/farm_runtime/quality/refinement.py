@@ -185,11 +185,18 @@ def sam(args):
             raise ValueError("one to three nonempty text concepts per object required")
         if any(str(r["object_id"]) not in concepts for r in evidence["observations"]):
             raise ValueError("every crop object needs concept prompts")
-        model = CachedSAMConceptRefiner(args.model)
+    # Empty schedules are normal on well-supported/two-timestamp cohorts.
+    # Do not initialize CUDA or load either checkpoint for them.
+    if evidence["observations"]:
+        model = (
+            CachedSAMConceptRefiner(args.model)
+            if concepts is not None
+            else CachedSAMRefiner(args.model)
+        )
+        torch.cuda.synchronize()
+        load_seconds = time.monotonic() - started
     else:
-        model = CachedSAMRefiner(args.model)
-    torch.cuda.synchronize()
-    load_seconds = time.monotonic() - started
+        load_seconds = 0.0
     rows, skipped = [], []
     chosen = evidence["observations"]
     if args.limit:
@@ -293,6 +300,7 @@ def sam(args):
             prompts=describe_file(args.prompts) if args.prompts else None,
             model_weights=describe_file(args.model / "model.safetensors"),
             model_load_seconds=load_seconds,
+            no_inference_reason="empty_crop_schedule" if not chosen else None,
             total_seconds=time.monotonic() - started,
             release_eligible=False,
         ),

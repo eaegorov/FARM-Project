@@ -61,6 +61,24 @@ def test_profile_compiles_into_existing_dag_with_explicit_budgets_and_runtimes(
     )
     assert all("${" not in x for s in resolved["stages"] for x in s["command"])
     assert all(s.timeout_seconds == 900 for s in plan.stages)
+    args.refinement_crops = 12
+    refined = compile_plan(args)
+    write(plan_path, refined)
+    stages = plan_to_public_dict(load_plan(plan_path), tmp_path / "refined_run")[
+        "stages"
+    ]
+    assert len(stages) == 18
+    by_id = {s["id"]: s for s in stages}
+    assert by_id["refinement_selection"]["command"][0] == "geometry-python"
+    assert by_id["refinement_concept"]["command"][0] == "main-python"
+    assert by_id["refined_native"]["needs"] == ["refinement_selection"]
+    for name in ("appearance", "catalog"):
+        cmd = by_id[name]["command"]
+        assert cmd[cmd.index("--native") + 1].endswith("/refined_native/manifest.json")
+    args.refinement_crops = 33
+    with pytest.raises(ValueError, match="budget"):
+        compile_plan(args)
+    args.refinement_crops = 12
     args.adaptive_views = 1000
     with pytest.raises(ValueError, match="budget"):
         compile_plan(args)

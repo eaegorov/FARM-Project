@@ -349,3 +349,11 @@ Validator appearance теперь канонизирует порядок тол
 Отчёт V12: `19_refinement_schedule/REVIEW_RU.md`. Новый `quality refinement-schedule`: >=3 physical timestamps, current timestamp целиком исключён из scoring, общий crop budget12/per-object2, приоритет по возможному gain того же selector score. Исправлен приём больших расширений в unknown:96,32% добавленного участка трубы не поддерживались OTHER foreground. Теперь такая proposal отклоняется. Factory replay сохраняет прежние полезные замены.
 
 Factory6crops автоматически воспроизвели очистку cabinet/cart и quarantine; cart exposed-control IoU0,62920→0,65851 (прежний targeted0,65535), сумма дополнительной работы55,36с. Knaack12crops дали3 небольших изменения; precision немного выше, recall к old build masks ниже. У lift сохраняется выступ уже в >=2TS core, cart неполна. Следующая проверка — alpha/occlusion footprint и native ownership, затем интеграция с актуальными semantic masks.1244tests /64,70с.
+
+## 24. Проверка alpha footprint
+
+Отчёт V12: `20_native_footprint/REVIEW_RU.md`.22 object/view projections на неизменённых Gaussian IDs,8 sheets просмотрены, включая все4lift views. Повышение общего alpha .04→.25 уменьшает выступ lift, но снижает его recall к прежним автоматическим masks .9396→.8283; у crane .8900→.8021. Conditional share практически совпадает с mass. На видахlift2/7 большая часть excess лежит перед expected scene depth, поэтому скрытый объект за окклюдером не объясняет весь выступ. Defaults и membership сохранены; нужен адресный contributor audit.
+
+## 25. Refinement внутри quality DAG
+
+`scene-profile plan --refinement-crops 12` добавляет5 stages к прежним13. Budget0 сохраняет прежнюю последовательность. Пустые schedules пропускают SAM/CUDA; unchanged selection не пересобирает native bank. Appearance получает актуальный native input, пропускает quarantine, использует изменённые masks и дополнительные source-bound views. Разные mask grids сравниваются по доле foreground. Catalog проверяет input binding и сохраняет native timestamp count отдельно от исходной геометрии. Реальные прогоны и проверки фиксируются в `21_refined_profile/`.

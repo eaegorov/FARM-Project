@@ -251,12 +251,76 @@ def native(args):
     )
 
 
+def apply_refinement(args):
+    """Rebuild only after accepted replacements or an observation quarantine."""
+    from farm_runtime.quality import native_observations
+
+    native = read(args.native)
+    selection = read(args.selection)
+    if (
+        native.get("closed_test_opened") is not False
+        or selection.get("closed_test_opened") is not False
+    ):
+        raise ValueError("development native refinement required")
+    for key in ("input", "config"):
+        checked_file(native[key])
+        checked_file(selection[key])
+        if native[key]["sha256"] != selection[key]["sha256"]:
+            raise ValueError("refinement does not belong to this native build")
+    changed = sum(bool(r["selected"]) for r in selection["observations"])
+    quarantined = len(selection["quarantined_observations"])
+    if changed or quarantined:
+        native_observations.main(
+            [
+                "--input",
+                str(checked_file(selection["output_input"])),
+                "--ply",
+                str(checked_file(native["source_ply"])),
+                "--config",
+                str(checked_file(native["config"])),
+                "--mode",
+                "exclusions_on",
+                "--scope-alternative-budget",
+                str(args.alternatives),
+                "--output",
+                str(args.output),
+            ]
+        )
+        result = read(args.output / "manifest.json")
+    else:
+        args.output.mkdir(parents=True)
+        result = dict(native)
+    result["refinement_application"] = dict(
+        original_native=describe_file(args.native),
+        selection=describe_file(args.selection),
+        replaced_observations=changed,
+        quarantined_observations=quarantined,
+        native_rebuilt=bool(changed or quarantined),
+    )
+    write_json(args.output / "manifest.json", result)
+
+
 def semantics(args):
     from farm_runtime.quality import scope_evidence, refinement
 
-    chosen, deferred = bounded_groups(read(args.geometry), args.groups)
+    geometry = read(args.geometry)
+    native_input = checked_file(read(args.native)["input"]) if args.native else None
+    if native_input:
+        retained = {r["object_id"] for r in read(native_input)["objects"]}
+        geometry = dict(
+            geometry, groups=[g for g in geometry["groups"] if g["id"] in retained]
+        )
+    chosen, deferred = bounded_groups(geometry, args.groups)
     if not chosen:
         raise ValueError("no multi-timestamp appearance candidates")
+    deferred = sorted(
+        set(deferred)
+        | {
+            g["id"]
+            for g in read(args.geometry)["groups"]
+            if g["independent_timestamps"] >= 2 and g["id"] not in chosen
+        }
+    )
     args.output.mkdir(parents=True)
     scope_evidence.main(
         [
@@ -267,6 +331,7 @@ def semantics(args):
             "--output",
             str(args.output / "evidence"),
             *[x for g in chosen for x in ("--group-id", str(g))],
+            *(["--native-input", str(native_input)] if native_input else []),
         ]
     )
     refinement.main(
@@ -289,6 +354,7 @@ def semantics(args):
             schema="farm.quality-appearance-stage.v1",
             appearance=describe_file(args.output / "appearance/manifest.json"),
             source_geometry=describe_file(args.geometry),
+            source_native_input=describe_file(native_input) if native_input else None,
             selected_group_ids=chosen,
             deferred_group_ids=deferred,
             candidate_budget=args.groups,
@@ -300,7 +366,11 @@ def semantics(args):
 
 def compile_plan(args):
     """Return a normal FARM DAG; no additional execution framework."""
+    crop_budget = getattr(args, "refinement_crops", 0)
+    if type(crop_budget) is not int or not 0 <= crop_budget <= 32:
+        raise ValueError("refinement crop budget must be in 0..32")
     budgets = dict(
+        refinement_crops=crop_budget,
         initial=args.initial_views,
         adaptive=args.adaptive_views,
         vocabulary=args.vocabulary_views,
@@ -516,11 +586,97 @@ def compile_plan(args):
         [f"{q}/geometry/manifest.json", args.ply],
         "geometry",
     )
+    final_native = f"{q}/native/manifest.json"
+    if crop_budget:
+        schedule = f"{q}/refinement_schedule"
+        selection = f"{q}/refinement_selection"
+        add(
+            "refinement_schedule",
+            "refinement-schedule",
+            [
+                "--native",
+                final_native,
+                "--crop-budget",
+                crop_budget,
+                *up_args,
+                "--output",
+                schedule,
+            ],
+            f"{schedule}/manifest.json",
+            [final_native],
+            "geometry",
+        )
+        for backend in ("tracker", "concept"):
+            name = f"refinement_{backend}"
+            add(
+                name,
+                "refinement",
+                [
+                    "sam",
+                    "--evidence",
+                    f"{schedule}/manifest.json",
+                    "--model",
+                    args.sam_model,
+                    "--backend",
+                    backend,
+                    *(
+                        ["--prompts", f"{schedule}/concepts.json"]
+                        if backend == "concept"
+                        else []
+                    ),
+                    "--output",
+                    f"{q}/{name}",
+                ],
+                f"{q}/{name}/manifest.json",
+                [f"{schedule}/manifest.json"],
+            )
+        proposal_paths = [
+            f"{q}/refinement_{b}/manifest.json" for b in ("tracker", "concept")
+        ]
+        add(
+            "refinement_selection",
+            "native-refinement",
+            [
+                "--input",
+                f"{q}/native/input/manifest.json",
+                "--config",
+                f"{q}/native/config.json",
+                "--ply",
+                args.ply,
+                *[x for p in proposal_paths for x in ("--proposals", p)],
+                "--output",
+                selection,
+            ],
+            f"{selection}/report.json",
+            [final_native, *proposal_paths],
+            "geometry",
+        )
+        add(
+            "refined_native",
+            "scene-profile",
+            [
+                "apply-refinement",
+                "--native",
+                final_native,
+                "--selection",
+                f"{selection}/report.json",
+                "--alternatives",
+                args.alternatives,
+                "--output",
+                f"{q}/refined_native",
+            ],
+            f"{q}/refined_native/manifest.json",
+            [final_native, f"{selection}/report.json"],
+            "geometry",
+        )
+        final_native = f"{q}/refined_native/manifest.json"
     add(
         "appearance",
         "scene-profile",
         [
             "semantics",
+            "--native",
+            final_native,
             "--geometry",
             f"{q}/geometry/manifest.json",
             "--model",
@@ -531,21 +687,21 @@ def compile_plan(args):
             f"{q}/semantics",
         ],
         f"{q}/semantics/manifest.json",
-        [f"{q}/geometry/manifest.json"],
+        [f"{q}/geometry/manifest.json", final_native],
     )
     add(
         "catalog",
         "scene-catalog",
         [
             "--native",
-            f"{q}/native/manifest.json",
+            final_native,
             "--semantics",
             f"{q}/semantics/manifest.json",
             "--output",
             f"{q}/catalog",
         ],
         f"{q}/catalog/catalog.json",
-        [f"{q}/native/manifest.json", f"{q}/semantics/manifest.json"],
+        [final_native, f"{q}/semantics/manifest.json"],
     )
     return dict(
         schema_version=1,
@@ -561,7 +717,11 @@ def compile_plan(args):
             schema="farm.bounded-quality-profile.v1",
             budgets=budgets,
             start="completed registered metric RGBD from existing FARM ingress",
-            refinement="Targeted crop refinement remains a separate measured stage; not enabled here",
+            refinement=(
+                "bounded other-timestamp crop refinement"
+                if crop_budget
+                else "disabled by crop budget 0"
+            ),
             scope_resolution="preserve nested alternatives; no automatic physical merging",
             release_eligible=False,
         ),
@@ -590,7 +750,10 @@ def main(argv=None):
     q.add_argument("--groups", type=int, default=128)
     q.add_argument("--alternatives", type=int, default=16)
     q.add_argument("--world-up", type=float, nargs=3, required=True)
+    q = command("apply-refinement", ["native", "selection"])
+    q.add_argument("--alternatives", type=int, default=16)
     q = command("semantics", ["geometry", "model"])
+    q.add_argument("--native", type=Path)
     q.add_argument("--groups", type=int, default=64)
     q = command(
         "plan", ["rgbd", "ply", "sam-model", "vlm-model", "project-root", "output-root"]
@@ -599,6 +762,7 @@ def main(argv=None):
     q.add_argument("--scene-id", required=True)
     q.add_argument("--world-up", type=float, nargs=3, required=True)
     for field, value in dict(
+        refinement_crops=0,
         initial_views=12,
         adaptive_views=8,
         vocabulary_views=8,
@@ -622,6 +786,8 @@ def main(argv=None):
         native(args)
     elif args.phase == "semantics":
         semantics(args)
+    elif args.phase == "apply-refinement":
+        apply_refinement(args)
     elif args.phase == "plan":
         write_json(args.output, compile_plan(args))
     return 0

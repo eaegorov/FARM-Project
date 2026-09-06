@@ -19,8 +19,11 @@ flowchart LR
     F --> G[Новые proposals + прежние masks]
     G --> H[Geometric association]
     H --> I[Native lift и nested alternatives]
-    H --> J[2 contextual crops: compact appearance]
-    I --> K[Общий каталог и source-order masks]
+    I --> R[Опционально: до 12 crops по противоречиям]
+    R --> S[SAM tracker + concepts, проверка по OTHER timestamps]
+    S --> T[Пересчёт native только при принятых изменениях]
+    T --> J[2 актуальных contextual crops: compact appearance]
+    T --> K[Общий каталог и source-order masks]
     J --> K
 ```
 
@@ -36,6 +39,7 @@ python -m farm_runtime.cli quality scene-profile plan \
   --sam-model /absolute/sam3_checkpoint \
   --vlm-model /absolute/qwen3_vl_4b_checkpoint \
   --world-up 0 -1 0 \
+  --refinement-crops 12 \
   --project-root /absolute/FARM-Project \
   --output-root /absolute/quality_outputs \
   --runtimes /absolute/runtime_prefixes.json \
@@ -94,7 +98,23 @@ rendered contribution, отрицательное свидетельство к�
 окном и скрытая толщина панели не становятся физическим измерением объекта.
 Маски альтернатив не объединяются молча в exclusive bank.
 
-Targeted crop refinement из этапа V12/11 и автоматическое разрешение scope
-ещё не включены в этот общий профиль. Они требуют отдельного выбора кандидатов
-по противоречиям. Новый каталог не заменяет проверенный production bank и не
-означает завершённый universal quality release.
+`--refinement-crops 12` включает пять дополнительных этапов того же DAG:
+scheduler, SAM tracker, SAM concepts, other-timestamp selection и conditional
+native rebuild. Допустимый бюджет0..32, максимум2 crops на объект. Default0
+сохраняет профиль из13 stages; opt-in12 даёт18. Кандидатам нужны минимум3
+независимых timestamps, чтобы проверять crop по двум OTHER timestamps.
+Противоречивый ракурс может стать unknown; unsupported expansion отклоняется.
+Пустой crop schedule не загружает SAM/CUDA, отсутствие принятых изменений
+сохраняет прежний bank/input без повторного native build.
+
+Appearance всегда получает effective native input. Удалённые object/view
+наблюдения не участвуют, принятые replacements используют изменённые masks,
+дополнительные зарегистрированные views разрешены. Неизменённые исходные masks
+сохраняют прежние pixels; выбор между сетками разных разрешений сравнивает
+foreground fraction. Связь идёт по имени и SHA256 RGB, а не по local image ID.
+Каталог отклоняет stale appearance после mask refinement и отдельно хранит
+`native_independent_timestamps`, включая дополнительные/исключённые наблюдения.
+
+Автоматическое physical scope merging пока не включено. Новый каталог не
+заменяет проверенный production bank и не означает завершённый universal
+quality release.

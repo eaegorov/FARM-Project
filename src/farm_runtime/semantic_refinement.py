@@ -164,7 +164,18 @@ def select_review_views(rows, budget=2):
         return []
     if any(not r["clipped"] for r in candidates):
         candidates = [r for r in candidates if not r["clipped"]]
-    candidates.sort(key=lambda r: (-r["foreground_pixels"], r["image_id"]))
+    fractions = ["foreground_fraction" in r for r in candidates]
+    if any(fractions) and not all(fractions):
+        raise ValueError("review views must use consistent visibility units")
+
+    def visibility(row):
+        return (
+            row["foreground_fraction"] if all(fractions) else row["foreground_pixels"]
+        )
+
+    if any(not math.isfinite(visibility(r)) or visibility(r) <= 0 for r in candidates):
+        raise ValueError("positive finite visibility required")
+    candidates.sort(key=lambda r: (-visibility(r), r["image_id"]))
     chosen = [candidates.pop(0)]
     while candidates and len(chosen) < budget:
         candidates = [
@@ -179,13 +190,11 @@ def select_review_views(rows, budget=2):
         sensors = {
             x["source_image"]["path"].split("/")[-1].split("_")[0] for x in chosen
         }
-        maximum = max(r["foreground_pixels"] for r in candidates)
+        maximum = max(visibility(r) for r in candidates)
 
         def score(r):
             sensor = r["source_image"]["path"].split("/")[-1].split("_")[0]
-            return math.sqrt(r["foreground_pixels"] / maximum) + 0.15 * (
-                sensor not in sensors
-            )
+            return math.sqrt(visibility(r) / maximum) + 0.15 * (sensor not in sensors)
 
         candidate = max(candidates, key=score)
         chosen.append(candidate)

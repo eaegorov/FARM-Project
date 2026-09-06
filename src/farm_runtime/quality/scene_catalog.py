@@ -19,7 +19,7 @@ def read(path):
     return json.loads(Path(path).read_text())
 
 
-def bound_appearance(stage_path, geometry_record):
+def bound_appearance(stage_path, geometry_record, native_input_record=None):
     """Reject a same-number object from any other geometry namespace."""
     stage = read(stage_path)
     if stage.get("schema") != "farm.quality-appearance-stage.v1":
@@ -39,6 +39,12 @@ def bound_appearance(stage_path, geometry_record):
     checked_file(evidence["source_groups"])
     if evidence["source_groups"]["sha256"] != geometry_record["sha256"]:
         raise ValueError("appearance pixels belong to a different geometry namespace")
+    if native_input_record is not None:
+        for document in (stage, evidence):
+            binding = document.get("source_native_input")
+            if not binding or binding["sha256"] != native_input_record["sha256"]:
+                raise ValueError("appearance masks differ from effective native input")
+            checked_file(binding)
     ids = [r["object_id"] for r in appearance["objects"]]
     if len(ids) != len(set(ids)) or set(ids) != set(stage["selected_group_ids"]):
         raise ValueError("appearance group selection mismatch")
@@ -84,7 +90,12 @@ def main(argv=None):
     if not record:
         raise ValueError("native bank must be bound to geometric group namespace")
     geometry = read(checked_file(record))
-    appearances, semantics = bound_appearance(args.semantics, record)
+    require_binding = bool(
+        inputs.get("parent_input") or read(args.semantics).get("source_native_input")
+    )
+    appearances, semantics = bound_appearance(
+        args.semantics, record, describe_file(input_path) if require_binding else None
+    )
     source_path = checked_file(manifest["source_ply"])
     if inputs["source_ply"]["sha256"] != manifest["source_ply"]["sha256"]:
         raise ValueError("native source PLY mismatch")
@@ -175,6 +186,9 @@ def main(argv=None):
                 object_id=oid,
                 candidate_labels=groups[oid]["candidate_labels"],
                 independent_timestamps=groups[oid]["independent_timestamps"],
+                native_independent_timestamps=len(
+                    {run.frame(o.image_id).physical_timestamp for o in obj.observations}
+                ),
                 label=parsed["label"] if parsed else None,
                 caption=parsed["caption"] if parsed else None,
                 semantic_status=(
