@@ -208,3 +208,100 @@ def test_existing_surface_depth_cannot_change_after_sampling(tmp_path):
     inputs.recorded_depths = {"source": descriptor}
     with pytest.raises(ValueError):
         inputs.frame("source")
+
+
+def partial_validation_case():
+    from farm_runtime.proposal_geometry import surface_points
+    from farm_runtime.quality.surface_validation import prepared_surface
+
+    whole_frame = dict(
+        depth=np.full((40, 40), 2.0, np.float32),
+        K=np.array([[40.0, 0, 20], [0, 40.0, 20], [0, 0, 1.0]]),
+        T_world_cam=np.eye(4),
+        excluded=np.zeros((40, 40), bool),
+    )
+    clipped_frame = {k: v.copy() for k, v in whole_frame.items()}
+    clipped_frame["T_world_cam"][0, 3] = 1.6
+    whole = np.zeros((40, 40), bool)
+    whole[5:35, 5:35] = True
+    clipped = np.zeros_like(whole)
+    clipped[5:35, :3] = True
+    points, metrics = surface_points(clipped, **clipped_frame)
+    reference = prepared_surface(
+        "clipped", points, clipped, metrics["pixel_footprint_m"]
+    )
+    context = dict(target_name="whole", references=[(reference, clipped_frame)])
+    return points, whole, whole_frame, context
+
+
+def test_additional_full_view_can_confirm_an_edge_clipped_source():
+    from farm_runtime.quality.surface_validation import select_observation
+
+    points, mask, frame, context = partial_validation_case()
+    args = (
+        points,
+        np.ones(len(points), bool),
+        [mask],
+        [dict(label="cabinet", score=0.8)],
+        frame,
+        None,
+        0.1,
+    )
+    assert select_observation(*args)[0] is None
+    selected, rows, reason = select_observation(*args, partial_context=context)
+    assert selected == 0 and reason == "matched_static_surface"
+    assert rows[0]["reciprocal_surface_agreement"] < 0.3
+    assert (
+        rows[0]["partial_view_evidence"][0]["reason"] == "partial_view_surface_support"
+    )
+
+
+def test_partial_additional_view_preserves_nested_scope_guard():
+    from farm_runtime.quality.surface_validation import select_observation
+
+    points, mask, frame, context = partial_validation_case()
+    context["references"][0][0]["scope_containers"] = [99]
+    assert (
+        select_observation(
+            points,
+            np.ones(len(points), bool),
+            [mask],
+            [dict(label="cabinet", score=0.8)],
+            frame,
+            None,
+            0.1,
+            partial_context=context,
+        )[0]
+        is None
+    )
+
+
+def test_partial_additional_view_keeps_visible_background_and_exclusions():
+    from farm_runtime.quality.surface_validation import select_observation
+    from scipy.ndimage import binary_dilation
+
+    for mode in ("background", "excluded", "missing"):
+        points, mask, frame, context = partial_validation_case()
+        reference, source_frame = context["references"][0]
+        if mode == "background":
+            reference["mask"][20:] = False
+            reference["projection_mask"] = binary_dilation(
+                reference["mask"], iterations=1
+            )
+        elif mode == "excluded":
+            source_frame["excluded"][:] = True
+        else:
+            source_frame["depth"][:] = 0
+        assert (
+            select_observation(
+                points,
+                np.ones(len(points), bool),
+                [mask],
+                [dict(label="cabinet", score=0.8)],
+                frame,
+                None,
+                0.1,
+                partial_context=context,
+            )[0]
+            is None
+        )

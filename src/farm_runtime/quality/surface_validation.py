@@ -15,6 +15,8 @@ from scipy.spatial import cKDTree
 from farm_runtime.angular_discovery import rotate_image
 from farm_runtime.obb_proposals import fit_surface_envelope, project_world
 from farm_runtime.proposal_geometry import (
+    GeometryPolicy,
+    compare_surfaces,
     equivalent_masks,
     mask_overlap,
     project_evidence,
@@ -28,7 +30,52 @@ from farm_runtime.surface_evidence import aggregate_timestamps, point_observatio
 from scripts.geometry.refine_farm_object_geometry import _fit_robust_obb
 
 
-def select_observation(points, core, masks, detections, frame, labels, radius_m):
+def prepared_surface(name, points, mask, footprint, containers=()):
+    return dict(
+        frame=name,
+        points=points,
+        mask=mask,
+        pixel_footprint_m=footprint,
+        scope_containers=list(containers),
+        tree=cKDTree(points),
+        bounds=(points.min(0), points.max(0)),
+        projection_mask=binary_dilation(mask, iterations=1),
+    )
+
+
+def reference_surfaces(inputs, members):
+    references = []
+    for node in members:
+        mask = inputs.mask(node)
+        containers = []
+        for other in inputs.nodes.values():
+            if (
+                other["frame"] != node["frame"]
+                or other["id"] == node["id"]
+                or other.get("source_priority", 0) > node.get("source_priority", 0)
+            ):
+                continue
+            _, a, b = mask_overlap(mask, inputs.mask(other))
+            if a >= 0.85 > b:
+                containers.append(other["id"])
+        references.append(
+            (
+                prepared_surface(
+                    node["frame"],
+                    inputs.clouds[f"node_{node['id']:04d}"],
+                    mask,
+                    node["pixel_footprint_m"],
+                    containers,
+                ),
+                inputs.frame(node["frame"]),
+            )
+        )
+    return references
+
+
+def select_observation(
+    points, core, masks, detections, frame, labels, radius_m, *, partial_context=None
+):
     """Require visible core support and reciprocal static surface overlap.
 
     An optional label allowlist limits inspection. Identity always requires
@@ -65,6 +112,34 @@ def select_observation(points, core, masks, detections, frame, labels, radius_m)
             and agreement >= 0.8
             and reciprocal >= 0.3
         )
+        partial_evidence = []
+        if not accepted and partial_context is not None and len(candidate) >= 20:
+            name = partial_context["target_name"]
+            containers = []
+            for j in candidates:
+                if j == i:
+                    continue
+                _, a, b = mask_overlap(masks[i], masks[j])
+                if a >= 0.85 > b:
+                    containers.append(j)
+            target = prepared_surface(
+                name, candidate, masks[i], metrics["pixel_footprint_m"], containers
+            )
+            for reference, reference_frame in partial_context["references"]:
+                result = compare_surfaces(
+                    reference,
+                    target,
+                    {reference["frame"]: reference_frame, name: frame},
+                    GeometryPolicy(partial_view_association=True),
+                )
+                partial_evidence.append(dict(source_name=reference["frame"], **result))
+            # Reuse the same FOV/visibility/negative/scope constraints as proposal
+            # association. A missing surface outside the source image is unknown.
+            accepted = any(
+                r["decision"] == "match"
+                and r["reason"] == "partial_view_surface_support"
+                for r in partial_evidence
+            ) and not any(r["decision"] == "separate" for r in partial_evidence)
         score = 2 * agreement * reciprocal / max(1e-9, agreement + reciprocal)
         rows.append(
             dict(
@@ -78,6 +153,11 @@ def select_observation(points, core, masks, detections, frame, labels, radius_m)
                 reciprocal_surface_agreement=reciprocal,
                 score=score,
                 eligible=accepted,
+                **(
+                    {"partial_view_evidence": partial_evidence}
+                    if partial_evidence
+                    else {}
+                ),
                 **metrics,
             )
         )
@@ -160,6 +240,11 @@ def main(argv=None):
         parser.add_argument("--" + name, type=Path, required=True)
     parser.add_argument("--supplement", type=Path, action="append", default=[])
     parser.add_argument("--world-up", type=float, nargs=3, required=True)
+    parser.add_argument(
+        "--partial-view-association",
+        action="store_true",
+        help="Reuse guarded partial-FOV matching for additional views",
+    )
     args = parser.parse_args(argv)
     if args.output.exists():
         raise ValueError("new output required")
@@ -239,6 +324,11 @@ def main(argv=None):
         prefix = f"group_{group_id:04d}"
         group = by_id[group_id]
         members, points, timestamps, radii = inputs.support(group)
+        references = (
+            reference_surfaces(inputs, members)
+            if args.partial_view_association
+            else None
+        )
         if not np.array_equal(points, old[prefix + "_points"]):
             raise ValueError("source point order changed")
         core = old[prefix + "_core"]
@@ -268,6 +358,11 @@ def main(argv=None):
                 frame,
                 None,
                 max(0.04, float(np.median(radii))),
+                partial_context=(
+                    {"target_name": name, "references": references}
+                    if references is not None
+                    else None
+                ),
             )
             matches.append(
                 dict(
@@ -367,6 +462,7 @@ def main(argv=None):
             source_proposals=describe_file(args.proposals),
             supplements=supplements,
             matching_labels_are_not_identity=True,
+            partial_view_association=args.partial_view_association,
             groups=output_rows,
             point_evidence=describe_file(args.output / "point_evidence.npz"),
             total_seconds=time.monotonic() - started,
