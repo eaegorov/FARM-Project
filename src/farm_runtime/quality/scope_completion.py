@@ -16,6 +16,7 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageOps
 
 from farm_runtime.angular_discovery import rotate_image
+from farm_runtime.quality.completion_policy import completion_seed
 from farm_runtime.quality.mask_refinement import checked_file
 from farm_runtime.quality.proposal_geometry import read_masks, read_observations
 from farm_runtime.quality.surface_tracker import restore_crop_logits
@@ -120,7 +121,7 @@ def completion_prompts(result, current):
     ]
 
 
-def validated_requests(tracker_path, validation_path):
+def validated_requests(tracker_path, validation_path, *, allow_ambiguous=False):
     """Resolve flattened detection indices, including multiple objects in one view."""
     tracker, rows = read_observations(tracker_path)
     validation = json.loads(validation_path.read_text())
@@ -168,12 +169,13 @@ def validated_requests(tracker_path, validation_path):
             seen.add(key)
             if key not in crops:
                 continue
-            selected = match["selected_detection"]
-            if match["decision"] != "matched_static_surface" or selected is None:
+            seed = completion_seed(match, allow_ambiguous=allow_ambiguous)
+            if seed is None:
                 skipped.append(
                     dict(group_id=key[0], name=key[1], reason="unresolved_identity")
                 )
                 continue
+            selected = seed["seed_detection"]
             local = selected - offsets.get(key[1], 0)
             obs, record = by_name[key[1]], crops[key]
             if obs["timestamp"] != match["timestamp"]:
@@ -206,6 +208,11 @@ def validated_requests(tracker_path, validation_path):
                     observation=obs,
                     detection_index=local,
                     selected_detection=selected,
+                    **(
+                        {"ambiguous_seed": True}
+                        if seed["fallback_detection"] is None
+                        else {}
+                    ),
                     timestamp=match["timestamp"],
                 )
             )
@@ -266,6 +273,11 @@ def main(argv=None):
         parser.add_argument("--" + name, type=Path, required=True)
     parser.add_argument("--crop-budget", type=int, default=4)
     parser.add_argument("--crops-per-object", type=int, default=2)
+    parser.add_argument(
+        "--ambiguous-scope-proposals",
+        action="store_true",
+        help="Propose completions from eligible ambiguous tracker seeds; no prior fallback",
+    )
     args = parser.parse_args(argv)
     if (
         args.output.exists()
@@ -275,7 +287,9 @@ def main(argv=None):
         raise ValueError(
             "new output, crop budget 1..16 and per-object budget 1..3 required"
         )
-    requests, skipped = validated_requests(args.tracker, args.validation)
+    requests, skipped = validated_requests(
+        args.tracker, args.validation, allow_ambiguous=args.ambiguous_scope_proposals
+    )
     selected = bounded_requests(requests, args.crop_budget, args.crops_per_object)
     args.output.mkdir(parents=True)
     for folder in ("masks", "visuals", "diagrams"):
@@ -370,6 +384,7 @@ def main(argv=None):
                 source_image=record["source_image"],
                 source_mask=describe_file(diagram_path),
                 selected_detection=request["selected_detection"],
+                **({"ambiguous_seed": True} if request.get("ambiguous_seed") else {}),
                 local_detection_index=request["detection_index"],
                 response=response,
                 prompts=prompts,
@@ -418,6 +433,11 @@ def main(argv=None):
             sam_prediction_seconds=sam_seconds,
             total_seconds=time.monotonic() - tick,
             preserve_core_box=True,
+            **(
+                {"ambiguous_scope_proposals": True}
+                if args.ambiguous_scope_proposals
+                else {}
+            ),
             test_opened=False,
             closed_test_opened=False,
             release_eligible=False,

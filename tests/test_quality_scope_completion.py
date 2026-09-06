@@ -317,3 +317,49 @@ def test_cli_preserves_both_objects_in_one_frame_and_reuses_model_instances(
     masks = read_masks(row, output)
     assert len(masks) == 2 and masks[0][:3, :6].all() and masks[1][7:, 4:].all()
     assert not masks[0][4:].any() and not masks[1][:6].any()
+
+
+def test_ambiguous_proposals_choose_best_eligible_tracker_without_accepting_it(
+    tmp_path,
+):
+    tracker, validation = fixture(tmp_path)
+    doc = json.loads(validation.read_text())
+    match = doc["groups"][0]["extra_matches"][0]
+    match.update(
+        selected_detection=None,
+        decision="ambiguous_competing_scope",
+        candidates=[
+            dict(detection_index=3, eligible=True, score=0.9),
+            dict(detection_index=0, eligible=True, score=0.8),
+            dict(detection_index=1, eligible=False, score=1.0),
+        ],
+    )
+    validation.write_text(json.dumps(doc))
+    original, _ = completion.validated_requests(tracker, validation)
+    assert [r["record"]["group_id"] for r in original] == [22]
+    requests, _ = completion.validated_requests(
+        tracker, validation, allow_ambiguous=True
+    )
+    assert requests[0]["selected_detection"] == 3
+    assert requests[0]["ambiguous_seed"] is True
+    assert "ambiguous_seed" not in requests[1]
+    # The source validation still contains no selected mask for this group.
+    assert (
+        json.loads(validation.read_text())["groups"][0]["extra_matches"][0][
+            "selected_detection"
+        ]
+        is None
+    )
+    match["candidates"][1]["score"] = 0.95
+    validation.write_text(json.dumps(doc))
+    requests, skipped = completion.validated_requests(
+        tracker, validation, allow_ambiguous=True
+    )
+    assert [r["record"]["group_id"] for r in requests] == [22]
+    assert skipped[0]["reason"] == "selected_other_source"
+    match["decision"] = "no_unambiguous_surface_match"
+    validation.write_text(json.dumps(doc))
+    requests, _ = completion.validated_requests(
+        tracker, validation, allow_ambiguous=True
+    )
+    assert [r["record"]["group_id"] for r in requests] == [22]

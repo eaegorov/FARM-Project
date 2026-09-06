@@ -1,8 +1,8 @@
-"""Bind visible-scope proposals to accepted tracker observations.
+"""Bind visible-scope proposals to geometrically eligible tracker seeds.
 
 This supplies a proposal-pool preference, never a replacement for geometric
-eligibility. A failed or ambiguous completion falls back to the prior eligible
-tracker observation.
+eligibility. Only an already accepted observation can be a fallback; opt-in
+ambiguous seeds remain unresolved when completion fails.
 """
 
 from __future__ import annotations
@@ -12,6 +12,27 @@ from pathlib import Path
 
 from farm_runtime.quality.mask_refinement import checked_file
 from farm_runtime.quality.proposal_geometry import read_observations
+
+
+def completion_seed(match, *, allow_ambiguous=False):
+    """Choose a geometrically eligible seed without accepting ambiguous scope."""
+    selected = match["selected_detection"]
+    if match["decision"] == "matched_static_surface" and selected is not None:
+        return dict(seed_detection=selected, fallback_detection=selected)
+    if (
+        allow_ambiguous
+        and match["decision"] == "ambiguous_competing_scope"
+        and selected is None
+    ):
+        eligible = sorted(
+            (r for r in match["candidates"] if r["eligible"]),
+            key=lambda r: (-r["score"], r["detection_index"]),
+        )
+        if len(eligible) >= 2:
+            return dict(
+                seed_detection=eligible[0]["detection_index"], fallback_detection=None
+            )
+    return None
 
 
 def load_completion_preferences(path, audit, proposals, supplements, partial_view):
@@ -62,16 +83,27 @@ def load_completion_preferences(path, audit, proposals, supplements, partial_vie
             raise ValueError("unique bound completion object/view required")
         seen.add(key)
         match = matches[key]
+        ambiguous = row.get("ambiguous_seed", False)
+        if type(ambiguous) is not bool or (
+            ambiguous and completion.get("ambiguous_scope_proposals") is not True
+        ):
+            raise ValueError(
+                "ambiguous completion requires an explicit proposal policy"
+            )
+        seed = completion_seed(match, allow_ambiguous=ambiguous)
         if (
-            match["decision"] != "matched_static_surface"
-            or row["selected_detection"] != match["selected_detection"]
+            seed is None
+            or ambiguous != (seed["fallback_detection"] is None)
+            or row["selected_detection"] != seed["seed_detection"]
             or not any(
                 c["detection_index"] == row["selected_detection"]
                 and c["eligible"] is True
                 for c in match["candidates"]
             )
         ):
-            raise ValueError("completion must start from an accepted tracker mask")
+            raise ValueError(
+                "completion must start from its bound eligible tracker seed"
+            )
         response = row["response"]
         if response["validation_error"] is not None:
             continue
@@ -95,6 +127,7 @@ def load_completion_preferences(path, audit, proposals, supplements, partial_vie
         if candidates:
             result[key] = dict(
                 candidate_indices=candidates,
-                fallback_detection=row["selected_detection"],
+                fallback_detection=seed["fallback_detection"],
+                **({"seed_detection": seed["seed_detection"]} if ambiguous else {}),
             )
     return result

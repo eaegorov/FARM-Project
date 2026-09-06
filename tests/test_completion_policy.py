@@ -236,3 +236,65 @@ def test_completion_priority_does_not_retract_the_prior_visible_mask():
     )
     assert all(r["eligible"] for r in rows)
     assert selected == 0
+
+
+def test_ambiguous_seed_completion_has_no_accepted_prior_fallback():
+    frame, partial, full, points = selection_case()
+    args = (
+        points,
+        np.ones(len(points), bool),
+        [partial, full],
+        [dict(label="object", score=0.9)] * 2,
+        frame,
+        None,
+        0.05,
+    )
+    preference = dict(candidate_indices=[1], seed_detection=0, fallback_detection=None)
+    assert select_observation(*args, completion_preference=preference)[0] == 1
+    # If the generated completion fails geometry, the eligible seed stays unresolved.
+    bad = np.zeros_like(partial)
+    bad[:3, :3] = True
+    changed = (*args[:2], [partial, bad], *args[3:])
+    chosen, rows, reason = select_observation(
+        *changed, completion_preference=preference
+    )
+    assert chosen is None and reason == "ambiguous_competing_scope"
+    assert rows[0]["eligible"]
+
+
+@pytest.mark.parametrize(
+    "fault", [None, "policy_missing", "wrong_seed", "prior_accepted"]
+)
+def test_ambiguous_completion_binds_policy_and_geometric_best(tmp_path, fault):
+    path, audit, base, supplements, parent = policy_fixture(tmp_path)
+    data = json.loads(parent.read_text())
+    match = data["groups"][0]["extra_matches"][0]
+    match.update(
+        selected_detection=None,
+        decision="ambiguous_competing_scope",
+        candidates=[
+            dict(detection_index=3, eligible=True, score=0.9),
+            dict(detection_index=0, eligible=True, score=0.8),
+        ],
+    )
+    if fault == "prior_accepted":
+        match.update(selected_detection=3, decision="matched_static_surface")
+    parent.write_text(json.dumps(data))
+    completion = json.loads(path.read_text())
+    completion["source_validation"] = describe_file(parent)
+    completion["ambiguous_scope_proposals"] = True
+    completion["outputs"][0]["ambiguous_seed"] = True
+    if fault == "policy_missing":
+        del completion["ambiguous_scope_proposals"]
+    elif fault == "wrong_seed":
+        completion["outputs"][0]["selected_detection"] = 0
+    path.write_text(json.dumps(completion))
+    if fault:
+        with pytest.raises(ValueError):
+            load_completion_preferences(path, audit, base, supplements, True)
+    else:
+        result = load_completion_preferences(path, audit, base, supplements, True)
+        assert result[7, "view.png"] == dict(
+            candidate_indices=[6, 8], seed_detection=3, fallback_detection=None
+        )
+        assert result[8, "view.png"]["fallback_detection"] == 4

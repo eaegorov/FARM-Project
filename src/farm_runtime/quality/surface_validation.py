@@ -245,11 +245,12 @@ def select_observation(
                 "completion preference and scope review are separate policies"
             )
         fallback = completion_preference["fallback_detection"]
+        seed = completion_preference.get("seed_detection", fallback)
         preferred = [
             r
             for r in eligible
             if r["detection_index"] in completion_preference["candidate_indices"]
-            and mask_overlap(masks[fallback], masks[r["detection_index"]])[1] >= 0.90
+            and mask_overlap(masks[seed], masks[r["detection_index"]])[1] >= 0.90
         ]
         if preferred:
             best = preferred[0]
