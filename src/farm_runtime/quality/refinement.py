@@ -9,7 +9,7 @@ from pathlib import Path
 import time
 
 import numpy as np
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageOps
 
 from farm_runtime.angular_discovery import rotate_image, upright_quarter_turns
 from farm_runtime.quality_baseline import describe_file, write_json
@@ -291,6 +291,7 @@ def sam(args):
             prompts=describe_file(args.prompts) if args.prompts else None,
             model_weights=describe_file(args.model / "model.safetensors"),
             model_load_seconds=load_seconds,
+            scene_context_included=contextual,
             total_seconds=time.monotonic() - started,
             release_eligible=False,
         ),
@@ -485,7 +486,31 @@ def orient(args):
     )
 
 
-def review_image(image, row, *, semantic_only=False, scope=False):
+def scope_context_image(row):
+    """Locate a source crop on its real full RGB before the same upright rotation."""
+    from farm_runtime.quality.mask_refinement import checked_file
+
+    with Image.open(checked_file(row["source_image"])) as source:
+        context = source.convert("RGB")
+    box = row["crop_source_xyxy"]
+    if (
+        len(box) != 4
+        or any(type(v) is not int for v in box)
+        or not 0 <= box[0] < box[2] <= context.width
+        or not 0 <= box[1] < box[3] <= context.height
+        or type(row["turns"]) is not int
+        or row["turns"] not in range(4)
+    ):
+        raise ValueError("valid source crop and quarter turns required")
+    ImageDraw.Draw(context).rectangle(
+        (box[0], box[1], box[2] - 1, box[3] - 1),
+        outline="#ffd84d",
+        width=max(1, round(max(context.size) / 350)),
+    )
+    return Image.fromarray(rotate_image(np.asarray(context), row["turns"]))
+
+
+def review_image(image, row, *, semantic_only=False, scope=False, context=None):
     """Build the requested visual evidence without fabricated mask candidates."""
     from farm_runtime.quality.mask_refinement import checked_file
 
@@ -507,17 +532,35 @@ def review_image(image, row, *, semantic_only=False, scope=False):
             return photo
         # Keep synthetic annotation colors out of appearance evidence.
         silhouette = Image.fromarray(mask.astype(np.uint8) * 255).convert("RGB")
-        canvas = Image.new("RGB", (1040, 550), "#111827")
+        panels = [
+            (photo, "PHOTO: APPEARANCE"),
+            (silhouette, "MASK DIAGRAM: WHITE = TARGET"),
+        ]
+        if context is not None:
+            panels.insert(0, (context, "SCENE CONTEXT: TARGET LOCATION"))
+        canvas = Image.new("RGB", (520 * len(panels), 550), "#111827")
         draw = ImageDraw.Draw(canvas)
-        for col, tile in enumerate((photo, silhouette)):
-            tile.thumbnail((508, 508))
+        for col, (tile, title) in enumerate(panels):
+            if context is not None:
+                # Fill the available visual tokens; enlargement adds no detail.
+                tile = ImageOps.contain(
+                    tile,
+                    (508, 508),
+                    method=(
+                        Image.Resampling.NEAREST
+                        if tile is silhouette
+                        else Image.Resampling.LANCZOS
+                    ),
+                )
+            else:
+                tile.thumbnail((508, 508))
             canvas.paste(
                 tile,
                 (col * 520 + (508 - tile.width) // 2, 32 + (508 - tile.height) // 2),
             )
             draw.text(
                 (col * 520 + 8, 8),
-                "PHOTO: APPEARANCE" if col == 0 else "MASK DIAGRAM: WHITE = TARGET",
+                title,
                 fill="white",
             )
         return canvas
@@ -557,6 +600,9 @@ def vlm(args):
 
     proposals = json.loads(args.proposals.read_text())
     scope = getattr(args, "scope", False)
+    contextual = getattr(args, "scope_context", False)
+    if contextual and not scope:
+        raise ValueError("--scope-context requires --scope")
     if scope and (
         proposals.get("schema") != "farm.object-scope-evidence.v1"
         or proposals.get("reserved_test_opened") is not False
@@ -569,6 +615,15 @@ def vlm(args):
         if scope
         else SEMANTIC_PROMPT if args.semantic_only else REVIEW_PROMPT
     )
+    if contextual:
+        prompt = prompt.replace("Each sheet has two panels:", "Each sheet includes:")
+        prompt = (
+            "SCENE CONTEXT is the original full RGB with a yellow rectangle locating "
+            "the PHOTO crop. Use it to understand nearby structure and possible parents. "
+            "PHOTO is enlarged for inspection; this adds no visual detail. "
+            "Describe the physical target, never the sheet, annotation or camera views. "
+            + prompt
+        )
     args.output.mkdir(parents=True)
     (args.output / "visuals").mkdir()
     (args.output / "prompt.txt").write_text(prompt)
@@ -590,7 +645,11 @@ def vlm(args):
             with Image.open(checked_file(row["crop"])) as source:
                 image = source.convert("RGB")
             canvas = review_image(
-                image, row, semantic_only=args.semantic_only, scope=scope
+                image,
+                row,
+                semantic_only=args.semantic_only,
+                scope=scope,
+                context=scope_context_image(row) if contextual else None,
             )
             path = (
                 args.output / "visuals" / f"{object_id:06d}_{row['image_id']:06d}.jpg"
@@ -608,9 +667,7 @@ def vlm(args):
         torch.cuda.reset_peak_memory_stats()
         image_ids = [r["image_id"] for r in chosen]
         response = (
-            model.ask(
-                SCOPE_PROMPT, images, image_ids, validate_scope, max_new_tokens=768
-            )
+            model.ask(prompt, images, image_ids, validate_scope, max_new_tokens=768)
             if scope
             else model.review(images, image_ids, semantic_only=args.semantic_only)
         )
@@ -641,6 +698,7 @@ def vlm(args):
             model_config=describe_file(args.model / "config.json"),
             prompt=describe_file(args.output / "prompt.txt"),
             model_load_seconds=load_seconds,
+            scene_context_included=contextual,
             total_seconds=time.monotonic() - started,
             human_labels_in_prompt=False,
             detector_labels_in_prompt=False,
@@ -696,6 +754,11 @@ def main(argv=None):
         "--scope",
         action="store_true",
         help="Review actual proposal scope with clean RGB and its mask",
+    )
+    p.add_argument(
+        "--scope-context",
+        action="store_true",
+        help="Add registered source RGB context and enlarge actual scope crops",
     )
     p.set_defaults(func=vlm)
     args = parser.parse_args(argv)

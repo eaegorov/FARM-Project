@@ -637,6 +637,12 @@ def main(argv=None):
     for name in ("ply", "config", "output"):
         parser.add_argument("--" + name, type=Path, required=True)
     parser.add_argument("--prepare-only", action="store_true")
+    parser.add_argument(
+        "--scope-alternative-budget",
+        type=int,
+        default=0,
+        help="Preserve up to 16 nested scope hypotheses from cached VJP",
+    )
     args = parser.parse_args(argv)
     if args.output.exists():
         raise ValueError("new output required")
@@ -646,6 +652,8 @@ def main(argv=None):
         raise ValueError(
             "--world-up is required only with --geometry; --group-id requires --geometry"
         )
+    if not 0 <= args.scope_alternative_budget <= 16:
+        raise ValueError("scope alternative budget must be from 0 to 16")
     started = time.monotonic()
     config, _ = lift.load_config(args.config)
     args.output.mkdir(parents=True)
@@ -666,6 +674,8 @@ def main(argv=None):
             args.validation, config, args.output / "input"
         )
         input_path = args.output / "input" / "manifest.json"
+    if args.scope_alternative_budget and not input_manifest.get("source_geometry"):
+        raise ValueError("scope alternatives require frozen source geometry")
     source = describe_file(args.ply)
     if source["sha256"] != input_manifest["source_ply"]["sha256"]:
         raise ValueError("source PLY changed")
@@ -721,6 +731,20 @@ def main(argv=None):
         )
         bank = build_verified_csr(owner, confidence, support)
         np.savez_compressed(dest / "proposal_bank.npz", **bank)
+        alternatives = None
+        if args.scope_alternative_budget:
+            from farm_runtime.quality.scope_ownership import preserve_scope_alternatives
+
+            alternatives = preserve_scope_alternatives(
+                input_manifest,
+                evidence,
+                gaussians,
+                config,
+                bank,
+                object_rows,
+                dest / "scope_alternatives",
+                args.scope_alternative_budget,
+            )
         native_geometry = []
         for obj in run.objects:
             indices = np.flatnonzero(owner == obj.object_id)
@@ -755,6 +779,7 @@ def main(argv=None):
             geometry_gate=geometry,
             native_geometry=native_geometry,
             bank=describe_file(dest / "proposal_bank.npz"),
+            scope_alternatives=alternatives,
             visuals=visuals,
             closed_test_opened=False,
             release_eligible=False,

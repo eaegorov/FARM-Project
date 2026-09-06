@@ -111,3 +111,50 @@ def test_scope_rejects_schema_echo_and_enum_as_physical_identity(field, value, r
     result[field] = value
     with pytest.raises(ValueError, match=reason):
         validate_scope(json.dumps(result), [1])
+
+
+def test_scope_context_uses_exact_source_rotation_and_rejects_stale_rgb(tmp_path):
+    from farm_runtime.quality.refinement import scope_context_image
+    from farm_runtime.angular_discovery import rotate_image
+
+    rgb = np.zeros((60, 100, 3), np.uint8)
+    rgb[:] = [35, 70, 90]
+    rgb[30:, 50:] = [170, 60, 20]
+    path = tmp_path / "source.png"
+    Image.fromarray(rgb).save(path)
+    row = dict(
+        source_image=describe_file(path), crop_source_xyxy=[20, 10, 40, 30], turns=1
+    )
+    context = scope_context_image(row)
+    assert context.size == (60, 100)
+    expected = rgb.copy()
+    from PIL import ImageDraw
+
+    marked = Image.fromarray(expected)
+    ImageDraw.Draw(marked).rectangle((20, 10, 39, 29), outline="#ffd84d", width=1)
+    np.testing.assert_array_equal(
+        np.asarray(context), rotate_image(np.asarray(marked), 1)
+    )
+    row["crop_source_xyxy"] = [0, 0, 101, 20]
+    with pytest.raises(ValueError, match="source crop"):
+        scope_context_image(row)
+    row["crop_source_xyxy"] = [20, 10, 40, 30]
+    path.write_bytes(b"changed")
+    with pytest.raises(ValueError, match="hash mismatch"):
+        scope_context_image(row)
+
+
+def test_context_sheet_preserves_clean_photo_and_binary_shape_when_enlarged(tmp_path):
+    mask = np.zeros((40, 60), bool)
+    mask[10:30, 20:40] = True
+    path = tmp_path / "mask.npz"
+    np.savez_compressed(path, baseline=mask)
+    rgb = Image.new("RGB", (60, 40), (35, 70, 90))
+    context = Image.new("RGB", (100, 80), (180, 90, 20))
+    sheet = review_image(
+        rgb, dict(masks=describe_file(path)), scope=True, context=context
+    )
+    assert sheet.size == (1560, 550)
+    assert sheet.getpixel((774, 286)) == (35, 70, 90)
+    assert sheet.getpixel((1294, 286)) == (255, 255, 255)
+    assert context.size == (100, 80)

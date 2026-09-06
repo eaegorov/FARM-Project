@@ -231,6 +231,8 @@ def _require_sections(config: Mapping[str, Any]) -> None:
 
     if config["mask"].get("negative_domain", "ring") not in ("ring", "visible_background"):
         raise ValueError("mask.negative_domain must be ring or visible_background")
+    if config["mask"].get("other_mask_negative_policy", "exclude") not in ("exclude", "background"):
+        raise ValueError("mask.other_mask_negative_policy must be exclude or background")
     for key in ("positive_depth_policy", "negative_depth_policy"):
         if config["mask"].get(key, "stable") not in ("stable", "valid"):
             raise ValueError(f"mask.{key} must be stable or valid")
@@ -1386,7 +1388,10 @@ def _load_view_masks(
         visible_surface |= raw & foreground_surface
         if int(np.count_nonzero(positive)) < int(config["mask"]["minimum_positive_pixels"]):
             positive = (raw & foreground_surface).astype(np.float32) * float(config["mask"]["raw_interior_weight"])
-        other = all_raw & ~raw
+        # Other proposal hypotheses must not silently erase candidate-specific
+        # background. The opt-in mode retains transient/depth unknown masks.
+        other = (all_raw & ~raw if config["mask"].get(
+            "other_mask_negative_policy", "exclude") == "exclude" else np.zeros_like(raw))
         negative = negative_mask_ring(
             raw, other, background_surface, ring_kernel,
             int(config["mask"].get("negative_guard_pixels", 0)),

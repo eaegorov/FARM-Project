@@ -284,3 +284,50 @@ def test_control_split_uses_source_timestamp_not_bundle_local_nominal_time():
         require_new_timestamps(["camera_a"], sources, {"000100"})
     with pytest.raises(ValueError, match="duplicate"):
         require_new_timestamps(["camera_b", "camera_b"], sources, {"000100"})
+
+
+def test_candidate_background_is_independent_of_nested_proposal_cohort(tmp_path):
+    run, frame, observation, config = fixture(tmp_path)
+    config["mask"].update(
+        negative_domain="visible_background", other_mask_negative_policy="background"
+    )
+    outer = np.zeros(frame.depth_size, bool)
+    outer[3:37, 3:37] = True
+    path = tmp_path / "outer.npz"
+    np.savez_compressed(
+        path,
+        image_shape=np.array([40, 40]),
+        raw_shape=np.array([40, 40]),
+        raw_bbox_xyxy=np.array([0, 0, 40, 40]),
+        raw_bits=np.packbits(outer.ravel(), bitorder="little"),
+    )
+    parent = MaskObservation(8, 0, "outer.npz", {})
+    excluded = np.zeros(frame.depth_size, bool)
+    excluded[4:8, 4:8] = True
+    exclusion_path = tmp_path / "excluded.npy"
+    np.save(exclusion_path, excluded)
+    run = replace(
+        run,
+        mask_overrides={(7, 0): run.mask_overrides[7, 0], (8, 0): path},
+        observation_exclusions={0: describe_file(exclusion_path)},
+    )
+    single = _load_view_masks(run, frame, {7: [observation]}, config)[0][7]
+    nested = _load_view_masks(run, frame, {7: [observation], 8: [parent]}, config)[0][7]
+    for key in ["positive_weight", "negative_weight"]:
+        np.testing.assert_array_equal(single[key], nested[key])
+        assert not nested[key][excluded].any()
+    assert nested["negative_weight"][8, 8] > 0
+    config["mask"]["other_mask_negative_policy"] = "exclude"
+    legacy = _load_view_masks(run, frame, {7: [observation], 8: [parent]}, config)[0][7]
+    assert legacy["negative_weight"][8, 8] == 0
+
+
+def test_other_mask_negative_policy_rejects_unknown_values(tmp_path):
+    import yaml
+
+    _, _, _, config = fixture(tmp_path)
+    config["mask"]["other_mask_negative_policy"] = "ignore-everything"
+    path = tmp_path / "config.yaml"
+    path.write_text(yaml.safe_dump(config))
+    with pytest.raises(ValueError, match="other_mask_negative_policy"):
+        load_config(path)
