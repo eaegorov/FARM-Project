@@ -256,3 +256,28 @@ def test_preparation_stat_fingerprint_is_checked_before_content_upgrade(tmp_path
         freeze_source_ply(record)
     with pytest.raises(ValueError, match="changed since preparation"):
         freeze_source_ply(frozen)
+
+
+def test_native_sensor_family_comes_from_registered_preparation(tmp_path):
+    geometry, config = geometry_fixture(tmp_path / "case")
+    doc = json.loads(geometry.read_text())
+    proposals = Path(doc["inputs"]["proposals"]["path"])
+    raw = json.loads(proposals.read_text())
+    for row in raw["observations"]:
+        row.pop("sensor")
+        row.pop("family")
+    write_json(proposals, raw)
+    doc["inputs"]["proposals"] = describe_file(proposals)
+    write_json(geometry, doc)
+    run, _, _ = prepare_geometry(geometry, config, tmp_path / "native", [0, 0, 1])
+    restored, _, _ = load_prepared(tmp_path / "native/manifest.json")
+    assert [(f.sensor, f.family) for f in run.frames] == [
+        (f.sensor, f.family) for f in restored.frames
+    ]
+    assert {f.sensor for f in run.frames} == {"cam0", "cam1"}
+    raw["observations"][0]["sensor"] = "wrong_sensor"
+    write_json(proposals, raw)
+    doc["inputs"]["proposals"] = describe_file(proposals)
+    write_json(geometry, doc)
+    with pytest.raises(ValueError, match="registered sensor/family"):
+        prepare_geometry(geometry, config, tmp_path / "conflict", [0, 0, 1])

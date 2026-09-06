@@ -245,6 +245,16 @@ def freeze_source_ply(record):
     }
 
 
+def registered_identity(row, config):
+    """Decode the identity using the frozen RGBD preparation contract."""
+    match = re.fullmatch(config["identity_regex"], row["source_image"])
+    if match is None:
+        raise ValueError("source frame identity cannot be decoded")
+    if match[config.get("timestamp_group", "timestamp")] != str(row["frame_id"]):
+        raise ValueError("registered timestamp identity mismatch")
+    return match[config["sensor_group"]], match[config["family_group"]]
+
+
 def _prepare_native(
     inputs,
     selected_groups,
@@ -268,6 +278,7 @@ def _prepare_native(
         or prep["fingerprint"] != summary["fingerprint"]
     ):
         raise ValueError("matching completed RGBD manifest required")
+    rgbd = prep["fingerprint_payload"]["config"]
     groups = {g["id"]: g for g in inputs.geometry["groups"]}
     source_ply = freeze_source_ply(prep["fingerprint_payload"]["inputs"]["ply"])
     output.mkdir(parents=True)
@@ -281,6 +292,14 @@ def _prepare_native(
             raise ValueError("untrusted registration")
         row = inputs.frames[name]
         source = source_rows[name]
+        sensor, family = registered_identity(row, rgbd)
+        if (
+            source.get("sensor", sensor) != sensor
+            or source.get("family", family) != family
+        ):
+            raise ValueError(
+                "proposal metadata conflicts with registered sensor/family"
+            )
         f = inputs.frame(name)
         if name not in inputs.trusted or str(row["frame_id"]) != source["timestamp"]:
             raise ValueError("untrusted registration or timestamp mismatch")
@@ -310,8 +329,8 @@ def _prepare_native(
             str(row["frame_id"]),
             int(row["timestamp_ns"]),
             row["camera"],
-            source["sensor"],
-            source["family"],
+            sensor,
+            family,
             name,
             shape,
             np.asarray(row["K"], float),
@@ -481,9 +500,7 @@ def load_prepared(path):
         row = registered[name]
         if int(row["timestamp_ns"]) != record["physical_timestamp_ns"]:
             raise ValueError("registered timestamp mapping changed")
-        match = re.fullmatch(config["identity_regex"], name)
-        if match is None:
-            raise ValueError("source frame identity cannot be decoded")
+        sensor, family = registered_identity(row, config)
         source_frames = checked_file(manifest["source_frames"]).parent
         depth = checked_file(record["depth"])
         if depth.resolve() != (source_frames / row["depth_path"]).resolve():
@@ -495,8 +512,8 @@ def load_prepared(path):
             str(row["frame_id"]),
             int(row["timestamp_ns"]),
             row["camera"],
-            match[config["sensor_group"]],
-            match[config["family_group"]],
+            sensor,
+            family,
             name,
             tuple(row["depth_size"]),
             np.asarray(row["K"], float),
@@ -638,6 +655,9 @@ def main(argv=None):
         parser.add_argument("--" + name, type=Path, required=True)
     parser.add_argument("--prepare-only", action="store_true")
     parser.add_argument(
+        "--mode", choices=("both", "exclusions_on", "exclusions_off"), default="both"
+    )
+    parser.add_argument(
         "--scope-alternative-budget",
         type=int,
         default=0,
@@ -698,7 +718,8 @@ def main(argv=None):
     import torch
 
     reports = []
-    for mode in ("exclusions_off", "exclusions_on"):
+    modes = ("exclusions_off", "exclusions_on") if args.mode == "both" else (args.mode,)
+    for mode in modes:
         dest = args.output / mode
         dest.mkdir()
         (dest / "visuals").mkdir()
@@ -811,7 +832,8 @@ def main(argv=None):
             reports=reports,
             alignment=alignment,
             total_seconds=time.monotonic() - started,
-            interpretation="Same-input transient exclusion ablation with existing exact FARM lift. Reverse images use build observations, not heldout evaluation. Production bank unchanged.",
+            modes=list(modes),
+            interpretation="Existing exact FARM lift with explicit transient-exclusion modes. Reverse images use build observations, not heldout evaluation. Production bank unchanged.",
             closed_test_opened=False,
             release_eligible=False,
         ),

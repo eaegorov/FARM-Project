@@ -1,0 +1,29 @@
+box
+container
+cabinet
+cart
+table
+chair
+shelf
+rack
+workbench
+machine
+tool
+ladder
+door
+window
+light fixture
+pipe
+sign
+fire extinguisher
+bin
+bucket
+barrel
+bag
+pallet
+monitor
+camera
+fan
+plant
+vehicle
+person

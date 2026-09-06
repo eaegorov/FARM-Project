@@ -331,3 +331,9 @@ Native stage с девятью scope alternatives: 6,42 / 6,97 с, 1437 MiB; alt
 Отчёт V12: `16_compact_semantics/REVIEW_RU.md`. `quality refinement vlm --compact-semantics` использует contextual RGB + PHOTO + binary mask и узкую схему из 4 полей, max180 tokens. На одинаковых 24 canvases 4B: 12/12 valid против длинного scope 1/12, inference 32,10 против 80,24 с. Проверены все 24 изображения. Это улучшение формата и полезности черновых описаний, не доказанная semantic accuracy. Ошибки колонна/window frame, sign/decal и неподтверждённые material/orientation сохраняются. Empty uncertainty не означает уверенность.
 
 8B при том же запросе: 53,06 с inference, 17310 MiB; два strict ID-order failures, содержательные регрессии crate→concrete pillar и pallet→box. Замена на 8B не принимается. Model-load time зависит от cache и отдельно указан в отчёте. Исправлен SAM writer с ошибочным VLM-only полем; 1215 tests passed / 69,40 с. Следующий шаг — связный bounded quality run и каталог с явным native/scope/physical-size статусом.
+
+## 21. Общий quality scene profile и каталог
+
+Отчёт V12: `17_scene_profile/REVIEW_RU.md`; руководство [QUALITY_SCENE_PROFILE_RU.md](QUALITY_SCENE_PROFILE_RU.md). Существующий FARM orchestrator выполняет 13 bounded этапов, snapshots и provenance сохранены. Knaack: 40 multi-timestamp candidates, 36 primary native masks, 4 nested alternatives. Native IDs и support точно совпали с этапом 14. Сумма успешных stages 517,41 с после готового RGBD; два запуска с исправлением identity adapter между ними, не uninterrupted cold run. 1224 tests passed / 85,13 с.
+
+Все 40 compact JSON валидны, но визуально обнаружены context distraction (потолочная труба→каска человека) и wall/crate ошибки. Каталог хранит модельные proposals, observed OBB и unresolved physical size/scope. Следующий шаг — local-context comparison на той же когорте, затем bounded crop refinement. Universal release ещё не подтверждён.

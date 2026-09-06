@@ -5,6 +5,8 @@ import importlib
 import sys
 
 ACTIONS = {
+    "scene-profile": "scene_profile",
+    "scene-catalog": "scene_catalog",
     "scene-vocabulary": "scene_vocabulary",
     "concept-discovery": "concept_discovery",
     "discovery-coverage": "discovery_coverage",
