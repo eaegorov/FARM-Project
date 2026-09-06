@@ -63,7 +63,7 @@ def main(argv=None):
                 )
         before = read_bank(args.baseline_ablation / args.domain / "proposal_bank.npz")
         after = read_bank(args.ablation / args.domain / "proposal_bank.npz")
-        names = ("Before mask refinement", "After mask refinement")
+        names = ("Before development change", "After development change")
     else:
         before, after = [
             read_bank(args.ablation / d / "proposal_bank.npz")

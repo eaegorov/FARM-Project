@@ -70,17 +70,6 @@ def prepare(validation_path, config, output):
     audit_path = checked_file(validation["source_audit"])
     audit = json.loads(audit_path.read_text())
     inputs = SurfaceInputs(checked_file(audit["source_geometry"]))
-    prep_path = inputs.frames_path.parent / "run_manifest.json"
-    prep = json.loads(prep_path.read_text())
-    summary = json.loads(
-        checked_file(inputs.geometry["inputs"]["prep_summary"]).read_text()
-    )
-    if (
-        prep.get("status") != "complete"
-        or not prep.get("qa_passed")
-        or prep["fingerprint"] != summary["fingerprint"]
-    ):
-        raise ValueError("matching completed RGBD manifest required")
     extra_path = checked_file(validation["source_proposals"])
     _, extras = read_observations(extra_path)
     extra = {r["name"]: r for r in extras}
@@ -131,6 +120,156 @@ def prepare(validation_path, config, output):
                 detection_index=index,
             )
             source_rows[name] = extra[name]
+    return _prepare_native(
+        inputs,
+        validation["groups"],
+        observations,
+        source_rows,
+        extra,
+        masks,
+        config,
+        output,
+        source_validation=describe_file(validation_path),
+    )
+
+
+def prepare_geometry(geometry_path, config, output, world_up, group_ids=None):
+    """Freeze observed multi-timestamp groups without inventing validation data.
+
+    Geometric association is an identity hypothesis, not verified object scope.
+    The resulting masks and boxes remain development-only.
+    """
+    from farm_runtime.obb_proposals import fit_surface_envelope, z_up_rotation
+    from scripts.geometry.refine_farm_object_geometry import _fit_robust_obb
+
+    z_up_rotation(world_up)  # Validate before using gravity in the existing fitter.
+    inputs = SurfaceInputs(geometry_path)
+    if (
+        inputs.geometry.get("schema") != "farm.proposal-surface-association.v1"
+        or inputs.geometry.get("release_eligible") is not False
+    ):
+        raise ValueError("development surface association required")
+    groups = {g["id"]: g for g in inputs.geometry["groups"]}
+    selected = (
+        sorted(gid for gid, g in groups.items() if g["independent_timestamps"] >= 2)
+        if group_ids is None
+        else list(dict.fromkeys(group_ids))
+    )
+    if not selected or not set(selected) <= groups.keys():
+        raise ValueError("nonempty known group IDs required")
+    selection, observations, source_rows = [], {}, {}
+    for oid in selected:
+        group = groups[oid]
+        members, points, timestamps, _ = inputs.support(group)
+        actual_timestamps = {n["timestamp"] for n in members}
+        if (
+            len(actual_timestamps) < 2
+            or len(actual_timestamps) != group["independent_timestamps"]
+            or len({n["frame"] for n in members}) != len(members)
+        ):
+            raise ValueError(
+                "two independent timestamps and unique group/frame required"
+            )
+        if not np.isfinite(points).all():
+            raise ValueError("finite registered object support required")
+        rotation = _fit_robust_obb(
+            points,
+            0.005,
+            orientation_mode="gravity_yaw",
+            up_vector=world_up,
+        )["rotation_matrix"]
+        weights = np.zeros(len(points))
+        for timestamp in np.unique(timestamps):
+            selected_points = timestamps == timestamp
+            weights[selected_points] = 1 / selected_points.sum()
+        box = fit_surface_envelope(
+            points,
+            weights,
+            rotation,
+            "FARM gravity-PCA; original observed support",
+        )
+        selection.append(dict(group_id=oid, boxes={"all_observed": box}))
+        for node in members:
+            name = node["frame"]
+            transient = inputs.transients.get(name)
+            if (
+                transient is None
+                or not any(q["prompt"] == "person" for q in transient["queries"])
+                or any(d["label"] != "person" for d in transient["detections"])
+            ):
+                raise ValueError("explicit person-only transient evidence required")
+            observations[oid, name] = dict(
+                mask=inputs.mask(node),
+                source_kind="original_geometry",
+                node_id=node["id"],
+            )
+            source_rows[name] = inputs.observations[name]
+    return _prepare_native(
+        inputs,
+        selection,
+        observations,
+        source_rows,
+        {},
+        {},
+        config,
+        output,
+    )
+
+
+def freeze_source_ply(record):
+    """Upgrade a matching preparation stat fingerprint to a content binding.
+
+    Older RGBD preparations used size/mtime. Checking those before hashing
+    preserves their original guarantee; the new SHA does not retroactively
+    claim that the old preparation had a content hash.
+    """
+    path = Path(record["path"])
+    stat = path.stat()
+    if "sha256" not in record:
+        if (
+            record.get("size") != stat.st_size
+            or record.get("mtime_ns") != stat.st_mtime_ns
+        ):
+            raise ValueError(
+                "source PLY no longer matches preparation stat fingerprint"
+            )
+    current = describe_file(path)
+    if "sha256" in record and current["sha256"] != record["sha256"]:
+        raise ValueError("source PLY changed since preparation")
+    return {
+        **record,
+        **current,
+        "preparation_binding": (
+            "sha256" if "sha256" in record else "size_mtime_then_sha256"
+        ),
+    }
+
+
+def _prepare_native(
+    inputs,
+    selected_groups,
+    observations,
+    source_rows,
+    extra,
+    masks,
+    config,
+    output,
+    *,
+    source_validation=None,
+):
+    prep_path = inputs.frames_path.parent / "run_manifest.json"
+    prep = json.loads(prep_path.read_text())
+    summary = json.loads(
+        checked_file(inputs.geometry["inputs"]["prep_summary"]).read_text()
+    )
+    if (
+        prep.get("status") != "complete"
+        or not prep.get("qa_passed")
+        or prep["fingerprint"] != summary["fingerprint"]
+    ):
+        raise ValueError("matching completed RGBD manifest required")
+    groups = {g["id"]: g for g in inputs.geometry["groups"]}
+    source_ply = freeze_source_ply(prep["fingerprint_payload"]["inputs"]["ply"])
     output.mkdir(parents=True)
     (output / "masks").mkdir()
     (output / "exclusions").mkdir()
@@ -138,6 +277,8 @@ def prepare(validation_path, config, output):
     exclusions = {}
     frame_rows = []
     for image_id, name in enumerate(sorted(source_rows)):
+        if name not in inputs.trusted:
+            raise ValueError("untrusted registration")
         row = inputs.frames[name]
         source = source_rows[name]
         f = inputs.frame(name)
@@ -195,7 +336,7 @@ def prepare(validation_path, config, output):
     overrides = {}
     object_rows = []
     split_rows = []
-    for row in validation["groups"]:
+    for row in selected_groups:
         oid = row["group_id"]
         group = groups[oid]
         object_observations = []
@@ -271,11 +412,16 @@ def prepare(validation_path, config, output):
     )
     manifest = dict(
         schema="farm.native-observation-input.v1",
-        source_validation=describe_file(validation_path),
+        source_validation=source_validation,
         source_geometry=describe_file(inputs.geometry_path),
+        observation_origin=(
+            "validated_additional_views"
+            if source_validation
+            else "geometric_association_only"
+        ),
         source_frames=describe_file(inputs.frames_path),
         source_prep_manifest=describe_file(prep_path),
-        source_ply=prep["fingerprint_payload"]["inputs"]["ply"],
+        source_ply=source_ply,
         object_id_namespace="source geometry group IDs; distinct from legacy FARM IDs",
         timestamp_authority="Registered frames.json; nominal timestamps are local to this preparation. Source frame ID is the cross-run identity.",
         frames=frame_rows,
@@ -482,6 +628,11 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--validation", type=Path)
+    source.add_argument(
+        "--geometry", type=Path, help="Freeze geometric groups directly"
+    )
+    parser.add_argument("--group-id", type=int, action="append")
+    parser.add_argument("--world-up", type=float, nargs=3)
     source.add_argument("--input", type=Path, help="Reuse a frozen prepared input")
     for name in ("ply", "config", "output"):
         parser.add_argument("--" + name, type=Path, required=True)
@@ -489,12 +640,27 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.output.exists():
         raise ValueError("new output required")
+    if bool(args.geometry) != bool(args.world_up) or (
+        args.group_id and not args.geometry
+    ):
+        raise ValueError(
+            "--world-up is required only with --geometry; --group-id requires --geometry"
+        )
     started = time.monotonic()
     config, _ = lift.load_config(args.config)
     args.output.mkdir(parents=True)
     if args.input:
         run, split, input_manifest = load_prepared(args.input)
         input_path = args.input
+    elif args.geometry:
+        run, split, input_manifest = prepare_geometry(
+            args.geometry,
+            config,
+            args.output / "input",
+            args.world_up,
+            args.group_id,
+        )
+        input_path = args.output / "input" / "manifest.json"
     else:
         run, split, input_manifest = prepare(
             args.validation, config, args.output / "input"

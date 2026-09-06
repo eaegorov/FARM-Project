@@ -46,6 +46,15 @@ def test_semantic_evidence_needs_only_a_real_baseline_and_checks_hash(tmp_path):
     assert plain.getpixel((0, 0)) == (50, 60, 70)
     scope = review_image(image, row, scope=True)
     assert scope.size == (1040, 550)
+    other_rgb = review_image(
+        Image.new("RGB", image.size, (190, 20, 10)), row, scope=True
+    )
+    # Scope shape is independent of photograph colors; PHOTO interior is intact.
+    np.testing.assert_array_equal(
+        np.asarray(scope)[:, 520:], np.asarray(other_rgb)[:, 520:]
+    )
+    assert scope.getpixel((254, 286)) == (50, 60, 70)
+    assert scope.getpixel((774, 286)) == (255, 255, 255)
     path.write_bytes(b"changed")
     with pytest.raises(ValueError, match="hash mismatch"):
         review_image(image, row, scope=True)
@@ -73,3 +82,32 @@ def test_scope_requires_explicit_granularity_and_keeps_identity_unknown():
     value["scope"]["kind"] = "whole object with maybe parts"
     with pytest.raises(ValueError, match="scope kind"):
         validate_scope(json.dumps(value), [1, 2])
+
+
+@pytest.mark.parametrize(
+    "field,value,reason",
+    [
+        ("label", "observable English candidate category", "schema placeholder"),
+        ("caption", "one factual English sentence", "schema placeholder"),
+        ("label", "integral_part", "scope enum"),
+    ],
+)
+def test_scope_rejects_schema_echo_and_enum_as_physical_identity(field, value, reason):
+    result = dict(
+        label="box",
+        caption="A rectangular box.",
+        functional_identity=dict(label=None, direct_visual_evidence=""),
+        integral_parts=[],
+        external_connections=[],
+        supporting_objects=[],
+        contained_objects=[],
+        uncertainty=[],
+        observed_image_ids=[1],
+        same_physical_target=True,
+        scope=dict(
+            kind="whole_object", parent_description=None, mask_coverage_issues=[]
+        ),
+    )
+    result[field] = value
+    with pytest.raises(ValueError, match=reason):
+        validate_scope(json.dumps(result), [1])

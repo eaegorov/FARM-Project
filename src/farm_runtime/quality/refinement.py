@@ -505,18 +505,20 @@ def review_image(image, row, *, semantic_only=False, scope=False):
             )
         if not scope:
             return photo
-        rgb = np.asarray(image).copy()
-        rgb[mask] = (rgb[mask] * 0.6 + np.array([40, 210, 255]) * 0.4).astype(np.uint8)
+        # Keep synthetic annotation colors out of appearance evidence.
+        silhouette = Image.fromarray(mask.astype(np.uint8) * 255).convert("RGB")
         canvas = Image.new("RGB", (1040, 550), "#111827")
         draw = ImageDraw.Draw(canvas)
-        for col, tile in enumerate((photo, Image.fromarray(rgb))):
+        for col, tile in enumerate((photo, silhouette)):
             tile.thumbnail((508, 508))
             canvas.paste(
                 tile,
                 (col * 520 + (508 - tile.width) // 2, 32 + (508 - tile.height) // 2),
             )
             draw.text(
-                (col * 520 + 8, 8), "PHOTO" if col == 0 else "PROPOSAL", fill="white"
+                (col * 520 + 8, 8),
+                "PHOTO: APPEARANCE" if col == 0 else "MASK DIAGRAM: WHITE = TARGET",
+                fill="white",
             )
         return canvas
     canvas = Image.new("RGB", (1750, 400), "#111827")

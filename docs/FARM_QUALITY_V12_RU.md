@@ -291,3 +291,15 @@ V12 10_native_observations/REVIEW_RU.md содержит причинную ди
 Tracker девять crops 18,00 с; concept 57,48 с (альтернативные диагностические ветви). Выбор по сохранённым proposals 9,77 с, native rebuild около 4,3 с. 46 изображений фактически просмотрены; 1182 tests passed, затем 34 targeted после provenance checks и проверка всех реальных proposals. Human gold и scene-wide runtime этими результатами не заменяются.
 
 Следующий шаг: перенос на legacy шесть Factory объектов и Knaack, затем общий scene-wide профиль с ограниченным бюджетом refinement; не расширять число эвристик на единственном примере.
+
+## 16. Перенос на Knaack и границы общих параметров
+
+Отчёт V12: `12_scene_validation/REVIEW_RU.md`. `native-observations --geometry --world-up` принимает multi-timestamp группы напрямую, сохраняя existing FARM geometry/lift. Общий writer проверен на прежнем Factory validation input: 12 масок по массивам, 11 exclusions, split/OBB совпадают. Старый size/mtime PLY fingerprint проверяется перед новым SHA binding; историческая степень проверки сохранена явно.
+
+На шести Factory targets rendered contribution даёт mixed result: пожарный шкаф median IoU 0,8488→0,9488 с лучшим исключением трубы; огнетушитель 0,7762→0,7445 с небольшой потерей тела. 2px negative guard повышает и покрытие, и фон. Глобальные defaults/старый reviewed bank не изменены.
+
+Knaack: Qwen4B 8 RGB 35,71 с; SAM3 12 RGB / 56 prompts 88,72 с; 540 proposals → 342 static surface nodes → только 6 multi-timestamp групп (7,01 с). Native build шести групп 4,60 с, 1 790 MiB peak. Все 6 geometry sheets и 12 native crops просмотрены: коробчатые поверхности плотные, колонны/подъёмник частично неполные, тележка из-за окклюзии подтверждена только фрагментом. Физические размеры не валидированы; это не полный cold scene runtime.
+
+VLM иногда принимает cyan overlay за защитную плёнку. Scope evidence теперь показывает отдельную бинарную схему и original RGB; copied schema placeholders и scope enums вместо label отклоняются. Бинарная схема устраняет эту цветовую примесь, но 4B/8B всё ещё ошибаются в смысле/материале малых crops. 8B не показала достаточного преимущества для автоматического принятия captions. Final full suite: 1191 passed / 70,53 с.
+
+Следующий приоритет: ограниченный добор зарегистрированных ракурсов по видимости уже найденных объектов → подтверждение singleton/occluded targets → contextual RGB semantics → единый scene profile с общим бюджетом. Не лечить недостаток наблюдений ослаблением native voting.

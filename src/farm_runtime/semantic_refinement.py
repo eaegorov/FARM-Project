@@ -25,7 +25,7 @@ Image IDs are identifiers, not category hints.
 """
 
 
-SCOPE_PROMPT = """Inspect one spatially associated target candidate across views. Each sheet has two panels: PHOTO shows the original RGB with an approximate yellow location rectangle; PROPOSAL shows the actual current cyan mask. A mask is a hypothesis, not truth. No detector category is provided. Check both RGB appearance and what the mask covers. The visible candidate may be a whole object, an integral part, a collection of separate objects, a covering, or a patch of a larger surface. Do not upgrade a door, handle, panel, wrapping sheet or covered contents into the full parent machine. A partial view at the image border is still valid evidence; do not invent unseen extent. If the views appear to refer to different objects, state that explicitly.
+SCOPE_PROMPT = """Inspect one spatially associated target candidate across views. Each sheet has two panels: PHOTO shows the original RGB with an approximate yellow location rectangle; MASK DIAGRAM is a separate black-and-white segmentation diagram, where white marks the candidate pixels. The diagram is not a photograph: its colors and solid shape never establish material, wrapping, paint or physical completeness. Describe appearance only from PHOTO. A mask is a hypothesis, not truth. No detector category is provided. Check both RGB appearance and what the mask covers. The visible candidate may be a whole object, an integral part, a collection of separate objects, a covering, or a patch of a larger surface. Do not upgrade a door, handle, panel, wrapping sheet or covered contents into the full parent machine. A partial view at the image border is still valid evidence; do not invent unseen extent. If the views appear to refer to different objects, state that explicitly.
 Return a conservative observable label for the ACTUAL candidate scope and one factual appearance sentence. Hidden device function, brand and dimensions must not be guessed. Distinguish integral parts, external connections, supporting objects and contained objects. Report only visible components; no component may occur in two ownership lists. Wrapped objects can be distinct from their removable wrapping. Geometry containment alone does not establish ownership.
 Return only JSON:
 {"label":"observable English candidate category","caption":"one factual English sentence","functional_identity":{"label":null,"direct_visual_evidence":""},"integral_parts":[],"external_connections":[],"supporting_objects":[],"contained_objects":[],"uncertainty":[],"observed_image_ids":[123,456],"same_physical_target":true,"scope":{"kind":"whole_object|integral_part|object_collection|covering|surface_region|unclear","parent_description":null,"mask_coverage_issues":[]}}.
@@ -35,6 +35,14 @@ Choose exactly one scope kind. same_physical_target is true, false, or null if i
 
 def validate_scope(text, image_ids):
     result = validate_semantics(text, image_ids)
+    if result["label"].strip() in {
+        "whole_object",
+        "integral_part",
+        "object_collection",
+        "surface_region",
+        "unclear",
+    }:
+        raise ValueError("scope enum is not an observable object label")
     if "same_physical_target" not in result or (
         result["same_physical_target"] is not None
         and type(result["same_physical_target"]) is not bool
@@ -69,6 +77,12 @@ def validate_semantics(text, image_ids):
     for field in ("label", "caption"):
         if not isinstance(result.get(field), str) or not result[field].strip():
             raise ValueError("nonempty label/caption required")
+        if " ".join(result[field].lower().split()) in {
+            "observable english candidate category",
+            "observable english object category",
+            "one factual english sentence",
+        }:
+            raise ValueError("schema placeholder is not semantic evidence")
     groups = (
         "integral_parts",
         "external_connections",
