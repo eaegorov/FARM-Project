@@ -84,6 +84,7 @@ def select_observation(
     *,
     partial_context=None,
     scope_review=None,
+    completion_preference=None,
 ):
     """Require visible core support and reciprocal static surface overlap.
 
@@ -179,6 +180,33 @@ def select_observation(
         raise ValueError("scope review candidate evidence changed")
     if not eligible:
         return None, rows, "no_unambiguous_surface_match"
+    if completion_preference is not None:
+        if scope_review is not None:
+            raise ValueError(
+                "completion preference and scope review are separate policies"
+            )
+        fallback = completion_preference["fallback_detection"]
+        preferred = [
+            r
+            for r in eligible
+            if r["detection_index"] in completion_preference["candidate_indices"]
+            and mask_overlap(masks[fallback], masks[r["detection_index"]])[1] >= 0.90
+        ]
+        if preferred:
+            best = preferred[0]
+            ambiguous = any(
+                best["score"] - r["score"] < 0.08
+                and mask_overlap(
+                    masks[best["detection_index"]], masks[r["detection_index"]]
+                )[0]
+                < 0.8
+                for r in preferred[1:]
+            )
+            if not ambiguous:
+                return best["detection_index"], rows, "matched_static_surface"
+        if any(r["detection_index"] == fallback for r in eligible):
+            return fallback, rows, "matched_static_surface"
+        return None, rows, "ambiguous_competing_scope"
     best = eligible[0]
     if any(
         best["score"] - r["score"] < 0.08
@@ -263,9 +291,30 @@ def main(argv=None):
         type=Path,
         help="Bounded VLM consensus supporting the best geometric candidate",
     )
+    parser.add_argument(
+        "--scope-completion",
+        type=Path,
+        help="Try geometrically eligible completion proposals before the prior tracker mask",
+    )
     args = parser.parse_args(argv)
+    if args.scope_completion and args.scope_review:
+        raise ValueError(
+            "scope completion preference and scope review cannot be combined"
+        )
     if args.output.exists():
         raise ValueError("new output required")
+    completion_preferences = {}
+    if args.scope_completion:
+        from farm_runtime.quality.completion_policy import load_completion_preferences
+
+        completion_preferences = load_completion_preferences(
+            args.scope_completion,
+            args.audit,
+            args.proposals,
+            args.supplement,
+            args.partial_view_association,
+        )
+        args.supplement.append(args.scope_completion)
     audit = json.loads(args.audit.read_text())
     if audit.get("closed_test_opened") is not False:
         raise ValueError("development-only point audit required")
@@ -388,6 +437,7 @@ def main(argv=None):
                 None,
                 max(0.04, float(np.median(radii))),
                 scope_review=scope_choices.get((group_id, name)),
+                completion_preference=completion_preferences.get((group_id, name)),
                 partial_context=(
                     {"target_name": name, "references": references}
                     if references is not None
@@ -401,6 +451,24 @@ def main(argv=None):
                     decision=decision,
                     selected_detection=selected,
                     candidates=candidates,
+                    **(
+                        {
+                            "completion_selection": (
+                                "unresolved"
+                                if selected is None
+                                else (
+                                    "accepted_completion"
+                                    if selected
+                                    in completion_preferences[group_id, name][
+                                        "candidate_indices"
+                                    ]
+                                    else "retained_prior"
+                                )
+                            )
+                        }
+                        if (group_id, name) in completion_preferences
+                        else {}
+                    ),
                     **(
                         {"scope_resolution": "vlm_consensus_supports_geometry_best"}
                         if selected is not None
@@ -500,6 +568,14 @@ def main(argv=None):
             supplements=supplements,
             matching_labels_are_not_identity=True,
             partial_view_association=args.partial_view_association,
+            **(
+                {
+                    "scope_completion": describe_file(args.scope_completion),
+                    "completion_policy": "eligible_completion_then_eligible_prior_fallback",
+                }
+                if args.scope_completion
+                else {}
+            ),
             **(
                 {"scope_review": describe_file(args.scope_review)}
                 if args.scope_review

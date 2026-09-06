@@ -189,3 +189,12 @@ Validation должна ссылаться на тот же SHA геометри
 Semantic selection учитывает фактически оставшиеся timestamp после recovery и quarantine. Объекты с сохранёнными validated additional observations получают отдельный бюджет описаний до 16 групп сверх основного выбора, поэтому низкое исходное число ракурсов не вытесняет результат recovery. Потерявший второй timestamp объект в описания не проходит. В каталоге сохраняются оба счётчика — исходный `independent_timestamps` и фактический `native_independent_timestamps`; `recovered_from_single_timestamp` отмечает переход. Геометрическая поддержка не удостоверяет label, физические размеры или полноту маски.
 
 Это интеграция уже проверенных recovery observations. Автоматический выбор объектов для recovery и его включение в `scene-profile plan` пока остаются следующим этапом.
+
+
+## Приоритет проверяемого дополнения объекта
+
+При передаче `surface-validation --scope-completion COMPLETION` дополнительные маски из `scope-completion` проверяются раньше прежней tracker-маски. Передайте в обычных `--supplement` ровно тот набор и порядок, на котором основана родительская validation; completion manifest добавляется автоматически. Audit, source proposals, partial-view policy, принятый tracker detection и source artifacts должны совпадать.
+
+Приоритет возникает только после `scope_complete=false` и `confidence=high`. Кандидат обязан пройти прежние geometric identity gates и покрывать не менее 90% прежней маски; pixel union не выполняется. Выбирается однозначный geometric best среди таких completion candidates. Если дополнение не проходит проверку или неоднозначно, сохраняется прежний detection только при его текущей geometric eligibility. Иначе результат остаётся unknown. В выходе есть `completion_selection` и provenance выбранной политики.
+
+Режим включается явно и не совмещается со `--scope-review`. Он разделяет подтверждение идентичности и выбор более полного видимого scope; VLM не получает права отменять геометрию. В Stage37 устройство в общем Factory bank выросло с1252 до1731IDs с сохранением всех прежних точек; остальные115 масок не изменились. Неполнота части корпуса сохраняется. Физические размеры не валидированы; общий recovery DAG ещё предстоит.
