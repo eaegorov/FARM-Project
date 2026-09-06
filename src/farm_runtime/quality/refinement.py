@@ -291,7 +291,6 @@ def sam(args):
             prompts=describe_file(args.prompts) if args.prompts else None,
             model_weights=describe_file(args.model / "model.safetensors"),
             model_load_seconds=load_seconds,
-            scene_context_included=contextual,
             total_seconds=time.monotonic() - started,
             release_eligible=False,
         ),
@@ -596,26 +595,34 @@ def vlm(args):
         SEMANTIC_PROMPT,
         SCOPE_PROMPT,
         validate_scope,
+        APPEARANCE_PROMPT,
+        validate_appearance,
     )
 
     proposals = json.loads(args.proposals.read_text())
     scope = getattr(args, "scope", False)
-    contextual = getattr(args, "scope_context", False)
-    if contextual and not scope:
-        raise ValueError("--scope-context requires --scope")
-    if scope and (
+    appearance = getattr(args, "compact_semantics", False)
+    scope_input = scope or appearance
+    contextual = getattr(args, "scope_context", False) or appearance
+    if contextual and not scope_input:
+        raise ValueError("scene context requires --scope or --compact-semantics")
+    if scope_input and (
         proposals.get("schema") != "farm.object-scope-evidence.v1"
         or proposals.get("reserved_test_opened") is not False
     ):
         raise ValueError(
-            "scope review requires development-only spatial-group evidence"
+            "scope/appearance review requires development-only spatial-group evidence"
         )
     prompt = (
-        SCOPE_PROMPT
-        if scope
-        else SEMANTIC_PROMPT if args.semantic_only else REVIEW_PROMPT
+        APPEARANCE_PROMPT
+        if appearance
+        else (
+            SCOPE_PROMPT
+            if scope
+            else SEMANTIC_PROMPT if args.semantic_only else REVIEW_PROMPT
+        )
     )
-    if contextual:
+    if contextual and not appearance:
         prompt = prompt.replace("Each sheet has two panels:", "Each sheet includes:")
         prompt = (
             "SCENE CONTEXT is the original full RGB with a yellow rectangle locating "
@@ -634,7 +641,7 @@ def vlm(args):
     # Verify and prepare every selected image before loading the large VLM.
     prepared = []
     for object_id, observations in sorted(groups.items()):
-        if scope:
+        if scope_input:
             chosen = observations[: args.views]  # Already selected by scope-evidence.
             if len({r["timestamp"] for r in chosen}) != len(chosen):
                 raise ValueError("scope review views must have distinct timestamps")
@@ -648,7 +655,7 @@ def vlm(args):
                 image,
                 row,
                 semantic_only=args.semantic_only,
-                scope=scope,
+                scope=scope_input,
                 context=scope_context_image(row) if contextual else None,
             )
             path = (
@@ -667,8 +674,14 @@ def vlm(args):
         torch.cuda.reset_peak_memory_stats()
         image_ids = [r["image_id"] for r in chosen]
         response = (
-            model.ask(prompt, images, image_ids, validate_scope, max_new_tokens=768)
-            if scope
+            model.ask(
+                prompt,
+                images,
+                image_ids,
+                validate_appearance if appearance else validate_scope,
+                max_new_tokens=180 if appearance else 768,
+            )
+            if scope_input
             else model.review(images, image_ids, semantic_only=args.semantic_only)
         )
         result = dict(
@@ -685,12 +698,16 @@ def vlm(args):
         args.output / "manifest.json",
         dict(
             schema=(
-                "farm.local-object-scope.v1"
-                if scope
+                "farm.local-object-appearance.v1"
+                if appearance
                 else (
-                    "farm.local-object-semantics.v1"
-                    if args.semantic_only
-                    else "farm.local-object-review.v1"
+                    "farm.local-object-scope.v1"
+                    if scope
+                    else (
+                        "farm.local-object-semantics.v1"
+                        if args.semantic_only
+                        else "farm.local-object-review.v1"
+                    )
                 )
             ),
             objects=results,
@@ -699,6 +716,7 @@ def vlm(args):
             prompt=describe_file(args.output / "prompt.txt"),
             model_load_seconds=load_seconds,
             scene_context_included=contextual,
+            physical_scope_assessed=False if appearance else None,
             total_seconds=time.monotonic() - started,
             human_labels_in_prompt=False,
             detector_labels_in_prompt=False,
@@ -751,12 +769,18 @@ def main(argv=None):
     mode = p.add_mutually_exclusive_group()
     mode.add_argument("--semantic-only", action="store_true")
     mode.add_argument(
+        "--compact-semantics",
+        action="store_true",
+        help="Request only a grounded category, caption and uncertainty",
+    )
+    mode.add_argument(
         "--scope",
         action="store_true",
         help="Review actual proposal scope with clean RGB and its mask",
     )
     p.add_argument(
         "--scope-context",
+        "--scene-context",
         action="store_true",
         help="Add registered source RGB context and enlarge actual scope crops",
     )

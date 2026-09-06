@@ -325,3 +325,9 @@ Knaack при одинаковых 8 дополнительных RGB: adaptive 
 Отчёт V12: `15_scope_transfer/REVIEW_RU.md`. Девять вложенных geometric targets, одни masks/7 timestamps, legacy exclude vs background. Все 24 сравнения просмотрены. Ручки 173/180: mean build-reference IoU 0,0615→0,7945 и 0,0856→0,7913; исчезает большая примесь дверей. Корпус 47 неизменён, панели немного чище. Кран 0,7601→0,7562 (recall немного ниже, precision выше); это проверка на его двух исходных observations, не замена позднего adaptive refinement.
 
 Native stage с девятью scope alternatives: 6,42 / 6,97 с, 1437 MiB; alternatives из cached VJP 1,19 / 1,29 с. Рекомендуемый режим для нового quality profile — candidate-specific background + transient/depth unknown + сохранение nested scope hypotheses. Исторический default сохранён. Выпуск exclusive bank требует согласованного выбора physical scope. Код не менялся; применимы 1205 tests из этапа 14.
+
+## 20. Короткое описание объекта отдельно от physical scope
+
+Отчёт V12: `16_compact_semantics/REVIEW_RU.md`. `quality refinement vlm --compact-semantics` использует contextual RGB + PHOTO + binary mask и узкую схему из 4 полей, max180 tokens. На одинаковых 24 canvases 4B: 12/12 valid против длинного scope 1/12, inference 32,10 против 80,24 с. Проверены все 24 изображения. Это улучшение формата и полезности черновых описаний, не доказанная semantic accuracy. Ошибки колонна/window frame, sign/decal и неподтверждённые material/orientation сохраняются. Empty uncertainty не означает уверенность.
+
+8B при том же запросе: 53,06 с inference, 17310 MiB; два strict ID-order failures, содержательные регрессии crate→concrete pillar и pallet→box. Замена на 8B не принимается. Model-load time зависит от cache и отдельно указан в отчёте. Исправлен SAM writer с ошибочным VLM-only полем; 1215 tests passed / 69,40 с. Следующий шаг — связный bounded quality run и каталог с явным native/scope/physical-size статусом.
