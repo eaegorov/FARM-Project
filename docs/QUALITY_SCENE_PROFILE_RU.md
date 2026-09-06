@@ -132,3 +132,13 @@ quality release.
 Эти stages ещё не включены автоматически в18-stage scene profile. Они решают пропуски observations, но не гарантируют полноту физического объекта. Factory unit восстановлен в3timestamps, однако его основание частично отсутствует; fire cabinet depth support недостаточен для целой маски. Не принимать build-mask IoU или model score за whole-object acceptance. Подробности и runtime — V12/24_complementary_discovery/REVIEW_RU.md.
 
 Для дополнительных observations доступен opt-in `quality surface-validation --partial-view-association`: применяет те же guarded FOV правила, что proposal geometry, до признания source/candidate correspondence отсутствующим. Используйте его перед назначением tracker retries для edge-clipped объектов. Factory fire cabinet подтверждён без новых inference calls;3D completeness всё ещё требует дополнительных независимых камер. См. V12/25_planar_identity/REVIEW_RU.md.
+
+
+Адресный recovery за пределами текущего RGBD pool (V12/26_camera_completion):
+
+1. `quality camera-completion --audit AUDIT --split-packet PACKET --group-id ID --timestamp-budget 2 --output NEW_DIR` выбирает новые камеры по metadata. Исходный COLMAP, metric scale и filename identity берутся из preparation provenance. `PACKET.split_by_timestamp` разрешает только train/dev; команда не декодирует RGB. Подайте `preparation_names.txt` в существующий RGBD ingress. Frustum coverage ещё не visibility.
+2. После rig registration/depth используйте `surface-evidence` для исключения окклюдированных кандидатов, затем SAM и при необходимости `surface-tracker`/`surface-validation`.
+3. При `ambiguous_competing_scope`: `quality scope-review --validation VALIDATION --model QWEN_DIR --object-budget 4 --output NEW_DIR`. Максимум2VLM calls на объект/ракурс и2..4 eligible masks; пустая очередь без model load. Нужен независимый reference без FOV clipping. В `surface-validation` добавьте `--scope-review NEW_DIR/manifest.json`, сохранив те же audit/proposals/supplements/policy. Только high consensus в двух порядках, совпавший с geometric best, может снять ambiguity. Прочие решения остаются unknown.
+4. Принятые observations передаются в `native-observations`; проверяйте reverse renders и extent stability. Повторное использование устаревшего review отклоняется.
+
+Это отдельные bounded development commands. Автоматический global recovery budget/reuse в scene-profile пока не реализован. Положительный результат для fire cabinet не означает доказанный перенос на все сцены или подтверждение физических размеров.

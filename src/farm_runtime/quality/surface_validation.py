@@ -74,12 +74,22 @@ def reference_surfaces(inputs, members):
 
 
 def select_observation(
-    points, core, masks, detections, frame, labels, radius_m, *, partial_context=None
+    points,
+    core,
+    masks,
+    detections,
+    frame,
+    labels,
+    radius_m,
+    *,
+    partial_context=None,
+    scope_review=None,
 ):
     """Require visible core support and reciprocal static surface overlap.
 
     An optional label allowlist limits inspection. Identity always requires
-    geometry; ambiguous nested scopes and no-instance stay unknown.
+    geometry; no-instance stays unknown. Bound scope review may resolve an
+    ambiguity only by supporting the existing geometric best.
     """
     rows = []
     tree = cKDTree(points)
@@ -165,6 +175,8 @@ def select_observation(
         [r for r in rows if r["eligible"]],
         key=lambda r: (-r["score"], r["detection_index"]),
     )
+    if scope_review is not None and rows != scope_review["candidates"]:
+        raise ValueError("scope review candidate evidence changed")
     if not eligible:
         return None, rows, "no_unambiguous_surface_match"
     best = eligible[0]
@@ -174,7 +186,8 @@ def select_observation(
         < 0.8
         for r in eligible[1:]
     ):
-        return None, rows, "ambiguous_competing_scope"
+        if scope_review is None or scope_review["choice"] != best["detection_index"]:
+            return None, rows, "ambiguous_competing_scope"
     return best["detection_index"], rows, "matched_static_surface"
 
 
@@ -244,6 +257,11 @@ def main(argv=None):
         "--partial-view-association",
         action="store_true",
         help="Reuse guarded partial-FOV matching for additional views",
+    )
+    parser.add_argument(
+        "--scope-review",
+        type=Path,
+        help="Bounded VLM consensus supporting the best geometric candidate",
     )
     args = parser.parse_args(argv)
     if args.output.exists():
@@ -315,6 +333,17 @@ def main(argv=None):
                 )
             prepared[name] = base, masks + added, frame
         supplements.append(describe_file(supplement_path))
+    scope_choices = {}
+    if args.scope_review:
+        from farm_runtime.quality.scope_review import load_scope_choices
+
+        scope_choices = load_scope_choices(
+            args.scope_review,
+            args.audit,
+            args.proposals,
+            args.supplement,
+            args.partial_view_association,
+        )
     args.output.mkdir(parents=True)
     (args.output / "visuals").mkdir()
     output_rows, arrays = [], {}
@@ -358,6 +387,7 @@ def main(argv=None):
                 frame,
                 None,
                 max(0.04, float(np.median(radii))),
+                scope_review=scope_choices.get((group_id, name)),
                 partial_context=(
                     {"target_name": name, "references": references}
                     if references is not None
@@ -371,6 +401,13 @@ def main(argv=None):
                     decision=decision,
                     selected_detection=selected,
                     candidates=candidates,
+                    **(
+                        {"scope_resolution": "vlm_consensus_supports_geometry_best"}
+                        if selected is not None
+                        and (group_id, name) in scope_choices
+                        and scope_choices[group_id, name]["choice"] == selected
+                        else {}
+                    ),
                 )
             )
             if selected is not None:
@@ -463,6 +500,11 @@ def main(argv=None):
             supplements=supplements,
             matching_labels_are_not_identity=True,
             partial_view_association=args.partial_view_association,
+            **(
+                {"scope_review": describe_file(args.scope_review)}
+                if args.scope_review
+                else {}
+            ),
             groups=output_rows,
             point_evidence=describe_file(args.output / "point_evidence.npz"),
             total_seconds=time.monotonic() - started,

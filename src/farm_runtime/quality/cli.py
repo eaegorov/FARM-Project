@@ -17,6 +17,8 @@ ACTIONS = {
     "surface-evidence": "surface_evidence",
     "surface-validation": "surface_validation",
     "surface-tracker": "surface_tracker",
+    "scope-review": "scope_review",
+    "camera-completion": "camera_completion",
     "native-observations": "native_observations",
     "native-review": "native_review",
     "native-evaluation": "native_evaluation",

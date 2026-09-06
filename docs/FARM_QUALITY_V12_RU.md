@@ -1,7 +1,7 @@
 # FARM V12: воспроизводимость и независимая оценка качества
 
 Документ содержит инфраструктуру F0/F1 и обновление реализации FARM от 2026-09-05.
-Текущий отчёт и изображения: `output/farm_pipeline/factory/experiments/factory-universal-v12-quality-v1/11_scope_refinement/REVIEW_RU.md` относительно `3dgs_work`.
+Текущий отчёт и изображения: `output/farm_pipeline/factory/experiments/factory-universal-v12-quality-v1/26_camera_completion/REVIEW_RU.md` относительно `3dgs_work`.
 Реализованы rig-preserving RGB↔3DGS registration, angular/upright discovery ablation,
 расширение exact-lift кандидатов по build surface, native-support OBB и финальный CSR allowlist export.
 Шесть объектов имеют проверяемые masks/labels/captions/scope. Универсальная точность,
@@ -384,3 +384,8 @@ Opt-in `quality proposal-geometry --partial-view-association`: только дл
 `quality surface-validation --partial-view-association` использует Stage23 guarded partial-view comparison для кандидатов, не прошедших обычную reciprocal проверку. Default сохранён; FOV edge, visibility, negative и nested-scope guards обязательны.1271tests/67.27с.
 
 Пересмотр исходного RGB показал, что пожарный шкаф обрезан границей камеры, а не просто неполон в depth. Имеющийся full-frame SAM кандидат теперь принят без дополнительной сегментации,905points corroborated. Native2timestamps/5120IDs чисто покрывает правую часть, но левая дверца неполна; обе проекции просмотрены. Новых допустимых views в текущем48-frame RGBD pool не найдено. В исходном Factory6310images: следующий шаг — bounded selection из полного COLMAP pool с регистрацией выбранных камер, исключая закрытые timestamps. Plane/SIFT pilots не приняты. Отчёт V12/25_planar_identity/REVIEW_RU.md.
+
+
+## 31. Полный camera pool и разрешение scope ambiguity
+
+V12/26_camera_completion/REVIEW_RU.md: новый camera-completion выбирает2 timestamps из6310 COLMAP metadata до RGB; регистрация8views сохраняет anchors/исходную поверхность. Из двух новых направлений одно окклюдировано: depth screening должен идти до SAM. Geometric crop + Qwen scope-review с двумя порядками кандидатов восстанавливают целый fire cabinet. VLM допускается только при согласии с уже лучшим геометрическим кандидатом; immutable inputs/candidate evidence проверяются. Native3timestamps/13872IDs вместо5120: на тех же3build views meanIoU0,67918→0,95375,recall0,69541→0,99005. Все3сравнения просмотрены, внешняя труба исключена, небольшие погрешности границ остаются. Это не independent accuracy; observed thickness0,265m чувствительна на40%, physical extent неизвестен.1282tests/64,86с. Эти opt-in utilities ещё не входят в общий18-stage DAG; далее перенос на unit/Knaack и глобальный recovery budget.
