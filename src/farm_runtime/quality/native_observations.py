@@ -60,7 +60,8 @@ def write_native_mask(path, mask, shape, erosion_pixels):
     return describe_file(path)
 
 
-def prepare(validation_path, config, output):
+def validation_observations(validation_path, geometry_path=None):
+    """Read accepted observations with the original geometry ID namespace."""
     validation = json.loads(validation_path.read_text())
     if (
         validation.get("closed_test_opened") is not False
@@ -69,7 +70,12 @@ def prepare(validation_path, config, output):
         raise ValueError("explicit development-only validation required")
     audit_path = checked_file(validation["source_audit"])
     audit = json.loads(audit_path.read_text())
-    inputs = SurfaceInputs(checked_file(audit["source_geometry"]))
+    source_geometry = checked_file(audit["source_geometry"])
+    if geometry_path is not None and (
+        describe_file(geometry_path)["sha256"] != audit["source_geometry"]["sha256"]
+    ):
+        raise ValueError("recovery belongs to a different geometry namespace")
+    inputs = SurfaceInputs(source_geometry)
     extra_path = checked_file(validation["source_proposals"])
     _, extras = read_observations(extra_path)
     extra = {r["name"]: r for r in extras}
@@ -95,12 +101,20 @@ def prepare(validation_path, config, output):
     groups = {g["id"]: g for g in inputs.geometry["groups"]}
     observations = {}
     source_rows = {}
+    selected_ids = [row["group_id"] for row in validation["groups"]]
+    if (
+        len(set(selected_ids)) != len(selected_ids)
+        or not set(selected_ids) <= groups.keys()
+    ):
+        raise ValueError("unique known recovery group IDs required")
     for row in validation["groups"]:
         oid = row["group_id"]
         group = groups[oid]
         for node_id in group["members"]:
             node = inputs.nodes[node_id]
             name = node["frame"]
+            if (oid, name) in observations:
+                raise ValueError("duplicate group/frame observation")
             observations[oid, name] = dict(
                 mask=inputs.mask(node), source_kind="original_geometry", node_id=node_id
             )
@@ -108,10 +122,31 @@ def prepare(validation_path, config, output):
         for match in row["extra_matches"]:
             if match["selected_detection"] is None:
                 continue
-            if match["decision"] != "matched_static_surface":
-                raise ValueError("unaccepted extra mask")
             name = match["name"]
             index = match["selected_detection"]
+            eligible = {
+                c["detection_index"]
+                for c in match["candidates"]
+                if c["eligible"] is True
+            }
+            if (
+                match["decision"] != "matched_static_surface"
+                or type(index) is not int
+                or index not in eligible
+                or name not in extra
+                or not 0 <= index < len(masks[name])
+                or extra[name]["detections"][index]["label"] == "person"
+            ):
+                raise ValueError("geometrically accepted extra object mask required")
+            if (
+                name not in inputs.trusted
+                or match["timestamp"] != extra[name]["timestamp"]
+                or extra[name]["timestamp"] != str(inputs.frames[name]["frame_id"])
+                or not any(q["prompt"] == "person" for q in extra[name]["queries"])
+            ):
+                raise ValueError(
+                    "registered recovery timestamp and person query required"
+                )
             if (oid, name) in observations:
                 raise ValueError("duplicate group/frame observation")
             observations[oid, name] = dict(
@@ -120,6 +155,34 @@ def prepare(validation_path, config, output):
                 detection_index=index,
             )
             source_rows[name] = extra[name]
+    return inputs, validation, observations, source_rows, extra, masks
+
+
+def confirmed_recovery_groups(geometry_path, validation_path):
+    """Add a bounded recovery cohort without displacing the original native budget."""
+    inputs, validation, observations, _, _, _ = validation_observations(
+        validation_path, geometry_path
+    )
+    if len(validation["groups"]) > 16:
+        raise ValueError("recovery cohort must contain at most 16 groups")
+    result = []
+    for row in validation["groups"]:
+        oid = row["group_id"]
+        evidence = [
+            (name, obs) for (gid, name), obs in observations.items() if gid == oid
+        ]
+        timestamps = {inputs.frames[name]["timestamp_ns"] for name, _ in evidence}
+        if len(timestamps) >= 2 and any(
+            obs["source_kind"] == "validated_additional_view" for _, obs in evidence
+        ):
+            result.append(oid)
+    return sorted(result)
+
+
+def prepare(validation_path, config, output):
+    inputs, validation, observations, source_rows, extra, masks = (
+        validation_observations(validation_path)
+    )
     return _prepare_native(
         inputs,
         validation["groups"],
@@ -133,7 +196,9 @@ def prepare(validation_path, config, output):
     )
 
 
-def prepare_geometry(geometry_path, config, output, world_up, group_ids=None):
+def prepare_geometry(
+    geometry_path, config, output, world_up, group_ids=None, *, recovery_validation=None
+):
     """Freeze observed multi-timestamp groups without inventing validation data.
 
     Geometric association is an identity hypothesis, not verified object scope.
@@ -143,7 +208,15 @@ def prepare_geometry(geometry_path, config, output, world_up, group_ids=None):
     from scripts.geometry.refine_farm_object_geometry import _fit_robust_obb
 
     z_up_rotation(world_up)  # Validate before using gravity in the existing fitter.
-    inputs = SurfaceInputs(geometry_path)
+    recovery, extra, extra_masks = {}, {}, {}
+    if recovery_validation:
+        inputs, validation, recovery, _, extra, extra_masks = validation_observations(
+            recovery_validation, geometry_path
+        )
+        if len(validation["groups"]) > 16:
+            raise ValueError("recovery cohort must contain at most 16 groups")
+    else:
+        inputs = SurfaceInputs(geometry_path)
     if (
         inputs.geometry.get("schema") != "farm.proposal-surface-association.v1"
         or inputs.geometry.get("release_eligible") is not False
@@ -151,7 +224,19 @@ def prepare_geometry(geometry_path, config, output, world_up, group_ids=None):
         raise ValueError("development surface association required")
     groups = {g["id"]: g for g in inputs.geometry["groups"]}
     selected = (
-        sorted(gid for gid, g in groups.items() if g["independent_timestamps"] >= 2)
+        sorted(
+            gid
+            for gid, g in groups.items()
+            if g["independent_timestamps"] >= 2
+            or len(
+                {
+                    inputs.frames[name]["timestamp_ns"]
+                    for (oid, name) in recovery
+                    if oid == gid
+                }
+            )
+            >= 2
+        )
         if group_ids is None
         else list(dict.fromkeys(group_ids))
     )
@@ -162,8 +247,17 @@ def prepare_geometry(geometry_path, config, output, world_up, group_ids=None):
         group = groups[oid]
         members, points, timestamps, _ = inputs.support(group)
         actual_timestamps = {n["timestamp"] for n in members}
+        added = {
+            name: obs
+            for (gid, name), obs in recovery.items()
+            if gid == oid and obs["source_kind"] == "validated_additional_view"
+        }
+        names = {n["frame"] for n in members} | added.keys()
+        if not names <= inputs.trusted:
+            raise ValueError("trusted registration required")
+        effective_timestamps = {inputs.frames[name]["timestamp_ns"] for name in names}
         if (
-            len(actual_timestamps) < 2
+            len(effective_timestamps) < 2
             or len(actual_timestamps) != group["independent_timestamps"]
             or len({n["frame"] for n in members}) != len(members)
         ):
@@ -204,15 +298,23 @@ def prepare_geometry(geometry_path, config, output, world_up, group_ids=None):
                 node_id=node["id"],
             )
             source_rows[name] = inputs.observations[name]
+        for name, obs in added.items():
+            if (oid, name) in observations:
+                raise ValueError("duplicate group/frame observation")
+            observations[oid, name] = obs
+            source_rows[name] = extra[name]
     return _prepare_native(
         inputs,
         selection,
         observations,
         source_rows,
-        {},
-        {},
+        extra,
+        extra_masks,
         config,
         output,
+        source_validation=(
+            describe_file(recovery_validation) if recovery_validation else None
+        ),
     )
 
 
@@ -641,6 +743,24 @@ def reverse_review(gaussians, run, bank, config, input_manifest, output):
     return rows
 
 
+def retained_timestamp_counts(path, geometry_path):
+    """Count effective native views after recovery or quarantine."""
+    run, _, doc = load_prepared(path)
+    record = doc.get("source_geometry")
+    if not record or record["sha256"] != describe_file(geometry_path)["sha256"]:
+        raise ValueError("native masks belong to a different geometry namespace")
+    checked_file(record)
+    counts = {
+        obj.object_id: len(
+            {run.frame(obs.image_id).physical_timestamp for obs in obj.observations}
+        )
+        for obj in run.objects
+    }
+    if len(counts) != len(run.objects):
+        raise ValueError("unique native object IDs required")
+    return counts
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     source = parser.add_mutually_exclusive_group(required=True)
@@ -650,6 +770,7 @@ def main(argv=None):
     )
     parser.add_argument("--group-id", type=int, action="append")
     parser.add_argument("--world-up", type=float, nargs=3)
+    parser.add_argument("--recovery-validation", type=Path)
     source.add_argument("--input", type=Path, help="Reuse a frozen prepared input")
     for name in ("ply", "config", "output"):
         parser.add_argument("--" + name, type=Path, required=True)
@@ -672,6 +793,8 @@ def main(argv=None):
         raise ValueError(
             "--world-up is required only with --geometry; --group-id requires --geometry"
         )
+    if args.recovery_validation and not args.geometry:
+        raise ValueError("--recovery-validation requires --geometry")
     if not 0 <= args.scope_alternative_budget <= 16:
         raise ValueError("scope alternative budget must be from 0 to 16")
     started = time.monotonic()
@@ -687,6 +810,7 @@ def main(argv=None):
             args.output / "input",
             args.world_up,
             args.group_id,
+            recovery_validation=args.recovery_validation,
         )
         input_path = args.output / "input" / "manifest.json"
     else:

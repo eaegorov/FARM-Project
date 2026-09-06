@@ -91,7 +91,9 @@ def main(argv=None):
         raise ValueError("native bank must be bound to geometric group namespace")
     geometry = read(checked_file(record))
     require_binding = bool(
-        inputs.get("parent_input") or read(args.semantics).get("source_native_input")
+        inputs.get("parent_input")
+        or inputs.get("source_validation")
+        or read(args.semantics).get("source_native_input")
     )
     appearances, semantics = bound_appearance(
         args.semantics, record, describe_file(input_path) if require_binding else None
@@ -111,6 +113,10 @@ def main(argv=None):
         )
     groups = {g["id"]: g for g in geometry["groups"]}
     selected = {o.object_id: o for o in run.objects}
+    native_counts = {
+        oid: len({run.frame(o.image_id).physical_timestamp for o in obj.observations})
+        for oid, obj in selected.items()
+    }
     if not set(selected) <= groups.keys() or not set(appearances) <= groups.keys():
         raise ValueError("unknown group in native or appearance input")
     alternative_manifest = (
@@ -186,8 +192,10 @@ def main(argv=None):
                 object_id=oid,
                 candidate_labels=groups[oid]["candidate_labels"],
                 independent_timestamps=groups[oid]["independent_timestamps"],
-                native_independent_timestamps=len(
-                    {run.frame(o.image_id).physical_timestamp for o in obj.observations}
+                native_independent_timestamps=native_counts[oid],
+                recovered_from_single_timestamp=(
+                    groups[oid]["independent_timestamps"] < 2
+                    and native_counts[oid] >= 2
                 ),
                 label=parsed["label"] if parsed else None,
                 caption=parsed["caption"] if parsed else None,
@@ -225,7 +233,9 @@ def main(argv=None):
             if groups[g]["independent_timestamps"] >= 2 and g not in selected
         ),
         unconfirmed_single_timestamp_group_ids=sorted(
-            g for g in groups if groups[g]["independent_timestamps"] < 2
+            g
+            for g in groups
+            if native_counts.get(g, groups[g]["independent_timestamps"]) < 2
         ),
         deferred_appearance_group_ids=semantics["deferred_group_ids"],
         deferred_scope_alternative_ids=(

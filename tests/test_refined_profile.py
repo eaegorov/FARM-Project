@@ -190,6 +190,7 @@ def test_scope_uses_replaced_mask_omits_quarantine_and_keeps_additional_view(
             source_name=name,
             mask=descriptor,
             source_grid_hw=[40, 40],
+            physical_timestamp_ns=2 - i,
             **({"parent_mask": dict(path="old")} if name == "b.png" else {}),
         )
         for i, name in [(1, "b.png"), (0, "c.png")]

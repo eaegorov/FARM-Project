@@ -94,7 +94,21 @@ def main(argv=None):
     relations = aggregate_scope_containment(
         geometry["groups"], geometry["nodes"], evidence["scope_alternatives"]
     )
-    selected = [g for g in geometry["groups"] if g["independent_timestamps"] >= 2]
+    observations = {r["name"]: r for r in observations}
+    native = (
+        native_evidence(args.native_input, args.groups, observations)
+        if args.native_input
+        else None
+    )
+    counts = (
+        {
+            oid: len({row["physical_timestamp_ns"] for row in rows.values()})
+            for oid, rows in native.items()
+        }
+        if native is not None
+        else {g["id"]: g["independent_timestamps"] for g in geometry["groups"]}
+    )
+    selected = [g for g in geometry["groups"] if counts.get(g["id"], 0) >= 2]
     if args.group_id:
         requested = set(args.group_id)
         selected = [g for g in selected if g["id"] in requested]
@@ -105,12 +119,6 @@ def main(argv=None):
     if not selected:
         raise ValueError("no multiview groups selected")
     nodes = {n["id"]: n for n in geometry["nodes"]}
-    observations = {r["name"]: r for r in observations}
-    native = (
-        native_evidence(args.native_input, args.groups, observations)
-        if args.native_input
-        else None
-    )
     if native is not None and not {g["id"] for g in selected} <= native.keys():
         raise ValueError("semantic group absent from native input")
     frame_ids = {name: i for i, name in enumerate(sorted(observations))}

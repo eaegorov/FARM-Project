@@ -23,13 +23,18 @@ def read(path):
     return json.loads(Path(path).read_text())
 
 
-def bounded_groups(geometry, budget):
+def bounded_groups(geometry, budget, timestamp_counts=None):
     if type(budget) is not int or not 1 <= budget <= 128:
         raise ValueError("group budget must be in 1..128")
     if geometry.get("test_opened") is not False:
         raise ValueError("development geometry required")
-    groups = [g for g in geometry["groups"] if g["independent_timestamps"] >= 2]
-    ordered = sorted(groups, key=lambda g: (-g["independent_timestamps"], g["id"]))
+    counts = (
+        {g["id"]: g["independent_timestamps"] for g in geometry["groups"]}
+        if timestamp_counts is None
+        else timestamp_counts
+    )
+    groups = [g for g in geometry["groups"] if counts.get(g["id"], 0) >= 2]
+    ordered = sorted(groups, key=lambda g: (-counts[g["id"]], g["id"]))
     return [g["id"] for g in ordered[:budget]], [g["id"] for g in ordered[budget:]]
 
 
@@ -482,6 +487,17 @@ def native(args):
     from farm_runtime.quality import native_observations
 
     chosen, deferred = bounded_groups(read(args.geometry), args.groups)
+    recovery_validation = getattr(args, "recovery_validation", None)
+    recovered = (
+        native_observations.confirmed_recovery_groups(
+            args.geometry, recovery_validation
+        )
+        if recovery_validation
+        else []
+    )
+    added = sorted(set(recovered) - set(chosen))
+    chosen += added
+    deferred = [g for g in deferred if g not in chosen]
     if not chosen:
         raise ValueError(
             "no multi-timestamp groups; native quality output is unavailable"
@@ -503,6 +519,11 @@ def native(args):
             "--output",
             str(args.output),
             *[x for g in chosen for x in ("--group-id", str(g))],
+            *(
+                ["--recovery-validation", str(recovery_validation)]
+                if recovery_validation
+                else []
+            ),
         ]
     )
     write_json(
@@ -513,6 +534,11 @@ def native(args):
             source_geometry=describe_file(args.geometry),
             policy="Independent timestamps descending, stable group ID tie break",
             candidate_budget=args.groups,
+            recovery_added_group_ids=added,
+            recovery_additional_budget_limit=16,
+            source_recovery_validation=(
+                describe_file(recovery_validation) if recovery_validation else None
+            ),
             scene_completeness_claimed=False,
         ),
     )
@@ -572,12 +598,12 @@ def semantics(args):
 
     geometry = read(args.geometry)
     native_input = checked_file(read(args.native)["input"]) if args.native else None
+    counts = None
     if native_input:
-        retained = {r["object_id"] for r in read(native_input)["objects"]}
-        geometry = dict(
-            geometry, groups=[g for g in geometry["groups"] if g["id"] in retained]
-        )
-    chosen, deferred = bounded_groups(geometry, args.groups)
+        from farm_runtime.quality.native_observations import retained_timestamp_counts
+
+        counts = retained_timestamp_counts(native_input, args.geometry)
+    chosen, deferred = bounded_groups(geometry, args.groups, counts)
     if not chosen:
         raise ValueError("no multi-timestamp appearance candidates")
     deferred = sorted(
@@ -1084,6 +1110,7 @@ def main(argv=None):
     q.add_argument("--views", type=int, required=True)
     q.add_argument("--world-up", type=float, nargs=3, required=True)
     q = command("native", ["geometry", "ply", "config"])
+    q.add_argument("--recovery-validation", type=Path)
     q.add_argument("--groups", type=int, default=128)
     q.add_argument("--alternatives", type=int, default=16)
     q.add_argument("--world-up", type=float, nargs=3, required=True)

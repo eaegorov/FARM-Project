@@ -281,3 +281,240 @@ def test_native_sensor_family_comes_from_registered_preparation(tmp_path):
     write_json(geometry, doc)
     with pytest.raises(ValueError, match="registered sensor/family"):
         prepare_geometry(geometry, config, tmp_path / "conflict", [0, 0, 1])
+
+
+def recovery_fixture(root):
+    geometry, config = geometry_fixture(root)
+    evidence = root / "evidence.json"
+    write_json(evidence, dict(scope_alternatives=[]))
+    doc = json.loads(geometry.read_text())
+    doc["evidence_artifact"] = describe_file(evidence)
+    # A true single-view seed. The accepted view comes from another timestamp.
+    doc["groups"][0]["members"] = [1, 2]
+    doc["groups"][1]["members"] = [0]
+    write_json(geometry, doc)
+    audit = root / "audit.json"
+    write_json(audit, dict(source_geometry=describe_file(geometry)))
+    extra = root / "extra.json"
+    original = json.loads((root / "proposals.json").read_text())
+    write_json(
+        extra, dict(test_opened=False, observations=[original["observations"][2]])
+    )
+    validation = root / "validation.json"
+    write_json(
+        validation,
+        dict(
+            closed_test_opened=False,
+            release_eligible=False,
+            source_audit=describe_file(audit),
+            source_proposals=describe_file(extra),
+            groups=[
+                dict(
+                    group_id=8,
+                    extra_matches=[
+                        dict(
+                            name="cam0_002_center.png",
+                            timestamp="002",
+                            selected_detection=0,
+                            decision="matched_static_surface",
+                            candidates=[dict(detection_index=0, eligible=True)],
+                        )
+                    ],
+                )
+            ],
+        ),
+    )
+    return geometry, config, validation
+
+
+def test_recovery_preserves_other_objects_and_reaches_semantic_evidence(tmp_path):
+    from farm_runtime.quality.native_observations import (
+        confirmed_recovery_groups,
+        retained_timestamp_counts,
+    )
+    from farm_runtime.quality import scope_evidence
+    from farm_runtime.quality.scene_profile import bounded_groups
+
+    geometry, config, validation = recovery_fixture(tmp_path / "source")
+    _, _, before = prepare_geometry(geometry, config, tmp_path / "before", [0, -1, 0])
+    _, _, after = prepare_geometry(
+        geometry,
+        config,
+        tmp_path / "after",
+        [0, -1, 0],
+        recovery_validation=validation,
+    )
+    assert confirmed_recovery_groups(geometry, validation) == [8]
+    assert [row["object_id"] for row in after["objects"]] == [7, 8]
+    previous, retained = before["objects"][0], after["objects"][0]
+    assert previous["geometry"] == retained["geometry"]
+    assert [(r["source_name"], r["mask"]["sha256"]) for r in previous["masks"]] == [
+        (r["source_name"], r["mask"]["sha256"]) for r in retained["masks"]
+    ]
+    assert after["source_geometry"] == before["source_geometry"]
+    assert after["source_validation"] == describe_file(validation)
+    native_input = tmp_path / "after/manifest.json"
+    assert retained_timestamp_counts(native_input, geometry) == {7: 2, 8: 2}
+    assert bounded_groups(json.loads(geometry.read_text()), 128, {7: 1, 8: 2}) == (
+        [8],
+        [],
+    )
+    out = tmp_path / "semantics"
+    scope_evidence.main(
+        [
+            "--groups",
+            str(geometry),
+            "--native-input",
+            str(native_input),
+            "--group-id",
+            "8",
+            "--output",
+            str(out),
+        ]
+    )
+    evidence = json.loads((out / "manifest.json").read_text())
+    assert evidence["groups"][0]["independent_timestamps"] == 1
+    assert evidence["groups"][0]["retained_independent_timestamps"] == 2
+    assert {r["timestamp"] for r in evidence["observations"]} == {"001", "002"}
+    assert {r["mask_source"] for r in evidence["observations"]} == {
+        "geometry_original",
+        "additional_native_raw",
+    }
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "ineligible",
+        "ambiguous",
+        "person",
+        "same_timestamp",
+        "namespace",
+        "missing_person",
+    ],
+)
+def test_recovery_refuses_unconfirmed_or_mismatched_observations(tmp_path, fault):
+    geometry, config, validation = recovery_fixture(tmp_path / "source")
+    doc = json.loads(validation.read_text())
+    match = doc["groups"][0]["extra_matches"][0]
+    if fault == "ineligible":
+        match["candidates"][0]["eligible"] = False
+    elif fault == "ambiguous":
+        match["decision"] = "ambiguous_competing_scope"
+    elif fault == "person":
+        match["selected_detection"] = 1
+        match["candidates"] = [dict(detection_index=1, eligible=True)]
+    elif fault in ("same_timestamp", "missing_person"):
+        path = Path(doc["source_proposals"]["path"])
+        extra = json.loads(path.read_text())
+        if fault == "same_timestamp":
+            original = json.loads((geometry.parent / "proposals.json").read_text())
+            extra["observations"] = [original["observations"][1]]
+            match["name"] = "cam1_001_center.png"
+            match["timestamp"] = "001"
+        else:
+            extra["observations"][0]["queries"] = [dict(prompt="box")]
+        write_json(path, extra)
+        doc["source_proposals"] = describe_file(path)
+    elif fault == "namespace":
+        changed = json.loads(geometry.read_text())
+        changed["note"] = "different namespace, same integer IDs"
+        write_json(geometry, changed)
+    write_json(validation, doc)
+    with pytest.raises(ValueError):
+        prepare_geometry(
+            geometry,
+            config,
+            tmp_path / "refused",
+            [0, -1, 0],
+            [7, 8],
+            recovery_validation=validation,
+        )
+    assert not (tmp_path / "refused/manifest.json").exists()
+
+
+def test_semantics_budget_uses_recovered_and_quarantined_timestamps(
+    tmp_path, monkeypatch
+):
+    from types import SimpleNamespace
+    from farm_runtime.quality import scene_profile, scope_evidence, refinement
+
+    geometry, config, validation = recovery_fixture(tmp_path / "source")
+    prepare_geometry(
+        geometry,
+        config,
+        tmp_path / "native",
+        [0, -1, 0],
+        recovery_validation=validation,
+    )
+    input_path = tmp_path / "native/manifest.json"
+    doc = json.loads(input_path.read_text())
+    # Quarantine the sole second timestamp for object 7. Its old metadata still says 2.
+    doc["objects"][0]["masks"] = [
+        row for row in doc["objects"][0]["masks"] if row["physical_timestamp_ns"] == 100
+    ]
+    write_json(input_path, doc)
+    native = tmp_path / "native.json"
+    write_json(native, dict(input=describe_file(input_path)))
+    called = []
+
+    def fake_inference(argv):
+        evidence = json.loads(Path(argv[argv.index("--proposals") + 1]).read_text())
+        called.extend(g["id"] for g in evidence["groups"])
+        output = Path(argv[argv.index("--output") + 1])
+        output.mkdir()
+        write_json(output / "manifest.json", {})
+
+    monkeypatch.setattr(refinement, "main", fake_inference)
+    output = tmp_path / "appearance"
+    scene_profile.semantics(
+        SimpleNamespace(
+            geometry=geometry,
+            native=native,
+            groups=64,
+            model=tmp_path / "model",
+            output=output,
+        )
+    )
+    assert called == [8]
+    stage = json.loads((output / "manifest.json").read_text())
+    assert stage["selected_group_ids"] == [8]
+    assert stage["deferred_group_ids"] == [7]
+
+
+def test_native_recovery_adds_budget_without_displacing_original_groups(
+    tmp_path, monkeypatch
+):
+    from types import SimpleNamespace
+    from farm_runtime.quality import native_observations, scene_profile
+
+    geometry, config, validation = recovery_fixture(tmp_path / "source")
+    captured = []
+
+    def capture(argv):
+        captured.extend(argv)
+        Path(argv[argv.index("--output") + 1]).mkdir()
+
+    monkeypatch.setattr(native_observations, "main", capture)
+    output = tmp_path / "output"
+    scene_profile.native(
+        SimpleNamespace(
+            geometry=geometry,
+            recovery_validation=validation,
+            groups=1,
+            ply=geometry.parent / "source.ply",
+            config=tmp_path / "config",
+            world_up=[0, -1, 0],
+            alternatives=0,
+            output=output,
+        )
+    )
+    selected = [
+        int(captured[i + 1]) for i, arg in enumerate(captured) if arg == "--group-id"
+    ]
+    assert selected == [7, 8]
+    selection = json.loads((output / "selection.json").read_text())
+    assert selection["recovery_added_group_ids"] == [8]
+    assert selection["candidate_budget"] == 1
+    assert selection["selected_group_ids"] == [7, 8]
+    assert selection["deferred_group_ids"] == []
