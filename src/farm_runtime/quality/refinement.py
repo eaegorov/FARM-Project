@@ -178,11 +178,13 @@ def sam(args):
         concepts = json.loads(args.prompts.read_text())
         if any(
             not isinstance(v, list)
-            or len(v) != 3
+            or not 1 <= len(v) <= 3
             or any(not isinstance(t, str) or not t.strip() for t in v)
             for v in concepts.values()
         ):
-            raise ValueError("three nonempty text concepts per object required")
+            raise ValueError("one to three nonempty text concepts per object required")
+        if any(str(r["object_id"]) not in concepts for r in evidence["observations"]):
+            raise ValueError("every crop object needs concept prompts")
         model = CachedSAMConceptRefiner(args.model)
     else:
         model = CachedSAMRefiner(args.model)
@@ -247,7 +249,7 @@ def sam(args):
                     key=lambda c: (c["geometry_eligible"], candidate_score(c)),
                 )
             )
-        canvas = Image.new("RGB", (1600, 500), "#111827")
+        canvas = Image.new("RGB", (400 * len(shown), 500), "#111827")
         draw = ImageDraw.Draw(canvas)
         for col, candidate in enumerate(shown):
             mask = arrays[candidate["key"]]

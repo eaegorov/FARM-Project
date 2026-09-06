@@ -131,3 +131,33 @@ def test_quarantine_is_object_specific_unknown_and_preserves_two_timestamps():
     assert decisions[2]["quarantine"] == "insufficient_remaining_timestamps"
     assert manifest["split"]["objects"][0]["build_timestamps"] == ["200", "300"]
     assert rejected[0]["observation"]["mask"] == {"original": 0}
+
+
+def test_single_high_score_candidate_cannot_expand_into_unobserved_wall():
+    fg = np.zeros((40, 40), np.float32)
+    fg[8:14, 5:35] = 1
+    bg = np.zeros_like(fg)
+    source = np.zeros_like(fg, bool)
+    source[8:13, 5:35] = True
+    expanded = fg > 0
+    expanded[14:30, 5:35] = True
+    result = choose_proposal(dict(source=source, expanded=expanded), fg, bg)
+    assert result["decision"] == "unsupported_expansion"
+    assert result["selected"] is None
+    assert result["metrics"]["expanded"]["foreground_recall"] == 1
+    assert result["metrics"]["expanded"]["expansion"]["unexplained_fraction"] == 1
+
+
+def test_supported_missing_body_can_grow_beyond_source_boundary():
+    fg = np.zeros((40, 40), np.float32)
+    fg[5:25, 5:25] = 1
+    source = fg > 0
+    source[5:8] = False
+    result = choose_proposal(
+        dict(source=source, complete=fg > 0), fg, np.zeros_like(fg)
+    )
+    assert result["selected"] == "complete"
+    assert (
+        result["metrics"]["complete"]["expansion"]["beyond_source_boundary_pixels"] > 0
+    )
+    assert result["metrics"]["complete"]["expansion"]["unexplained_fraction"] == 0

@@ -343,3 +343,9 @@ Native stage с девятью scope alternatives: 6,42 / 6,97 с, 1437 MiB; alt
 Отчёт V12: `18_local_context/REVIEW_RU.md`. Два opt-in ablations на тех же40 candidates не дали устойчивого улучшения: 322 helmet→shoe→tool; тонкая деталь109 всё ещё wall. Masked RGB помогает ящикам/некоторым малым компонентам, но не обосновывает общий default. Просмотрены6 страниц/16 объектов, неизменённые панели проверены на80 реальных canvases. GPU contention исключает честное сравнение новых timings с baseline.
 
 Validator appearance теперь канонизирует порядок только полного множества уникальных evidence IDs; raw сохранён. 1232 tests passed /69,60с. Следующий шаг — автоматический bounded crop scheduler по other-timestamp contradiction, без ручных ID списков.
+
+## 23. Автоматический выбор crop refinement
+
+Отчёт V12: `19_refinement_schedule/REVIEW_RU.md`. Новый `quality refinement-schedule`: >=3 physical timestamps, current timestamp целиком исключён из scoring, общий crop budget12/per-object2, приоритет по возможному gain того же selector score. Исправлен приём больших расширений в unknown:96,32% добавленного участка трубы не поддерживались OTHER foreground. Теперь такая proposal отклоняется. Factory replay сохраняет прежние полезные замены.
+
+Factory6crops автоматически воспроизвели очистку cabinet/cart и quarantine; cart exposed-control IoU0,62920→0,65851 (прежний targeted0,65535), сумма дополнительной работы55,36с. Knaack12crops дали3 небольших изменения; precision немного выше, recall к old build masks ниже. У lift сохраняется выступ уже в >=2TS core, cart неполна. Следующая проверка — alpha/occlusion footprint и native ownership, затем интеграция с актуальными semantic masks.1244tests /64,70с.

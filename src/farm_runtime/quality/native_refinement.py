@@ -35,6 +35,9 @@ POLICY = dict(
     ambiguity_mask_iou=0.85,
     quarantine_background_fraction=0.3,
     minimum_retained_object_timestamps=2,
+    expansion_boundary_tolerance_pixels=2,
+    expansion_foreground_threshold=0.02,
+    maximum_unexplained_expansion_fraction=0.5,
 )
 
 
@@ -80,6 +83,27 @@ def proposal_metrics(mask, foreground, background):
         background_fraction=leaked / (captured + leaked) if captured + leaked else None,
         score=(captured - leaked) / total if total else None,
         mask_pixels=int(mask.sum()),
+    )
+
+
+def expansion_evidence(mask, source, foreground, policy=POLICY):
+    """Unknown pixels cannot justify substantial growth beyond the source edge."""
+    from scipy.ndimage import binary_dilation
+
+    allowed = binary_dilation(
+        source, iterations=policy["expansion_boundary_tolerance_pixels"]
+    )
+    extension = mask & ~allowed
+    count = int(extension.sum())
+    unexplained = int(
+        (extension & (foreground <= policy["expansion_foreground_threshold"])).sum()
+    )
+    fraction = unexplained / count if count else 0.0
+    return dict(
+        beyond_source_boundary_pixels=count,
+        unexplained_pixels=unexplained,
+        unexplained_fraction=fraction,
+        supported=fraction <= policy["maximum_unexplained_expansion_fraction"],
     )
 
 
@@ -133,6 +157,12 @@ def choose_proposal(masks, foreground, background, policy=POLICY):
                 alternatives=[best, key],
                 metrics=metrics,
             )
+    extension = expansion_evidence(masks[best], masks["source"], foreground, policy)
+    metrics[best]["expansion"] = extension
+    if not extension["supported"]:
+        return dict(
+            decision="unsupported_expansion", selected=None, best=best, metrics=metrics
+        )
     return dict(
         decision="other_view_consistent_improvement", selected=best, metrics=metrics
     )
@@ -212,6 +242,25 @@ def _zero_evidence(item):
             )
         },
     )
+
+
+def collect_timestamp_votes(gs, run, split, config, wanted):
+    """Accumulate the unchanged source cohort once per physical timestamp."""
+    candidates, _ = lift.build_candidates(run, gs, split, config)
+    if not set(wanted) <= candidates.keys():
+        raise ValueError("unknown candidate requested for timestamp evidence")
+    votes = {oid: {} for oid in wanted}
+    started = time.monotonic()
+    for timestamp in split["build_timestamps"]:
+        fresh = {oid: _zero_evidence(item) for oid, item in candidates.items()}
+        lift.accumulate_build_evidence(
+            gs, run, dict(split, build_timestamps=[timestamp]), fresh, config
+        )
+        for oid in wanted:
+            item = fresh[oid]
+            votes[oid][timestamp] = item.positive_timestamps, item.negative_timestamps
+        del fresh
+    return candidates, votes, time.monotonic() - started
 
 
 def _read_proposals(paths, input_path, run):
@@ -333,21 +382,10 @@ def main(argv=None):
     write_json(args.output / "policy.json", POLICY)
     gs = lift.load_gaussians(open_graphdeco_ply(args.ply), run.meters_per_scene_unit)
     lift.alignment_guard(gs, run, config)
-    candidates, _ = lift.build_candidates(run, gs, split, config)
     wanted = {oid for oid, _ in proposals}
-    votes = {oid: {} for oid in wanted}
-    evidence_started = time.monotonic()
-    # One VJP pass per timestamp, regardless of how many proposals use it.
-    for timestamp in split["build_timestamps"]:
-        fresh = {oid: _zero_evidence(item) for oid, item in candidates.items()}
-        lift.accumulate_build_evidence(
-            gs, run, dict(split, build_timestamps=[timestamp]), fresh, config
-        )
-        for oid in wanted:
-            item = fresh[oid]
-            votes[oid][timestamp] = item.positive_timestamps, item.negative_timestamps
-        del fresh
-    accumulation_seconds = time.monotonic() - evidence_started
+    candidates, votes, accumulation_seconds = collect_timestamp_votes(
+        gs, run, split, config, wanted
+    )
     objects = {obj.object_id: obj for obj in run.objects}
     output_manifest = json.loads(json.dumps(manifest))
     output_objects = {row["object_id"]: row for row in output_manifest["objects"]}
