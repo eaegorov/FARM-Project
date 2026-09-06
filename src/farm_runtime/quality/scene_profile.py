@@ -891,6 +891,11 @@ def compile_plan(args):
                     args.sam_model,
                     "--backend",
                     backend,
+                    *[
+                        x
+                        for p in (getattr(args, "refinement_reuse", []) or [])
+                        for x in ("--reuse-proposals", p)
+                    ],
                     *(
                         ["--prompts", f"{schedule}/concepts.json"]
                         if backend == "concept"
@@ -900,7 +905,10 @@ def compile_plan(args):
                     f"{q}/{name}",
                 ],
                 f"{q}/{name}/manifest.json",
-                [f"{schedule}/manifest.json"],
+                [
+                    f"{schedule}/manifest.json",
+                    *(getattr(args, "refinement_reuse", []) or []),
+                ],
             )
         proposal_paths = [
             f"{q}/refinement_{b}/manifest.json" for b in ("tracker", "concept")
@@ -1052,6 +1060,13 @@ def main(argv=None):
         "--balance-refinement-errors",
         action="store_true",
         help="Opt in to foreground/background error diversity within the existing crop budget",
+    )
+    q.add_argument(
+        "--refinement-reuse",
+        type=Path,
+        action="append",
+        default=[],
+        help="Compatible proposal manifests reused by refinement before new inference",
     )
     args = p.parse_args(argv)
     if args.output.exists():

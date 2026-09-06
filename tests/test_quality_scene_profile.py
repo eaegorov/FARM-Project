@@ -82,6 +82,15 @@ def test_profile_compiles_into_existing_dag_with_explicit_budgets_and_runtimes(
     schedule = next(s for s in balanced["stages"] if s["id"] == "refinement_schedule")
     assert "--balance-error-modes" in schedule["command"]
     assert len(balanced["stages"]) == 18
+    args.refinement_reuse = [tmp_path / "cache.json"]
+    write(plan_path, compile_plan(args))
+    cached = plan_to_public_dict(load_plan(plan_path), tmp_path / "cached_run")
+    for stage in cached["stages"]:
+        if stage["id"] in ("refinement_tracker", "refinement_concept"):
+            assert str(args.refinement_reuse[0]) in stage["command"]
+            assert "--reuse-proposals" in stage["command"]
+            assert str(args.refinement_reuse[0]) in stage["fingerprint_inputs"]
+    assert len(cached["stages"]) == 18
     args.refinement_crops = 33
     with pytest.raises(ValueError, match="budget"):
         compile_plan(args)

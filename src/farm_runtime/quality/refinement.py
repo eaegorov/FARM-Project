@@ -150,6 +150,163 @@ def prepare(args):
     )
 
 
+def sam_inference_contract(model, backend, *, model_config=None, model_weights=None):
+    """Bind cached proposals to model bytes, preprocessing code and libraries."""
+    from importlib.metadata import version
+
+    root = Path(__file__).resolve().parents[1]
+    files = [
+        Path(__file__),
+        root / "segmentation_refinement.py",
+        root / "concept_segmentation.py",
+        root / "angular_discovery.py",
+    ]
+    return dict(
+        version=1,
+        backend=backend,
+        model_config=(model_config or describe_file(model / "config.json"))["sha256"],
+        model_weights=(model_weights or describe_file(model / "model.safetensors"))[
+            "sha256"
+        ],
+        auxiliary_model_files={
+            p.name: describe_file(p)["sha256"]
+            for p in sorted(model.iterdir())
+            if p.is_file() and p.name not in ("config.json", "model.safetensors")
+        },
+        implementation={p.name: describe_file(p)["sha256"] for p in files},
+        libraries={
+            name: version(name)
+            for name in (
+                "torch",
+                "torchvision",
+                "transformers",
+                "numpy",
+                "Pillow",
+                "scipy",
+                "tokenizers",
+                "safetensors",
+            )
+        },
+    )
+
+
+def sam_request_key(row, concepts):
+    import hashlib
+
+    request = {
+        key: row[key]
+        for key in (
+            "timestamp",
+            "physical_timestamp_ns",
+            "crop_grid_xyxy",
+            "crop_source_xyxy",
+            "grid_shape_hw",
+            "turns",
+        )
+    }
+    request.update(
+        {key: row[key]["sha256"] for key in ("crop", "seeds", "source_image")}
+    )
+    request["concepts"] = concepts
+    return hashlib.sha256(
+        json.dumps(request, sort_keys=True, allow_nan=False).encode()
+    ).hexdigest()
+
+
+def sam_reuse_index(paths, contract):
+    from farm_runtime.quality.mask_refinement import checked_file
+
+    index, sources = {}, []
+    for path in paths:
+        doc = json.loads(path.read_text())
+        if (
+            doc.get("schema") != "farm.sam-refinement-proposals.v1"
+            or doc.get("release_eligible") is not False
+        ):
+            raise ValueError("development SAM proposal cache required")
+        descriptor = describe_file(path)
+        compatible = doc.get("inference_contract") == contract
+        sources.append(dict(manifest=descriptor, compatible=compatible))
+        if not compatible:
+            # Old outputs lack the preprocessing/runtime fingerprint. They
+            # remain valid evidence but are not automatically trusted as cache.
+            continue
+        evidence = json.loads(checked_file(doc["evidence"]).read_text())
+        if (
+            evidence.get("reserved_test_opened") is not False
+            or evidence.get("legacy_heldout_used") is not False
+        ):
+            raise ValueError("build-only proposal cache required")
+        evidence_rows = {
+            (r["object_id"], r["image_id"]): r for r in evidence["observations"]
+        }
+        concepts = (
+            json.loads(checked_file(doc["prompts"]).read_text())
+            if contract["backend"] == "concept"
+            else None
+        )
+        for row in doc["observations"]:
+            source = evidence_rows[row["object_id"], row["image_id"]]
+            query = concepts[str(row["object_id"])] if concepts is not None else None
+            key = sam_request_key(source, query)
+            if sam_request_key(row, query) != key or row.get("inference_key") != key:
+                raise ValueError("cached SAM request differs from its frozen evidence")
+            index.setdefault(key, (row, descriptor))
+    return index, sources
+
+
+def reuse_sam_row(row, cached, descriptor, output, probability):
+    """Copy/link arrays, retaining current evidence and explicit old provenance."""
+    import errno
+    import os
+    import shutil
+    from farm_runtime.quality.mask_refinement import checked_file
+
+    archive = checked_file(cached["masks"])
+    with np.load(archive, allow_pickle=False) as data:
+        if not np.array_equal(data["baseline"], probability >= 0.1):
+            raise ValueError("cached baseline differs from current seed")
+        for candidate in cached["candidates"]:
+            mask, logits = data[candidate["key"]], data[candidate["soft_logit_key"]]
+            if (
+                mask.dtype != np.bool_
+                or mask.shape != probability.shape
+                or logits.shape != mask.shape
+                or not np.isfinite(logits).all()
+            ):
+                raise ValueError("invalid cached SAM mask/logit arrays")
+    name = Path(row["crop"]["path"]).stem
+    destinations = {}
+    for field, folder, suffix in (
+        ("masks", "masks", ".npz"),
+        ("visual", "visuals", ".jpg"),
+    ):
+        source = archive if field == "masks" else checked_file(cached[field])
+        destination = output / folder / (name + suffix)
+        try:
+            os.link(source, destination)
+        except OSError as exc:
+            if exc.errno not in (errno.EXDEV, errno.EPERM, errno.EACCES, errno.EROFS):
+                raise
+            shutil.copyfile(source, destination)
+        destinations[field] = describe_file(destination)
+    return dict(
+        row,
+        candidates=cached["candidates"],
+        display_candidates=cached["display_candidates"],
+        **destinations,
+        inference_key=cached["inference_key"],
+        reused_from=dict(
+            manifest=descriptor,
+            object_id=cached["object_id"],
+            image_id=cached["image_id"],
+        ),
+        seconds=0.0,
+        peak_allocated_mib=0.0,
+        encoder_calls=0,
+    )
+
+
 def sam(args):
     from farm_runtime.segmentation_refinement import (
         CachedSAMRefiner,
@@ -157,7 +314,6 @@ def sam(args):
         candidate_score,
     )
     from farm_runtime.quality.mask_refinement import checked_file
-    import torch
 
     evidence = json.loads(args.evidence.read_text())
     if (
@@ -185,18 +341,15 @@ def sam(args):
             raise ValueError("one to three nonempty text concepts per object required")
         if any(str(r["object_id"]) not in concepts for r in evidence["observations"]):
             raise ValueError("every crop object needs concept prompts")
-    # Empty schedules are normal on well-supported/two-timestamp cohorts.
-    # Do not initialize CUDA or load either checkpoint for them.
-    if evidence["observations"]:
-        model = (
-            CachedSAMConceptRefiner(args.model)
-            if concepts is not None
-            else CachedSAMRefiner(args.model)
-        )
-        torch.cuda.synchronize()
-        load_seconds = time.monotonic() - started
-    else:
-        load_seconds = 0.0
+    model_config = describe_file(args.model / "config.json")
+    model_weights = describe_file(args.model / "model.safetensors")
+    contract = sam_inference_contract(
+        args.model, args.backend, model_config=model_config, model_weights=model_weights
+    )
+    reuse, reuse_sources = sam_reuse_index(
+        getattr(args, "reuse_proposals", []) or [], contract
+    )
+    model, load_seconds = None, 0.0
     rows, skipped = [], []
     chosen = evidence["observations"]
     if args.limit:
@@ -222,6 +375,26 @@ def sam(args):
                 dict(name=f"concept_{i}", text=text)
                 for i, text in enumerate(concepts[str(row["object_id"])])
             ]
+        inference_key = sam_request_key(
+            row, concepts[str(row["object_id"])] if concepts is not None else None
+        )
+        if inference_key in reuse:
+            cached, descriptor = reuse[inference_key]
+            rows.append(
+                reuse_sam_row(row, cached, descriptor, args.output, probability)
+            )
+            continue
+        if model is None:
+            import torch
+
+            load_started = time.monotonic()
+            model = (
+                CachedSAMConceptRefiner(args.model)
+                if concepts is not None
+                else CachedSAMRefiner(args.model)
+            )
+            torch.cuda.synchronize()
+            load_seconds = time.monotonic() - load_started
         torch.cuda.reset_peak_memory_stats()
         tick = time.monotonic()
         candidates = model.predict(image, variants)
@@ -281,6 +454,8 @@ def sam(args):
                 candidates=proposals,
                 display_candidates=shown,
                 masks=describe_file(path),
+                visual=describe_file(visual),
+                inference_key=inference_key,
                 seconds=time.monotonic() - tick,
                 peak_allocated_mib=torch.cuda.max_memory_allocated() / 2**20,
                 encoder_calls=1,
@@ -295,12 +470,24 @@ def sam(args):
             observations=rows,
             skipped=skipped,
             evidence=describe_file(args.evidence),
-            model_config=describe_file(args.model / "config.json"),
+            model_config=model_config,
             backend=args.backend,
             prompts=describe_file(args.prompts) if args.prompts else None,
-            model_weights=describe_file(args.model / "model.safetensors"),
+            model_weights=model_weights,
             model_load_seconds=load_seconds,
-            no_inference_reason="empty_crop_schedule" if not chosen else None,
+            inference_contract=contract,
+            reuse_sources=reuse_sources,
+            reused_observations=sum("reused_from" in row for row in rows),
+            source_image_encoder_calls=sum(row["encoder_calls"] for row in rows),
+            no_inference_reason=(
+                "empty_crop_schedule"
+                if not chosen
+                else (
+                    "all_requests_reused"
+                    if rows and all("reused_from" in row for row in rows)
+                    else "insufficient_foreground_support" if model is None else None
+                )
+            ),
             total_seconds=time.monotonic() - started,
             release_eligible=False,
         ),
@@ -804,6 +991,13 @@ def main(argv=None):
     p.add_argument("--limit", type=int, default=0)
     p.add_argument("--backend", choices=("tracker", "concept"), default="tracker")
     p.add_argument("--prompts", type=Path)
+    p.add_argument(
+        "--reuse-proposals",
+        type=Path,
+        action="append",
+        default=[],
+        help="Reuse compatible fingerprinted crop proposals; current native scoring remains separate",
+    )
     p.set_defaults(func=sam)
     p = sub.add_parser("materialize")
     for name in ("proposals", "output"):
