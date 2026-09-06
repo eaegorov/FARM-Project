@@ -241,7 +241,10 @@ def main(argv=None):
     automatic = args.auto_groups is not None
     candidate_rows, available = (
         recovery_candidates(
-            inputs.geometry, args.candidate_budget, set(plan["sources"])
+            inputs.geometry,
+            args.candidate_budget,
+            set(plan["sources"]),
+            mask_reader=inputs.mask,
         )
         if automatic
         else ([], None)
@@ -378,7 +381,7 @@ def main(argv=None):
             concepts=describe_file(args.output / "concepts.txt"),
             recovery_schedule=(
                 dict(
-                    policy="Single-timestamp; source/relative-size thirds round robin, static depth support descending; then registered visibility",
+                    policy="Single-timestamp; source/relative-size thirds round robin, static depth support times same-frame multiview mask novelty descending; then registered visibility",
                     group_budget=args.auto_groups,
                     candidate_budget=args.candidate_budget,
                     view_budget=args.view_budget,
