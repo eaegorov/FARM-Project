@@ -36,6 +36,12 @@ Choose exactly one scope kind. same_physical_target is true, false, or null if i
 APPEARANCE_PROMPT = "Name the target candidate and describe its visible appearance. Each sheet shows SCENE CONTEXT locating a PHOTO crop, the actual PHOTO, and a separate binary MASK DIAGRAM whose white area is the candidate. The diagram supplies location and extent, never appearance or material. Describe the candidate indicated by the mask, not an imagined complete parent. Use the context to recognize surrounding structure. Prefer a conservative physical category when its function/material is not visually established. Do not invent details, brand, dimensions, invisible surfaces or component ownership. State a concrete uncertainty if identity or mask extent is unclear. A short factual caption is sufficient; do not discuss annotations, sheets or camera angles.\nReturn ONLY a JSON object with exactly four fields: label (short English string), caption (one short factual English sentence), uncertainty (a string; empty if none), observed_image_ids (the exact provided list of integers). All three text fields must be strings, never null, boolean or arrays."
 
 
+MASKED_APPEARANCE_PROMPT = APPEARANCE_PROMPT.replace(
+    "a separate binary MASK DIAGRAM whose white area is the candidate. The diagram supplies location and extent, never appearance or material.",
+    "a MASKED PHOTO preserving only the candidate's actual RGB pixels on a neutral gray background. Gray outside the mask hides irrelevant pixels; it is not a material, surface or object part.",
+)
+
+
 def validate_appearance(text, image_ids):
     """Validate a narrow description, without inventing an ownership assessment."""
     value = json.loads(text)
@@ -50,9 +56,14 @@ def validate_appearance(text, image_ids):
     if (
         not isinstance(ids, list)
         or any(type(i) is not int for i in ids)
-        or ids != list(image_ids)
+        or len(ids) != len(set(ids))
+        or set(ids) != set(image_ids)
     ):
         raise ValueError("exact observed image IDs required")
+    # This is one joint description, without per-view fields. Reordered evidence
+    # is equivalent; preserve the raw model answer in the caller and canonicalize
+    # only after validating unique, complete source membership.
+    value["observed_image_ids"] = list(image_ids)
     return value
 
 

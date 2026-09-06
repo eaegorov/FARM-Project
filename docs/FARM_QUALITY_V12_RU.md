@@ -337,3 +337,9 @@ Native stage с девятью scope alternatives: 6,42 / 6,97 с, 1437 MiB; alt
 Отчёт V12: `17_scene_profile/REVIEW_RU.md`; руководство [QUALITY_SCENE_PROFILE_RU.md](QUALITY_SCENE_PROFILE_RU.md). Существующий FARM orchestrator выполняет 13 bounded этапов, snapshots и provenance сохранены. Knaack: 40 multi-timestamp candidates, 36 primary native masks, 4 nested alternatives. Native IDs и support точно совпали с этапом 14. Сумма успешных stages 517,41 с после готового RGBD; два запуска с исправлением identity adapter между ними, не uninterrupted cold run. 1224 tests passed / 85,13 с.
 
 Все 40 compact JSON валидны, но визуально обнаружены context distraction (потолочная труба→каска человека) и wall/crate ошибки. Каталог хранит модельные proposals, observed OBB и unresolved physical size/scope. Следующий шаг — local-context comparison на той же когорте, затем bounded crop refinement. Universal release ещё не подтверждён.
+
+## 22. Local context и masked target RGB
+
+Отчёт V12: `18_local_context/REVIEW_RU.md`. Два opt-in ablations на тех же40 candidates не дали устойчивого улучшения: 322 helmet→shoe→tool; тонкая деталь109 всё ещё wall. Masked RGB помогает ящикам/некоторым малым компонентам, но не обосновывает общий default. Просмотрены6 страниц/16 объектов, неизменённые панели проверены на80 реальных canvases. GPU contention исключает честное сравнение новых timings с baseline.
+
+Validator appearance теперь канонизирует порядок только полного множества уникальных evidence IDs; raw сохранён. 1232 tests passed /69,60с. Следующий шаг — автоматический bounded crop scheduler по other-timestamp contradiction, без ручных ID списков.

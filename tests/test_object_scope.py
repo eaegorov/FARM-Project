@@ -158,3 +158,75 @@ def test_context_sheet_preserves_clean_photo_and_binary_shape_when_enlarged(tmp_
     assert sheet.getpixel((774, 286)) == (35, 70, 90)
     assert sheet.getpixel((1294, 286)) == (255, 255, 255)
     assert context.size == (100, 80)
+
+
+def test_local_context_clips_real_source_before_rotation(tmp_path):
+    from farm_runtime.quality.refinement import scope_context_image
+    from farm_runtime.angular_discovery import rotate_image
+    from PIL import ImageDraw
+
+    rgb = np.arange(60 * 100 * 3, dtype=np.uint8).reshape(60, 100, 3)
+    path = tmp_path / "source.png"
+    Image.fromarray(rgb).save(path)
+    row = dict(
+        source_image=describe_file(path), crop_source_xyxy=[0, 5, 20, 25], turns=1
+    )
+    marked = Image.fromarray(rgb)
+    ImageDraw.Draw(marked).rectangle((0, 5, 19, 24), outline="#ffd84d", width=1)
+    actual = scope_context_image(row, context_scale=3.0)
+    assert actual.size == (45, 40)
+    np.testing.assert_array_equal(
+        np.asarray(actual), rotate_image(np.asarray(marked)[:45, :40], 1)
+    )
+    for bad in [True, 0.5, 9, float("nan"), float("inf")]:
+        with pytest.raises(ValueError, match="context scale"):
+            scope_context_image(row, context_scale=bad)
+
+
+def test_context_change_leaves_appearance_and_binary_panels_identical(tmp_path):
+    from farm_runtime.quality.refinement import scope_context_image
+
+    source = tmp_path / "source.png"
+    rgb = np.zeros((100, 160, 3), np.uint8)
+    rgb[:, :50] = [200, 40, 60]
+    Image.fromarray(rgb).save(source)
+    mask_path = tmp_path / "masks.npz"
+    np.savez_compressed(mask_path, baseline=np.ones((20, 20), bool))
+    row = dict(
+        source_image=describe_file(source),
+        crop_source_xyxy=[90, 40, 110, 60],
+        turns=0,
+        masks=describe_file(mask_path),
+    )
+    photo = Image.new("RGB", (20, 20), (70, 90, 80))
+    full = np.asarray(
+        review_image(photo, row, scope=True, context=scope_context_image(row))
+    )
+    local = np.asarray(
+        review_image(
+            photo, row, scope=True, context=scope_context_image(row, context_scale=3.0)
+        )
+    )
+    np.testing.assert_array_equal(full[:, 520:], local[:, 520:])
+    assert not np.array_equal(full[:, :520], local[:, :520])
+
+
+def test_masked_appearance_preserves_target_rgb_and_hides_background(tmp_path):
+    mask = np.zeros((508, 508), bool)
+    mask[100:400, 200:300] = True
+    path = tmp_path / "mask.npz"
+    np.savez_compressed(path, baseline=mask)
+    rgb = np.full((508, 508, 3), [220, 40, 70], np.uint8)
+    rgb[mask] = [25, 60, 90]
+    row = dict(masks=describe_file(path))
+    context = Image.new("RGB", (100, 100))
+    full = review_image(Image.fromarray(rgb), row, scope=True, context=context)
+    masked = review_image(
+        Image.fromarray(rgb), row, scope=True, context=context, mask_appearance=True
+    )
+    np.testing.assert_array_equal(
+        np.asarray(full)[:, :1040], np.asarray(masked)[:, :1040]
+    )
+    tile = np.asarray(masked)[32:540, 1040:1548]
+    np.testing.assert_array_equal(tile[mask], rgb[mask])
+    assert (tile[~mask] == 128).all()

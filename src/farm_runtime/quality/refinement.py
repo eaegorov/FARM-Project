@@ -485,10 +485,16 @@ def orient(args):
     )
 
 
-def scope_context_image(row):
-    """Locate a source crop on its real full RGB before the same upright rotation."""
+def scope_context_image(row, *, context_scale=None):
+    """Locate the target on real source RGB, optionally bounding nearby context."""
     from farm_runtime.quality.mask_refinement import checked_file
 
+    if context_scale is not None and (
+        type(context_scale) not in (int, float)
+        or not np.isfinite(context_scale)
+        or not 1 <= context_scale <= 8
+    ):
+        raise ValueError("context scale must be finite and between 1 and 8")
     with Image.open(checked_file(row["source_image"])) as source:
         context = source.convert("RGB")
     box = row["crop_source_xyxy"]
@@ -506,10 +512,26 @@ def scope_context_image(row):
         outline="#ffd84d",
         width=max(1, round(max(context.size) / 350)),
     )
+    if context_scale is not None:
+        # Bound context in original coordinates before the common upright rotation.
+        # Clipping at image boundaries adds no padding or fabricated pixels.
+        cx, cy = (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
+        rx = (box[2] - box[0]) * context_scale / 2
+        ry = (box[3] - box[1]) * context_scale / 2
+        context = context.crop(
+            (
+                max(0, int(np.floor(cx - rx))),
+                max(0, int(np.floor(cy - ry))),
+                min(context.width, int(np.ceil(cx + rx))),
+                min(context.height, int(np.ceil(cy + ry))),
+            )
+        )
     return Image.fromarray(rotate_image(np.asarray(context), row["turns"]))
 
 
-def review_image(image, row, *, semantic_only=False, scope=False, context=None):
+def review_image(
+    image, row, *, semantic_only=False, scope=False, context=None, mask_appearance=False
+):
     """Build the requested visual evidence without fabricated mask candidates."""
     from farm_runtime.quality.mask_refinement import checked_file
 
@@ -531,10 +553,17 @@ def review_image(image, row, *, semantic_only=False, scope=False, context=None):
             return photo
         # Keep synthetic annotation colors out of appearance evidence.
         silhouette = Image.fromarray(mask.astype(np.uint8) * 255).convert("RGB")
-        panels = [
-            (photo, "PHOTO: APPEARANCE"),
-            (silhouette, "MASK DIAGRAM: WHITE = TARGET"),
-        ]
+        if mask_appearance:
+            # Preserve actual target RGB; hide only outside-mask pixels on a
+            # neutral background. Do not tint target colors or complete its shape.
+            masked_rgb = np.full((image.height, image.width, 3), 128, np.uint8)
+            masked_rgb[mask] = np.asarray(image)[mask]
+            target_panel = Image.fromarray(masked_rgb)
+            target_title = "MASKED PHOTO: TARGET RGB, GRAY = HIDDEN"
+        else:
+            target_panel = silhouette
+            target_title = "MASK DIAGRAM: WHITE = TARGET"
+        panels = [(photo, "PHOTO: APPEARANCE"), (target_panel, target_title)]
         if context is not None:
             panels.insert(0, (context, "SCENE CONTEXT: TARGET LOCATION"))
         canvas = Image.new("RGB", (520 * len(panels), 550), "#111827")
@@ -596,14 +625,21 @@ def vlm(args):
         SCOPE_PROMPT,
         validate_scope,
         APPEARANCE_PROMPT,
+        MASKED_APPEARANCE_PROMPT,
         validate_appearance,
     )
 
     proposals = json.loads(args.proposals.read_text())
     scope = getattr(args, "scope", False)
     appearance = getattr(args, "compact_semantics", False)
+    mask_appearance = getattr(args, "mask_appearance", False)
+    if mask_appearance and not appearance:
+        raise ValueError("masked appearance requires --compact-semantics")
     scope_input = scope or appearance
-    contextual = getattr(args, "scope_context", False) or appearance
+    context_scale = getattr(args, "context_scale", None)
+    contextual = (
+        getattr(args, "scope_context", False) or appearance or context_scale is not None
+    )
     if contextual and not scope_input:
         raise ValueError("scene context requires --scope or --compact-semantics")
     if scope_input and (
@@ -614,7 +650,7 @@ def vlm(args):
             "scope/appearance review requires development-only spatial-group evidence"
         )
     prompt = (
-        APPEARANCE_PROMPT
+        (MASKED_APPEARANCE_PROMPT if mask_appearance else APPEARANCE_PROMPT)
         if appearance
         else (
             SCOPE_PROMPT
@@ -625,7 +661,7 @@ def vlm(args):
     if contextual and not appearance:
         prompt = prompt.replace("Each sheet has two panels:", "Each sheet includes:")
         prompt = (
-            "SCENE CONTEXT is the original full RGB with a yellow rectangle locating "
+            "SCENE CONTEXT is original source RGB with a yellow rectangle locating "
             "the PHOTO crop. Use it to understand nearby structure and possible parents. "
             "PHOTO is enlarged for inspection; this adds no visual detail. "
             "Describe the physical target, never the sheet, annotation or camera views. "
@@ -656,7 +692,12 @@ def vlm(args):
                 row,
                 semantic_only=args.semantic_only,
                 scope=scope_input,
-                context=scope_context_image(row) if contextual else None,
+                mask_appearance=mask_appearance,
+                context=(
+                    scope_context_image(row, context_scale=context_scale)
+                    if contextual
+                    else None
+                ),
             )
             path = (
                 args.output / "visuals" / f"{object_id:06d}_{row['image_id']:06d}.jpg"
@@ -716,6 +757,8 @@ def vlm(args):
             prompt=describe_file(args.output / "prompt.txt"),
             model_load_seconds=load_seconds,
             scene_context_included=contextual,
+            context_scale=context_scale,
+            masked_target_rgb=mask_appearance,
             physical_scope_assessed=False if appearance else None,
             total_seconds=time.monotonic() - started,
             human_labels_in_prompt=False,
@@ -783,6 +826,16 @@ def main(argv=None):
         "--scene-context",
         action="store_true",
         help="Add registered source RGB context and enlarge actual scope crops",
+    )
+    p.add_argument(
+        "--context-scale",
+        type=float,
+        help="Restrict source context to 1–8 times the target crop extent; default full RGB",
+    )
+    p.add_argument(
+        "--mask-appearance",
+        action="store_true",
+        help="Show actual target RGB on neutral gray instead of the binary diagram (compact mode)",
     )
     p.set_defaults(func=vlm)
     args = parser.parse_args(argv)

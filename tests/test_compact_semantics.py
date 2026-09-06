@@ -7,7 +7,11 @@ from PIL import Image
 
 from farm_runtime.quality import refinement
 from farm_runtime.quality_baseline import describe_file
-from farm_runtime.semantic_refinement import APPEARANCE_PROMPT, validate_appearance
+from farm_runtime.semantic_refinement import (
+    APPEARANCE_PROMPT,
+    MASKED_APPEARANCE_PROMPT,
+    validate_appearance,
+)
 
 
 def appearance():
@@ -26,7 +30,8 @@ def appearance():
         {"caption": []},
         {"label": " "},
         {"integral_parts": []},
-        {"observed_image_ids": [8, 7]},
+        {"observed_image_ids": [7, 7, 8]},
+        {"observed_image_ids": [7, 9]},
         {"observed_image_ids": [7]},
         {"observed_image_ids": [7, True]},
     ],
@@ -43,8 +48,10 @@ def test_appearance_accepts_uncertain_identity_without_assessing_ownership():
     assert validate_appearance(json.dumps(value), [7, 8]) == value
 
 
+@pytest.mark.parametrize("context_scale", [None, 3.0])
+@pytest.mark.parametrize("masked_target", [False, True])
 def test_compact_cli_preserves_two_timestamp_evidence_and_context(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, context_scale, masked_target
 ):
     import torch
     import farm_runtime.semantic_refinement as semantics
@@ -91,7 +98,9 @@ def test_compact_cli_preserves_two_timestamp_evidence_and_context(
 
         def ask(self, prompt, images, image_ids, validator, *, max_new_tokens):
             calls.append(image_ids)
-            assert prompt == APPEARANCE_PROMPT
+            assert prompt == (
+                MASKED_APPEARANCE_PROMPT if masked_target else APPEARANCE_PROMPT
+            )
             assert validator is validate_appearance
             assert max_new_tokens == 180
             assert [im.size for im in images] == [(1560, 550)] * 2
@@ -119,11 +128,17 @@ def test_compact_cli_preserves_two_timestamp_evidence_and_context(
         "--output",
         str(output),
     ]
+    if masked_target:
+        args[1:1] = ["--mask-appearance"]
+    if context_scale is not None:
+        args[1:1] = ["--context-scale", str(context_scale)]
     refinement.main(args)
     result = json.loads((output / "manifest.json").read_text())
     assert calls == [[7, 8]]
     assert result["schema"] == "farm.local-object-appearance.v1"
     assert result["scene_context_included"] is True
+    assert result["context_scale"] == context_scale
+    assert result["masked_target_rgb"] == masked_target
     assert result["physical_scope_assessed"] is False
     assert result["objects"][0]["evidence_timestamps"] == ["7", "8"]
     # A repeated timestamp must fail before invoking the model again.
@@ -174,3 +189,11 @@ def test_empty_sam_batch_does_not_depend_on_vlm_arguments(tmp_path, monkeypatch)
     assert result["schema"] == "farm.sam-refinement-proposals.v1"
     assert result["observations"] == []
     assert "scene_context_included" not in result
+
+
+def test_appearance_normalizes_reordered_complete_evidence_only():
+    value = appearance()
+    value["observed_image_ids"] = [8, 7]
+    result = validate_appearance(json.dumps(value), [7, 8])
+    assert result["observed_image_ids"] == [7, 8]
+    assert result["caption"] == value["caption"]
