@@ -518,3 +518,47 @@ def test_native_recovery_adds_budget_without_displacing_original_groups(
     assert selection["candidate_budget"] == 1
     assert selection["selected_group_ids"] == [7, 8]
     assert selection["deferred_group_ids"] == []
+
+
+def test_semantics_recovery_has_separate_budget_and_preserves_base_selection(
+    tmp_path, monkeypatch
+):
+    from types import SimpleNamespace
+    from farm_runtime.quality import scene_profile, refinement
+
+    geometry, config, validation = recovery_fixture(tmp_path / "source")
+    prepare_geometry(
+        geometry,
+        config,
+        tmp_path / "native",
+        [0, -1, 0],
+        recovery_validation=validation,
+    )
+    native = tmp_path / "native.json"
+    write_json(native, dict(input=describe_file(tmp_path / "native/manifest.json")))
+    called = []
+
+    def capture(argv):
+        evidence = json.loads(Path(argv[argv.index("--proposals") + 1]).read_text())
+        called.extend(g["id"] for g in evidence["groups"])
+        out = Path(argv[argv.index("--output") + 1])
+        out.mkdir()
+        write_json(out / "manifest.json", {})
+
+    monkeypatch.setattr(refinement, "main", capture)
+    output = tmp_path / "appearance"
+    scene_profile.semantics(
+        SimpleNamespace(
+            geometry=geometry,
+            native=native,
+            groups=1,
+            model=tmp_path / "model",
+            output=output,
+        )
+    )
+    stage = json.loads((output / "manifest.json").read_text())
+    assert called == [7, 8]
+    assert stage["selected_group_ids"] == [7, 8]
+    assert stage["recovery_added_group_ids"] == [8]
+    assert stage["candidate_budget"] == 1
+    assert stage["deferred_group_ids"] == []

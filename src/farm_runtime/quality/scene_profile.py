@@ -604,6 +604,24 @@ def semantics(args):
 
         counts = retained_timestamp_counts(native_input, args.geometry)
     chosen, deferred = bounded_groups(geometry, args.groups, counts)
+    recovered = (
+        sorted(
+            obj["object_id"]
+            for obj in read(native_input)["objects"]
+            if counts.get(obj["object_id"], 0) >= 2
+            and any(
+                row.get("source_kind") == "validated_additional_view"
+                for row in obj["masks"]
+            )
+        )
+        if native_input
+        else []
+    )
+    if len(recovered) > 16:
+        raise ValueError("semantic recovery cohort must contain at most 16 groups")
+    added = sorted(set(recovered) - set(chosen))
+    chosen += added
+    deferred = [g for g in deferred if g not in chosen]
     if not chosen:
         raise ValueError("no multi-timestamp appearance candidates")
     deferred = sorted(
@@ -651,6 +669,8 @@ def semantics(args):
             selected_group_ids=chosen,
             deferred_group_ids=deferred,
             candidate_budget=args.groups,
+            recovery_added_group_ids=added,
+            recovery_additional_budget_limit=16,
             labels_are_model_proposals=True,
             physical_scope_assessed=False,
         ),
