@@ -118,3 +118,8 @@ foreground fraction. Связь идёт по имени и SHA256 RGB, а не 
 Автоматическое physical scope merging пока не включено. Новый каталог не
 заменяет проверенный production bank и не означает завершённый universal
 quality release.
+
+
+Проверенные18-stage прогоны из snapshot4784c3d: Knaack10:39, Factory17:25 после готового registered RGBD. Это wall time данного development run, без model download/raw ingress; budgets ограничивают полноту. Подробный аудит — V12/21_refined_profile/REVIEW_RU.md.
+
+Экспериментальный `quality proposal-geometry --partial-view-association` предназначен для отдельного geometry ablation. Общий scene profile пока не включает его: положительный poster followup проверен, но whole/part ambiguity и broader quality gates остаются. См. V12/23_partial_view_association/REVIEW_RU.md.

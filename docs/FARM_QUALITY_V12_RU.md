@@ -357,3 +357,18 @@ Factory6crops автоматически воспроизвели очистку
 ## 25. Refinement внутри quality DAG
 
 `scene-profile plan --refinement-crops 12` добавляет5 stages к прежним13. Budget0 сохраняет прежнюю последовательность. Пустые schedules пропускают SAM/CUDA; unchanged selection не пересобирает native bank. Appearance получает актуальный native input, пропускает quarantine, использует изменённые masks и дополнительные source-bound views. Разные mask grids сравниваются по доле foreground. Catalog проверяет input binding и сохраняет native timestamp count отдельно от исходной геометрии. Реальные прогоны и проверки фиксируются в `21_refined_profile/`.
+
+
+## 26. Непрерывные прогоны Factory и Knaack
+
+Чистый snapshot4784c3d: оба18-stage runs успешны. После готового registered RGBD Knaack10:39 (40candidates/36primary/4alternatives/40descriptions), Factory17:25 (174/117/16/64). Это не cold/raw-input timing и не semantic accuracy. Knaack final bank точно воспроизводит Stage19, все80mask bindings проверены. Factory audit локализовал потерю poster в association, container/fire cabinet в недостатке observations, wall unit27 в discovery. Отчёт V12/21_refined_profile/REVIEW_RU.md.
+
+## 27. DAM-3B с прямой маской
+
+12objects×2views finalKnaack: все24captions и12pages просмотрены. 50,13с total,7074MiB; устойчивого выигрыша над Qwen нет (airplane, plant branch, forklift, barrel и cardboard hallucinations). Default replacement отклонён. Весовая лицензия Noncommercial, backend в FARM не добавлен. Отчёт V12/22_region_captioning/REVIEW_RU.md.
+
+## 28. Частичная видимость и адресное заполнение 3D-маски
+
+Opt-in `quality proposal-geometry --partial-view-association`: только для реального пересечения FOV edge учитывает in-frame/covisible support, сохраняя depth/negative/mutual/cannot-link ограничения. Nested clipped part не определяет whole-object identity при наличии larger same-frame proposal. V1 whole-pallet/plank ошибка выявлена визуально и исключена вv2. 1255tests/66,27с.
+
+На фиксированных20RGB Factory174→184multi-TS, Knaack40→43; это counts, не recall. Poster group0 восстановлен из двух односторонне полных observations. Адресный добор2views существующими surface-evidence/SAM/validation/native этапами за17,12с даёт4162→32672Gaussians, mean build-reference IoU0,4610→0,9381, recall0,4709→0,9727. Все4crop comparisons просмотрены; небольшая wall leakage сохраняется. Physical thickness не подтверждена. Whole-scene default не менялся. Отчёт V12/23_partial_view_association/REVIEW_RU.md; следующий приоритет — автоматический выбор слабопокрытых objects для bounded followup.

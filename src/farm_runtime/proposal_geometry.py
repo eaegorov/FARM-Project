@@ -31,6 +31,7 @@ class GeometryPolicy:
     min_mask_agreement: float = 0.80
     negative_mask_fraction: float = 0.35
     ambiguity_margin: float = 0.08
+    partial_view_association: bool = False
 
 
 def mask_overlap(a, b):
@@ -161,6 +162,12 @@ def project_evidence(
 
     if include_point_indices:
         result.update(
+            out_of_frame_sides=[
+                int((positive & (uv[:, 0] < 0)).sum()),
+                int((positive & (uv[:, 0] >= w)).sum()),
+                int((positive & (uv[:, 1] < 0)).sum()),
+                int((positive & (uv[:, 1] >= h)).sum()),
+            ],
             surface_indices=chosen[visible],
             surface_pixels_xy=uv[chosen[visible]],
             occluded_indices=chosen[z > surface_depth + tolerance],
@@ -179,8 +186,11 @@ def compare_surfaces(a, b, frames, policy=GeometryPolicy()):
     gap = np.maximum(a["bounds"][0] - b["bounds"][1], b["bounds"][0] - a["bounds"][1])
     if np.any(gap > radius):
         return {"decision": "separate", "reason": "disjoint_surface_bounds"}
-    ab = float(np.mean(b["tree"].query(pa, k=1)[0] <= radius))
-    ba = float(np.mean(a["tree"].query(pb, k=1)[0] <= radius))
+    near = [
+        b["tree"].query(pa, k=1)[0] <= radius,
+        a["tree"].query(pb, k=1)[0] <= radius,
+    ]
+    ab, ba = [float(np.mean(values)) for values in near]
     directions = []
     for source, target in ((a, b), (b, a)):
         f = frames[target["frame"]]
@@ -194,6 +204,7 @@ def compare_surfaces(a, b, frames, policy=GeometryPolicy()):
                 f["excluded"],
                 policy,
                 mask_is_dilated=True,
+                include_point_indices=policy.partial_view_association,
             )
         )
     enough = [
@@ -210,19 +221,94 @@ def compare_surfaces(a, b, frames, policy=GeometryPolicy()):
         and min(ab, ba) >= policy.min_surface_agreement
         and all(d["mask_agreement"] >= policy.min_mask_agreement for d in directions)
     )
+    # A cropped image cannot contradict the part of a surface outside its FOV.
+    # Enable the alternate denominator only where the target mask reaches the
+    # same edge that projected source points cross. Occluded/excluded points
+    # remain unknown; they never become mask support.
+    partial, effective_agreement, partial_enough = [], [ab, ba], list(enough)
+    if policy.partial_view_association:
+        for i, (d, target) in enumerate(zip(directions, (b, a))):
+            mask = target["mask"]
+            touches = [
+                mask[:, 0].any(),
+                mask[:, -1].any(),
+                mask[0].any(),
+                mask[-1].any(),
+            ]
+            eligible = any(
+                touch and count > 0
+                for touch, count in zip(touches, d["out_of_frame_sides"])
+            )
+            # A border-clipped part nested in a larger same-image proposal
+            # cannot establish the physical extent of an object by itself.
+            containers = target.get("scope_containers", [])
+            if eligible and containers:
+                d["partial_scope_ambiguous_with"] = list(containers)
+                eligible = False
+            indices = d.pop("surface_indices")
+            for key in (
+                "surface_pixels_xy",
+                "occluded_indices",
+                "in_front_of_surface_indices",
+            ):
+                d.pop(key)
+            partial.append(bool(eligible))
+            if eligible:
+                partial_enough[i] = (
+                    d["surface_visible"] >= policy.min_points
+                    and d["surface_visible"] / max(1, d["in_frame"])
+                    >= policy.min_visible_fraction
+                )
+                effective_agreement[i] = (
+                    float(np.mean(near[i][indices])) if len(indices) else 0.0
+                )
+        partial_negative = any(
+            ok and d["mask_agreement"] < 1 - policy.negative_mask_fraction
+            for ok, d in zip(partial_enough, directions)
+        )
+        partial_positive = (
+            any(partial)
+            and all(partial_enough)
+            and min(effective_agreement) >= policy.min_surface_agreement
+            and all(
+                d["mask_agreement"] >= policy.min_mask_agreement for d in directions
+            )
+        )
+    else:
+        partial_negative = partial_positive = False
+    original_positive = positive
+    negative = negative or partial_negative
+    positive = positive or partial_positive
+    extra = {}
+    if any(partial):
+        extra = {
+            "partial_view_directions": partial,
+            "partial_surface_agreement": effective_agreement,
+            "partial_visible_sufficient": partial_enough,
+        }
+    score_agreement = (
+        effective_agreement if positive and not original_positive else [ab, ba]
+    )
     return {
+        **extra,
         "decision": "separate" if negative else "match" if positive else "unknown",
         "reason": (
             "visible_mask_conflict"
             if negative
             else (
-                "mutual_surface_support" if positive else "partial_or_ambiguous_support"
+                (
+                    "mutual_surface_support"
+                    if original_positive
+                    else "partial_view_surface_support"
+                )
+                if positive
+                else "partial_or_ambiguous_support"
             )
         ),
         "surface_agreement": [ab, ba],
         "radius_m": radius,
         "directions": directions,
-        "score": min(ab, ba) * min(d["mask_agreement"] for d in directions),
+        "score": min(score_agreement) * min(d["mask_agreement"] for d in directions),
     }
 
 
@@ -244,12 +330,26 @@ def associate(nodes, frames, policy=GeometryPolicy()):
         )
         node["projection_mask"] = binary_dilation(node["mask"], iterations=1)
     blocked, matches, diagnostics, scopes = set(), [], [], []
+    same_frame_overlaps = {}
+    by_frame = {}
+    for i, node in enumerate(nodes):
+        node["scope_containers"] = []
+        by_frame.setdefault(node["frame"], []).append(i)
+    for indices in by_frame.values():
+        for offset, i in enumerate(indices):
+            for j in indices[offset + 1 :]:
+                iou, ca, cb = mask_overlap(nodes[i]["mask"], nodes[j]["mask"])
+                same_frame_overlaps[i, j] = (iou, ca, cb)
+                if ca >= 0.85 > cb:
+                    nodes[i]["scope_containers"].append(j)
+                if cb >= 0.85 > ca:
+                    nodes[j]["scope_containers"].append(i)
     for i, a in enumerate(nodes):
         for j in range(i + 1, len(nodes)):
             b = nodes[j]
             if a["frame"] == b["frame"]:
                 blocked.add((i, j))
-                iou, ca, cb = mask_overlap(a["mask"], b["mask"])
+                iou, ca, cb = same_frame_overlaps[i, j]
                 if max(ca, cb) >= 0.85:
                     scopes.append(
                         {

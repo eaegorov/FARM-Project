@@ -140,11 +140,16 @@ def main(argv=None):
     for field in ("proposals", "rgbd", "transients", "output"):
         parser.add_argument("--" + field, type=Path, required=True)
     parser.add_argument("--views-from", type=Path)
+    parser.add_argument(
+        "--partial-view-association",
+        action="store_true",
+        help="Experimental: evaluate border-clipped matches within their observed field of view.",
+    )
     args = parser.parse_args(argv)
     if args.output.exists():
         raise ValueError("output directory must be new")
     started = time.monotonic()
-    policy = GeometryPolicy()
+    policy = GeometryPolicy(partial_view_association=args.partial_view_association)
     _, observations = read_observations(args.proposals)
     if args.views_from:
         _, selection = read_observations(args.views_from)

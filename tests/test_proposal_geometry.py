@@ -135,3 +135,93 @@ def test_component_cannot_link_survives_transitive_bridge(monkeypatch):
         True,
         False,
     ]
+
+
+def cropped_plane():
+    f, g = scene(), scene()
+    g["T_world_cam"][0, 3] = 1.6
+    whole = np.zeros((40, 40), bool)
+    whole[5:35, 5:35] = True
+    clipped = np.zeros_like(whole)
+    clipped[5:35, :3] = True
+    return [node("a", whole, f), node("b", clipped, g)], {"a": f, "b": g}
+
+
+def test_partial_fov_recovers_clipped_plane_without_changing_default():
+    nodes, frames = cropped_plane()
+    groups, baseline = associate(nodes, frames)
+    assert groups == [[0], [1]]
+    groups, evidence = associate(
+        nodes, frames, GeometryPolicy(partial_view_association=True)
+    )
+    assert groups == [[0, 1]]
+    edge = evidence["mutual_edges"][0]
+    assert edge["reason"] == "partial_view_surface_support"
+    assert edge["directions"][0]["visible_fraction"] < 0.15
+    assert edge["partial_view_directions"] == [True, False]
+    assert min(edge["partial_surface_agreement"]) > 0.9
+
+
+def test_partial_fov_keeps_visible_background_conflict():
+    nodes, frames = cropped_plane()
+    # The crop now observes only the top half of the candidate. The rest is
+    # reconstructed visible background, not missing support outside the image.
+    mask = nodes[1]["mask"].copy()
+    mask[20:] = False
+    nodes[1] = node("b", mask, frames["b"])
+    groups, evidence = associate(
+        nodes, frames, GeometryPolicy(partial_view_association=True, min_points=10)
+    )
+    assert groups == [[0], [1]]
+    assert evidence["candidate_pairs"][0]["reason"] == "visible_mask_conflict"
+
+
+def test_partial_fov_does_not_treat_occlusion_or_exclusion_as_support():
+    for mode in ("occluded", "missing", "excluded"):
+        nodes, frames = cropped_plane()
+        if mode == "occluded":
+            frames["b"]["depth"][:] = 1.0
+        elif mode == "missing":
+            frames["b"]["depth"][:] = 0.0
+        else:
+            frames["b"]["excluded"][:] = True
+        groups, evidence = associate(
+            nodes, frames, GeometryPolicy(partial_view_association=True)
+        )
+        assert groups == [[0], [1]]
+        assert evidence["candidate_pairs"][0]["decision"] == "unknown"
+
+
+def test_partial_fov_requires_mask_at_crossed_image_edge():
+    nodes, frames = cropped_plane()
+    # Preserve the surface points to isolate the image-edge eligibility gate.
+    nodes[1]["mask"][:, 0] = False
+    groups, evidence = associate(
+        nodes, frames, GeometryPolicy(partial_view_association=True)
+    )
+    assert groups == [[0], [1]]
+    assert "partial_view_directions" not in evidence["candidate_pairs"][0]
+
+
+def test_partial_fov_preserves_same_frame_scope_constraint():
+    nodes, frames = cropped_plane()
+    nodes.append(dict(nodes[1]))
+    groups, evidence = associate(
+        nodes, frames, GeometryPolicy(partial_view_association=True)
+    )
+    assert not any(1 in group and 2 in group for group in groups)
+    assert (1, 2) in evidence["cannot_link_pairs"]
+
+
+def test_partial_fov_does_not_promote_clipped_part_over_larger_scope():
+    nodes, frames = cropped_plane()
+    larger = nodes[1]["mask"].copy()
+    larger[:, :8] = True
+    nodes.append(node("b", larger, frames["b"]))
+    groups, evidence = associate(
+        nodes, frames, GeometryPolicy(partial_view_association=True)
+    )
+    assert not any(0 in group and 1 in group for group in groups)
+    pair = next(e for e in evidence["candidate_pairs"] if (e["a"], e["b"]) == (0, 1))
+    assert pair["decision"] == "unknown"
+    assert pair["directions"][0]["partial_scope_ambiguous_with"] == [2]
