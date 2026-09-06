@@ -449,3 +449,19 @@ Factory: 128 → 130 кандидатов, 114 → 116 непустых native m
 Stage37 исправляет выбор между допустимыми tracker/completion masks:high-confidence incomplete, прежние identity gates, покрытие≥90% старой маски, ambiguity fallback. Общий Factory result:устройство1252→1731IDs, все старые1252 сохранены, остальные115 memberships точны. Три native views и увеличенное сравнение подтверждают восстановление противоположной чёрной боковины без проводов.
 
 432 decoded mask archives финального input совпали с контролем; повторный lift не нужен. Разные SHA NPZ между runtime объяснены одинаковыми массивами. semantics --retain-stage сохранил65 аннотаций и обновил517 с другим ракурсом; appearance15,57с. Каталог130/116/66. Это сохранение ответов с provenance, не model cache и не semantic acceptance.1375tests/68,34с. Подробности:V12/37_scope_priority/REVIEW_RU.md. Далее автоматический recovery schedule.
+
+## 42. Автоматический recovery выполнен на двух сценах (2026-09-06)
+
+Stage38, код109ea11: scene-profile plan --recovery-groups добавляет семь стадий перед native. Выбор без ручных ID: source/size strata, static-depth support, до64 кандидатов,12 новых RGB и2 timestamp на объект. Отсекаются неразрешённые кадры и чужие tracker/completion proposals. Default остаётся0.1384tests/68,25с; пустая очередь проходит все7 стадий без модели/depth.
+
+Обычные continuations от готовой geometry: Factory909,150с, Knaack462,097с; это не cold raw-scene timing. Factory132кандидата/117масок/68описаний: новые159(126IDs),517(1731),614(366);490 подтверждён в2D, но native пуст.113/114 старых memberships точны,294 теряет2IDs в unassigned. Устройство совпадает со Stage37. Knaack42/37/42:399 получает480IDs/3TS,63 имеет пустойnative; все36старых memberships точны.
+
+Просмотрены native projections и semantic evidence.159 — плоская панель, не доказанный целый шкаф;614 — содержимое чёрного контейнера, не весь контейнер;399 — светлая строительная деталь, concrete не доказан. Автоматический выбор не включает пожарный шкаф634 и не является superset ручного Stage37. Пустые490/63 требуют отдельного диагноза. Rich scope review новых4Factory объектов дал0/4valid и не применён. Отчёт V12/38_automatic_recovery/REVIEW_RU.md.
+
+## 43. Дополнительные scope поля и layout не дали общего улучшения (2026-09-06)
+
+Stage39:8cases/2TS, Factory14/153/159/490/517/614,Knaack63/399.5-field scope:16calls/60,788с; diagram7/8valid,masked8/8valid, но все8masked ответы присвоили surface_region, включая устройство/ленту/трубу. Такой тип нельзя использовать для ownership. Исходные16standard JPEG воспроизведены побайтно.
+
+Две панели CONTEXT+MASKED PHOTO и4поля:8calls/31,364с,8/8valid,1360input tokens. Исправлены окно14 и пол153, но панель490 стала целым industrial cabinet, плоская399 — box. Общего улучшения нет; production defaults и каталоги сохранены. На просмотренных изображениях вырезы159 действительно входят в target, материал399 не установлен. Отчёт V12/39_compact_scope/REVIEW_RU.md.
+
+Дальше: контроль альтернативной VLM на этих же пикселях с учётом прошлых Qwen3.5-9B тестов, диагноз пустыхnative63/490, затем coverage/ranking и ограниченный добор зарегистрированных ракурсов. Physical dimensions остаютсяnull, универсальное качество не заявлено, closed test не открыт. Только Project A.
