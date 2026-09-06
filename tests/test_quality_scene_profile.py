@@ -266,3 +266,90 @@ def test_observed_extent_and_empty_uncertainty_never_certify_physical_size():
     assert (
         geometry_status(None, competing_scopes=set())["observed_obb_available"] is False
     )
+
+
+def test_complementary_union_preserves_tiles_primary_exclusions_and_source_priority(
+    tmp_path,
+):
+    from farm_runtime.quality.scene_profile import union_proposals
+    from farm_runtime.quality.proposal_geometry import read_masks
+    from farm_runtime.proposal_geometry import equivalent_masks
+
+    first, second = batch(tmp_path, "primary"), batch(tmp_path, "supplement")
+    a, b = json.loads(first.read_text()), json.loads(second.read_text())
+    for manifest, doc in [(first, a), (second, b)]:
+        source = Path(doc["observations"][0]["mask_artifact"]["path"])
+        target = manifest.parent / "masks" / source.name
+        target.parent.mkdir()
+        source.rename(target)
+        doc["observations"][0]["mask_artifact"] = describe_file(target)
+    row = a["observations"][0]
+    row.update(timestamp="100", grid_shape_hw=[5, 5], applied_quarter_turns=0)
+    row["detections"] = [
+        dict(
+            index=i,
+            label=label,
+            score=score,
+            logit_key="logits",
+            grid_window_xyxy=[0, 0, 5, 5],
+        )
+        for i, (label, score) in enumerate([("box", 0.55), ("person", 0.6)])
+    ]
+    other = copy.deepcopy(row)
+    other["mask_artifact"] = b["observations"][0]["mask_artifact"]
+    other["detections"] = [dict(row["detections"][0], label="heater", score=0.99)]
+    other["queries"] = []
+    b["observations"] = [other]
+    write(first, a)
+    write(second, b)
+    out = tmp_path / "union"
+    union_proposals(first, [second], out)
+    result = json.loads((out / "manifest.json").read_text())
+    merged = result["observations"][0]
+    assert [d["source_priority"] for d in merged["detections"]] == [0, 0, 1]
+    assert len({d["logit_key"] for d in merged["detections"]}) == 3
+    masks = read_masks(merged, out)
+    assert all(m.all() for m in masks)
+    groups = equivalent_masks(masks, [0.55, 0.6, 0.99], priorities=[0, 0, 1])
+    assert groups[0][0] == 1  # Primary confidence orders primary masks.
+    transient = json.loads((out / "transients.json").read_text())["observations"][0]
+    assert [d["label"] for d in transient["detections"]] == ["person"]
+    assert np.array_equal(read_masks(transient, out)[0], masks[1])
+    assert result["model_scores_calibrated_across_sources"] is False
+    novelty = tmp_path / "novel_union"
+    union_proposals(first, [second], novelty, maximum_primary_iou=0.5)
+    novel = json.loads((novelty / "manifest.json").read_text())
+    assert len(novel["observations"][0]["detections"]) == 2
+    assert len(novel["suppressed_proposals"]) == 1
+    assert novel["suppressed_proposals"][0]["primary_iou"] == 1.0
+    with pytest.raises(ValueError, match="IoU"):
+        union_proposals(
+            first, [second], tmp_path / "invalid_iou", maximum_primary_iou=0
+        )
+    for field, value in [
+        ("timestamp", "different"),
+        ("grid_shape_hw", [10, 10]),
+        ("applied_quarter_turns", 1),
+    ]:
+        changed = copy.deepcopy(b)
+        changed["observations"][0][field] = value
+        write(second, changed)
+        target = tmp_path / ("bad_" + field)
+        with pytest.raises(ValueError, match="identity/grid"):
+            union_proposals(first, [second], target)
+        assert not target.exists()
+
+
+def test_complementary_union_requires_primary_view_and_person_authority(tmp_path):
+    from farm_runtime.quality.scene_profile import union_proposals
+
+    first, second = batch(tmp_path, "primary"), batch(tmp_path, "other")
+    with pytest.raises(ValueError, match="primary observations"):
+        union_proposals(first, [second], tmp_path / "new_views")
+    a, b = json.loads(first.read_text()), json.loads(second.read_text())
+    b["observations"] = copy.deepcopy(a["observations"])
+    write(second, b)
+    a["observations"][0]["queries"] = []
+    write(first, a)
+    with pytest.raises(ValueError, match="person query"):
+        union_proposals(first, [second], tmp_path / "no_exclusions")

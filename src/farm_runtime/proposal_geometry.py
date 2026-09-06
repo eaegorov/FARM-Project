@@ -45,14 +45,21 @@ def mask_overlap(a, b):
     )
 
 
-def equivalent_masks(masks, scores, threshold=0.90):
+def equivalent_masks(masks, scores, threshold=0.90, *, priorities=None):
     """Group near-identical masks; every pair must agree, not only a chain.
 
     The highest scoring representative preserves original pixels. Alternative
     labels are retained by the caller, never used as identity evidence.
     """
+    priorities = [0] * len(masks) if priorities is None else list(priorities)
+    if len(priorities) != len(masks) or any(
+        type(p) is not int or p < 0 for p in priorities
+    ):
+        raise ValueError("one nonnegative source priority per mask required")
     groups = []
-    for index in sorted(range(len(masks)), key=lambda i: (-scores[i], i)):
+    for index in sorted(
+        range(len(masks)), key=lambda i: (priorities[i], -scores[i], i)
+    ):
         for group in groups:
             if all(mask_overlap(masks[index], masks[j])[0] >= threshold for j in group):
                 group.append(index)
@@ -340,9 +347,13 @@ def associate(nodes, frames, policy=GeometryPolicy()):
             for j in indices[offset + 1 :]:
                 iou, ca, cb = mask_overlap(nodes[i]["mask"], nodes[j]["mask"])
                 same_frame_overlaps[i, j] = (iou, ca, cb)
-                if ca >= 0.85 > cb:
+                if ca >= 0.85 > cb and nodes[j].get("source_priority", 0) <= nodes[
+                    i
+                ].get("source_priority", 0):
                     nodes[i]["scope_containers"].append(j)
-                if cb >= 0.85 > ca:
+                if cb >= 0.85 > ca and nodes[i].get("source_priority", 0) <= nodes[
+                    j
+                ].get("source_priority", 0):
                     nodes[j]["scope_containers"].append(i)
     for i, a in enumerate(nodes):
         for j in range(i + 1, len(nodes)):
@@ -374,15 +385,31 @@ def associate(nodes, frames, policy=GeometryPolicy()):
     for edge in matches:
         for source, target in ((edge["a"], edge["b"]), (edge["b"], edge["a"])):
             choices.setdefault((source, nodes[target]["frame"]), []).append(
-                (edge["score"], target)
+                (edge["score"], target, nodes[target].get("source_priority", 0))
             )
     unique = {}
     for key, candidates in choices.items():
-        ranked = sorted(candidates, key=lambda x: (-x[0], x[1]))
+        # A complementary detector cannot displace an available primary match.
+        # Geometry scores still arbitrate within the best available source.
+        priority = min(c[2] for c in candidates)
+        ranked = sorted(
+            (c for c in candidates if c[2] == priority), key=lambda x: (-x[0], x[1])
+        )
         if len(ranked) == 1 or ranked[0][0] - ranked[1][0] >= policy.ambiguity_margin:
             unique[key] = ranked[0][1]
     accepted = []
-    for edge in sorted(matches, key=lambda e: (-e["score"], e["a"], e["b"])):
+    for edge in sorted(
+        matches,
+        key=lambda e: (
+            max(
+                nodes[e["a"]].get("source_priority", 0),
+                nodes[e["b"]].get("source_priority", 0),
+            ),
+            -e["score"],
+            e["a"],
+            e["b"],
+        ),
+    ):
         i, j = edge["a"], edge["b"]
         if (
             unique.get((i, nodes[j]["frame"])) == j

@@ -162,6 +162,129 @@ def merge_proposals(paths, output):
     write_json(output / "transients.json", transients)
 
 
+def union_proposals(primary, supplements, output, *, maximum_primary_iou=None):
+    """Combine complementary detectors on identical pixels, without score fusion.
+
+    Primary near-duplicate masks keep priority. Supplementary detector scores
+    are never interpreted as calibrated probabilities against the primary model.
+    The primary person queries remain the exclusion authority.
+    """
+    from farm_runtime.quality.proposal_geometry import read_masks, read_observations
+
+    if maximum_primary_iou is not None and not 0 < maximum_primary_iou <= 1:
+        raise ValueError("maximum primary IoU must be in (0,1]")
+    from farm_runtime.proposal_geometry import mask_overlap
+
+    paths = [primary, *supplements]
+    if not supplements or len(set(paths)) != len(paths) or output.exists():
+        raise ValueError(
+            "distinct primary/supplement manifests and new output required"
+        )
+    documents, sources = [], []
+    for path in paths:
+        doc, rows = read_observations(path)
+        documents.append(doc)
+        sources.append({r["name"]: r for r in rows})
+    base = sources[0]
+    if any(set(rows) - set(base) for rows in sources[1:]):
+        raise ValueError("supplement views must belong to primary observations")
+    fields = ("timestamp", "source_image", "grid_shape_hw", "applied_quarter_turns")
+    filenames = [Path(name).stem + ".npz" for name in base]
+    if len(set(filenames)) != len(filenames):
+        raise ValueError("ambiguous mask artifact basenames")
+    for name, first in base.items():
+        if not any(q["prompt"] == "person" for q in first["queries"]):
+            raise ValueError("primary view needs an explicit person query")
+        checked_file(first["source_image"])
+        for source in sources:
+            if name in source and any(source[name][k] != first[k] for k in fields):
+                raise ValueError("proposal source identity/grid differs")
+    output.mkdir(parents=True)
+    (output / "masks").mkdir()
+    combined_rows, transient_rows, suppressed = [], [], []
+    for name, first in base.items():
+        arrays, detections, people = {}, [], []
+        primary_masks = read_masks(first, primary.parent)
+        for priority, (path, source) in enumerate(zip(paths, sources)):
+            if name not in source:
+                continue
+            row = source[name]
+            masks = read_masks(row, path.parent)  # Validate finite tiles/grids.
+            with np.load(
+                checked_file(row["mask_artifact"]), allow_pickle=False
+            ) as archive:
+                for index, detection in enumerate(row["detections"]):
+                    if priority and maximum_primary_iou is not None:
+                        overlaps = [
+                            (mask_overlap(masks[index], mask)[0], i)
+                            for i, mask in enumerate(primary_masks)
+                            if first["detections"][i]["label"] != "person"
+                        ]
+                        best, primary_index = max(overlaps, default=(0.0, None))
+                        if best >= maximum_primary_iou:
+                            suppressed.append(
+                                dict(
+                                    name=name,
+                                    source_priority=priority,
+                                    source_detection_index=index,
+                                    primary_detection_index=primary_index,
+                                    primary_iou=best,
+                                    reason="overlapping_primary_proposal",
+                                )
+                            )
+                            continue
+                    key = f"source_{priority:03d}_mask_{index:04d}"
+                    arrays[key] = archive[detection["logit_key"]].copy()
+                    entry = dict(
+                        detection,
+                        index=len(detections),
+                        logit_key=key,
+                        source_priority=priority,
+                        source_detection_index=index,
+                        source_logit_semantics=row.get("logit_semantics"),
+                    )
+                    detections.append(entry)
+                    if priority == 0 and detection["label"] == "person":
+                        people.append(entry)
+        target = output / "masks" / (Path(name).stem + ".npz")
+        np.savez_compressed(target, **arrays)
+        row = dict(
+            first,
+            detections=detections,
+            mask_artifact=describe_file(target),
+            logit_semantics="Uncalibrated per-source logits; >0 foreground; see source manifests.",
+        )
+        combined_rows.append(row)
+        transient_rows.append(
+            dict(
+                row,
+                detections=people,
+                queries=[q for q in first["queries"] if q["prompt"] == "person"],
+            )
+        )
+    common = dict(
+        schema="farm.complementary-proposals.v1",
+        source_manifests=[describe_file(p) for p in paths],
+        policy="Primary source first; confidence ranks only within a source; duplicate geometry masks preserve primary priority.",
+        observations=combined_rows,
+        test_opened=False,
+        release_eligible=False,
+        source_image_encoder_calls=0,
+        source_observation_count=sum(len(rows) for rows in sources),
+        maximum_primary_iou=maximum_primary_iou,
+        suppressed_proposals=suppressed,
+        model_scores_calibrated_across_sources=False,
+        primary_transients_preserved=True,
+    )
+    write_json(output / "manifest.json", common)
+    write_json(
+        output / "transients.json",
+        dict(
+            common, observations=transient_rows, role="primary person-only exclusions"
+        ),
+    )
+
+
 def segment(args):
     from farm_runtime.quality import concept_discovery
 
@@ -743,6 +866,9 @@ def main(argv=None):
     command("vocabulary", ["scene", "core"])
     q = command("merge")
     q.add_argument("--source", type=Path, action="append", required=True)
+    q = command("union", ["primary"])
+    q.add_argument("--supplement", type=Path, action="append", required=True)
+    q.add_argument("--max-primary-iou", type=float, default=None)
     q = command("segment", ["plan", "vocabulary", "model"])
     q.add_argument("--views", type=int, required=True)
     q.add_argument("--world-up", type=float, nargs=3, required=True)
@@ -780,6 +906,13 @@ def main(argv=None):
         union_vocabulary(args.scene, args.core, args.output)
     elif args.phase == "merge":
         merge_proposals(args.source, args.output)
+    elif args.phase == "union":
+        union_proposals(
+            args.primary,
+            args.supplement,
+            args.output,
+            maximum_primary_iou=args.max_primary_iou,
+        )
     elif args.phase == "segment":
         segment(args)
     elif args.phase == "native":

@@ -225,3 +225,63 @@ def test_partial_fov_does_not_promote_clipped_part_over_larger_scope():
     pair = next(e for e in evidence["candidate_pairs"] if (e["a"], e["b"]) == (0, 1))
     assert pair["decision"] == "unknown"
     assert pair["directions"][0]["partial_scope_ambiguous_with"] == [2]
+
+
+def test_detector_priority_keeps_primary_pixels_without_cross_model_score_comparison():
+    primary = np.zeros((10, 10), bool)
+    primary[1:9, 1:9] = True
+    supplement = primary.copy()
+    supplement[1, 1] = False
+    assert equivalent_masks([primary, supplement], [0.55, 0.99])[0][0] == 1
+    assert equivalent_masks([primary, supplement], [0.55, 0.99], priorities=[0, 1]) == [
+        [0, 1]
+    ]
+
+
+def test_complementary_mask_cannot_steal_an_existing_primary_correspondence():
+    f = scene()
+    mask = np.zeros((40, 40), bool)
+    mask[10:30, 10:30] = True
+    larger = np.zeros_like(mask)
+    larger[8:32, 8:32] = True
+    nodes = [node("a", mask, f), node("b", mask, f), node("b", larger, f)]
+    nodes[2]["source_priority"] = 1
+    groups, _ = associate(nodes, {"a": f, "b": f})
+    assert groups == [[0, 1], [2]]
+
+
+def test_lower_priority_container_does_not_disable_primary_partial_evidence():
+    nodes, frames = cropped_plane()
+    larger = nodes[1]["mask"].copy()
+    larger[:, :8] = True
+    nodes.append(dict(node("b", larger, frames["b"]), source_priority=1))
+    groups, evidence = associate(
+        nodes, frames, GeometryPolicy(partial_view_association=True)
+    )
+    assert groups == [[0, 1], [2]]
+    pair = next(e for e in evidence["candidate_pairs"] if (e["a"], e["b"]) == (0, 1))
+    assert pair["reason"] == "partial_view_surface_support"
+
+
+def test_complementary_edges_cannot_block_an_existing_primary_component(monkeypatch):
+    f = scene()
+    mask = np.zeros((40, 40), bool)
+    mask[10:30, 10:30] = True
+    nodes = [node(name, mask, f) for name in ("a", "b", "c", "c")]
+    for i, n in enumerate(nodes):
+        n["fixture_id"] = i
+        n["source_priority"] = int(i >= 2)
+    scores = {(0, 1): 0.6, (0, 2): 0.9, (1, 3): 0.8}
+
+    def compare(a, b, frames, policy):
+        score = scores.get((a["fixture_id"], b["fixture_id"]))
+        return dict(
+            decision="match" if score else "unknown",
+            reason="mutual_surface_support" if score else "disjoint_surface_bounds",
+            score=score or 0,
+        )
+
+    monkeypatch.setattr("farm_runtime.proposal_geometry.compare_surfaces", compare)
+    groups, _ = associate(nodes, {name: f for name in ("a", "b", "c")})
+    assert any(0 in g and 1 in g and 2 in g for g in groups)
+    assert not any(2 in g and 3 in g for g in groups)

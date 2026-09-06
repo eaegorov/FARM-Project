@@ -123,3 +123,10 @@ quality release.
 Проверенные18-stage прогоны из snapshot4784c3d: Knaack10:39, Factory17:25 после готового registered RGBD. Это wall time данного development run, без model download/raw ingress; budgets ограничивают полноту. Подробный аудит — V12/21_refined_profile/REVIEW_RU.md.
 
 Экспериментальный `quality proposal-geometry --partial-view-association` предназначен для отдельного geometry ablation. Общий scene profile пока не включает его: положительный poster followup проверен, но whole/part ambiguity и broader quality gates остаются. См. V12/23_partial_view_association/REVIEW_RU.md.
+
+Дополнительные экспериментальные stages:
+
+- `quality scene-profile union --primary SAM_MANIFEST --supplement OTHER_MANIFEST --max-primary-iou 0.5 --output NEW_DIR` объединяет предложения на одинаковых зарегистрированных RGB. Первичный источник сохраняет приоритет и person exclusions; logits разных моделей не калибруются друг против друга. Без threshold сохраняются все proposals, что в Factory ухудшало association.
+- `quality surface-tracker --audit SURFACE_AUDIT --proposals EXTRA_SAM_MANIFEST --validation FAILED_VALIDATION --model SAM_DIR --crop-budget 12 --output NEW_DIR` предлагает masks по проекции видимой поверхности в локальные RGB. `--validation` необязателен; с ним обрабатываются только unresolved matches. Выход передаётся как `--supplement` в `quality surface-validation`, затем принятые observations — в `native-observations`.
+
+Эти stages ещё не включены автоматически в18-stage scene profile. Они решают пропуски observations, но не гарантируют полноту физического объекта. Factory unit восстановлен в3timestamps, однако его основание частично отсутствует; fire cabinet depth support недостаточен для целой маски. Не принимать build-mask IoU или model score за whole-object acceptance. Подробности и runtime — V12/24_complementary_discovery/REVIEW_RU.md.

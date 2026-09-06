@@ -219,7 +219,10 @@ def main(argv=None):
         )
         masks = read_masks(obs, args.proposals.parent)
         equivalents = equivalent_masks(
-            masks, [d["score"] for d in obs["detections"]], policy.duplicate_iou
+            masks,
+            [d["score"] for d in obs["detections"]],
+            policy.duplicate_iou,
+            priorities=[d.get("source_priority", 0) for d in obs["detections"]],
         )
         valid = stable_depth(depth, policy)
         frame_rows.append(
@@ -252,6 +255,9 @@ def main(argv=None):
             ):
                 rejected.append(dict(**row, reason="insufficient_static_surface"))
                 continue
+            detection = obs["detections"][representative]
+            if "source_priority" in detection:
+                row["source_priority"] = detection["source_priority"]
             row["id"] = len(nodes)
             node_rows.append(row)
             nodes.append(dict(**row, mask=mask, points=points))
