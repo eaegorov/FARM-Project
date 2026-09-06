@@ -9,6 +9,7 @@ ACTIONS = {
     "scene-catalog": "scene_catalog",
     "scene-vocabulary": "scene_vocabulary",
     "concept-discovery": "concept_discovery",
+    "complementary-discovery": "complementary_discovery",
     "discovery-coverage": "discovery_coverage",
     "proposal-geometry": "proposal_geometry",
     "scope-evidence": "scope_evidence",

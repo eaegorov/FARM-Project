@@ -91,6 +91,30 @@ def test_profile_compiles_into_existing_dag_with_explicit_budgets_and_runtimes(
             assert "--reuse-proposals" in stage["command"]
             assert str(args.refinement_reuse[0]) in stage["fingerprint_inputs"]
     assert len(cached["stages"]) == 18
+    args.partial_view_association = True
+    args.complementary_model_root = tmp_path / "models"
+    write(plan_path, compile_plan(args))
+    complete = plan_to_public_dict(load_plan(plan_path), tmp_path / "complete")
+    by_id = {s["id"]: s for s in complete["stages"]}
+    assert len(complete["stages"]) == 20
+    for name in ("initial_geometry", "geometry"):
+        assert "--partial-view-association" in by_id[name]["command"]
+    command = by_id["geometry"]["command"]
+    assert command[command.index("--proposals") + 1].endswith(
+        "/complementary_proposals/manifest.json"
+    )
+    assert by_id["geometry"]["needs"] == ["complementary_proposals"]
+    assert by_id["complementary_proposals"]["needs"] == ["complementary_segmentation"]
+    assert (
+        str(args.complementary_model_root)
+        in by_id["complementary_segmentation"]["fingerprint_inputs"]
+    )
+    assert "--max-primary-iou" in by_id["complementary_proposals"]["command"]
+    args.complementary_model_root = None
+    args.complementary_vocabulary = tmp_path / "vocabulary.txt"
+    with pytest.raises(ValueError, match="model root"):
+        compile_plan(args)
+    args.complementary_vocabulary = None
     args.refinement_crops = 33
     with pytest.raises(ValueError, match="budget"):
         compile_plan(args)

@@ -308,7 +308,9 @@ def infer(plan, output, *, model_root, vocabulary, world_up):
             rgb = rotate_image(rgb, turns)
             rh, rw = rgb.shape[:2]
             size = variant["resolution"]
-            scale = min(1.0, size / max(rh, rw))
+            scale = size / max(rh, rw)
+            if not variant.get("allow_upscale", False):
+                scale = min(1.0, scale)
             small = np.asarray(
                 Image.fromarray(rgb).resize(
                     (round(rw * scale), round(rh * scale)), Image.Resampling.BILINEAR
@@ -441,10 +443,18 @@ def infer(plan, output, *, model_root, vocabulary, world_up):
         write_json(dest / "predictions.json", summary)
         canvas.save(dest / "overview.jpg", quality=90)
         results.append({k: v for k, v in summary.items() if k != "observations"})
+    from ultralytics.nn.text_model import _resolve_mobileclip_checkpoint
+
     report = {
         "schema": "farm.discovery-ablation-results.v1",
         "plan_sha256": json_digest(plan),
         "model": describe_file(model_root / "yoloe/yoloe-v8l-seg-pf.pt"),
+        "model_components": {
+            "vocabulary_head_checkpoint": describe_file(segmenter._base_ckpt),
+            "text_encoder_checkpoint": describe_file(
+                _resolve_mobileclip_checkpoint("blt")
+            ),
+        },
         "vocabulary": describe_file(vocabulary),
         "setup_seconds": setup_seconds,
         "setup_peak_allocated_mib": setup_peak_allocated_mib,

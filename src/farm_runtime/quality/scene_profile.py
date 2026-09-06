@@ -633,6 +633,11 @@ def semantics(args):
 
 def compile_plan(args):
     """Return a normal FARM DAG; no additional execution framework."""
+    complementary_root = getattr(args, "complementary_model_root", None)
+    complementary_vocabulary = getattr(args, "complementary_vocabulary", None)
+    partial_view = getattr(args, "partial_view_association", False)
+    if complementary_vocabulary and not complementary_root:
+        raise ValueError("complementary vocabulary requires a model root")
     crop_budget = getattr(args, "refinement_crops", 0)
     if type(crop_budget) is not int or not 0 <= crop_budget <= 32:
         raise ValueError("refinement crop budget must be in 0..32")
@@ -795,6 +800,7 @@ def compile_plan(args):
                 args.rgbd,
                 "--transients",
                 f"{q}/{proposals}/transients.json",
+                *(["--partial-view-association"] if partial_view else []),
                 "--output",
                 f"{q}/{name}",
             ],
@@ -829,7 +835,47 @@ def compile_plan(args):
             f"{q}/adaptive_segmentation/manifest.json",
         ],
     )
-    geometry("geometry", "combined_proposals")
+    final_proposals = "combined_proposals"
+    if complementary_root:
+        vocabulary = complementary_vocabulary or f"{root}/configs/yoloe_vocabulary.txt"
+        primary = f"{q}/combined_proposals/manifest.json"
+        supplement = f"{q}/complementary_segmentation/yoloe/manifest.json"
+        add(
+            "complementary_segmentation",
+            "complementary-discovery",
+            [
+                "--primary",
+                primary,
+                "--model-root",
+                complementary_root,
+                "--vocabulary",
+                vocabulary,
+                *up_args,
+                "--output",
+                f"{q}/complementary_segmentation",
+            ],
+            supplement,
+            [primary, vocabulary, complementary_root],
+        )
+        final_proposals = "complementary_proposals"
+        add(
+            final_proposals,
+            "scene-profile",
+            [
+                "union",
+                "--primary",
+                primary,
+                "--supplement",
+                supplement,
+                "--max-primary-iou",
+                0.5,
+                "--output",
+                f"{q}/{final_proposals}",
+            ],
+            f"{q}/{final_proposals}/manifest.json",
+            [primary, supplement],
+        )
+    geometry("geometry", final_proposals)
     add(
         "native",
         "scene-profile",
@@ -1045,6 +1091,22 @@ def main(argv=None):
     )
     q.add_argument("--runtimes", type=Path)
     q.add_argument("--scene-id", required=True)
+    q.add_argument(
+        "--partial-view-association",
+        action="store_true",
+        help="Use co-visible surface agreement for observations clipped by the image boundary",
+    )
+    q.add_argument(
+        "--complementary-model-root",
+        type=Path,
+        help="Opt in to YOLOE supplements on the same selected RGB; runtime model root must match",
+    )
+    q.add_argument(
+        "--complementary-vocabulary",
+        type=Path,
+        help="YOLOE vocabulary; defaults to the repository YOLOE vocabulary",
+    )
+
     q.add_argument("--world-up", type=float, nargs=3, required=True)
     for field, value in dict(
         refinement_crops=0,

@@ -166,3 +166,13 @@ Validation должна связывать тот же audit/base proposals и �
 Модели загружаются один раз на этап. Empty/unresolved очередь обходится без весов; при complete/uncertain ответе SAM не запускается. V12/30_scope_completion:unit2RGB17,81с, все12logits точны кпрототипу; complete cabinet8,08с/0SAM calls. Это отдельный opt-in этап; глобальный recovery budget в scene-profile ещё не реализован.
 
 Для повторной обработки можно передать `scene-profile plan --refinement-reuse /absolute/old_proposals/manifest.json` (флаг повторяемый). Он попадает в оба SAM refinement stages, каждый использует только совместимый backend/model/preprocessing contract. Standalone: `quality refinement sam --reuse-proposals MANIFEST`. Crop/seed/RGB/grid/orientation/queries обязаны совпасть; старый native selection не переносится. Текущие OTHER-timestamp votes пересчитываются штатно. Старые manifests без fingerprint обрабатываются обычным inference. V12/31_refinement_reuse:14Knaack candidates точны, повтор двухэтапного CPU запроса13,71→5,33с после устранения eager captioning imports; это не scene-wide speedup.
+
+## Частичная видимость и дополнительные предложения
+
+`--partial-view-association` включает co-visible surface policy в initial и final geometry. Согласованные наблюдения, обрезанные границей кадра, могут объединяться при сохранении проверок вложенности и отрицательных свидетельств. Флаг может изменить adaptive sampling и пока включается явно.
+
+`--complementary-model-root /absolute/models` добавляет два этапа после combined SAM proposals: `complementary-discovery` на тех же RGB и `scene-profile union --max-primary-iou 0.5`. С refinement получается 20 этапов, без него — 15. Root содержит YOLOE/MobileCLIP и соответствует runtime model root. `--complementary-vocabulary` задаёт словарь YOLOE; по умолчанию используется `configs/yoloe_vocabulary.txt`.
+
+Дополнительные маски с IoU ≥ 0,5 к основной маске исключаются. Сохраняются приоритет основной геометрической ассоциации и person exclusions от SAM. Оценки уверенности разных детекторов не смешиваются. Максимум — 48 уже выбранных RGB; новые снимки этап не открывает. Подтверждение группы в нескольких ракурсах ещё не доказывает полноту объекта или правильность его названия.
+
+На фиксированных снимках Factory результат точно совпал с прежним pilot; Knaack сохранил основные группы и подтвердил ещё одну. Её проверка выявила неполноту тонких элементов и недоказанный материал в VLM-описании. Время полного профиля и полнота сцены требуют следующего контроля.

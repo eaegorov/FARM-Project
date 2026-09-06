@@ -413,3 +413,13 @@ Knaack balanced scheduling не снял ambiguity88/image8. Все14candidates 
 ## 35. Reuse SAM и лёгкие geometry imports
 
 `refinement sam --reuse-proposals` и `scene-profile plan --refinement-reuse` связывают cache с actual crop/seed/model/processor/code/library fingerprints. Идентичные запросы выполняются без моделей/CUDA, но native scoring использует текущие observations. Все14Knaack candidates и selector metrics совпали с Stage29. Eager services/worker imports в captioning package заменены lazy public API; geometry/evidence helpers не загружают inference libraries. CPU replay двух SAM stages13,71→5,33с,1320tests/65,68с. V12/31_refinement_reuse/REVIEW_RU.md; полный scene timing требует отдельного прогона.
+
+## 36. Полный Knaack regression после Stage31
+
+Все 18 этапов прошли за 581,934 с от готового registered RGBD. Состав 36 основных масок, все 43 666 назначений гауссиан и timestamp support точно совпали со Stage21. Различия confidence не превышают 1,8e-7, размеров OBB — 2,7e-8 м. Совпали 40 labels/captions и 161 appearance/native image; в каждом SAM backend использован один cache hit. Прежние семантические ошибки остались. Отчёт: V12/32_common_regression/REVIEW_RU.md; исследовательские выводы: RESEARCH_UPDATE_RU.md рядом.
+
+## 37. Дополнительные предложения в общем профиле
+
+Флаги `--partial-view-association --complementary-model-root PATH` включают 20 этапов с refinement, сохраняя бюджет RGB. После adaptive SAM выполняются YOLOE и объединение с приоритетом основного источника и порогом IoU 0,5. Проверяются RGB, сетка, ориентация и checkpoint; поддержаны небольшие исходные изображения и пустая cohort. Записываются фактические веса словарных голов и MobileCLIP.
+
+На Factory совпали все 148 массивов масок, 1063 nodes, 699 groups, 192 multi-timestamp groups и 192 обзорных изображения со Stage24. На Knaack получены 114 предложений, сохранены 652 основных узла и 599 их групп; подтверждена ещё одна группа. Её 368 native IDs и пять новых изображений проверены: тонкие опоры неполны, две оси OBB чувствительны к хвостам, название Qwen `concrete slab` не принято как подтверждённый материал. Прошли 1330 тестов за 65,28 с. Следующий контроль — полный Factory run: initial partial-view association может изменить выбор дополнительных снимков. Отчёт: V12/33_complementary_profile/REVIEW_RU.md.
