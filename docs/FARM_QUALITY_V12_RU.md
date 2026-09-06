@@ -1,7 +1,7 @@
 # FARM V12: воспроизводимость и независимая оценка качества
 
 Документ содержит инфраструктуру F0/F1 и обновление реализации FARM от 2026-09-05.
-Текущий отчёт и изображения: `output/farm_pipeline/factory/experiments/factory-universal-v12-quality-v1/27_recovery_transfer/REVIEW_RU.md` относительно `3dgs_work`.
+Текущий отчёт и изображения: `output/farm_pipeline/factory/experiments/factory-universal-v12-quality-v1/28_scope_propagation/REVIEW_RU.md` относительно `3dgs_work`.
 Реализованы rig-preserving RGB↔3DGS registration, angular/upright discovery ablation,
 расширение exact-lift кандидатов по build surface, native-support OBB и финальный CSR allowlist export.
 Шесть объектов имеют проверяемые masks/labels/captions/scope. Универсальная точность,
@@ -398,3 +398,8 @@ V12/26_camera_completion/REVIEW_RU.md: новый camera-completion выбира
 Stage27показал, что1387/1393corroborated points могут описывать лишь неполную светлую часть unit. Ещё2готовых RGBD views и projection-tracker повторяют ошибку;YOLOE не обнаруживает unit. Targeted VLM bbox с сохранением уже подтверждённого bbox дал2полные SAM masks, принятые существующим geometry validator. Варианты с VLM point на стене не выбраны. Native5timestamps/2087IDs восстанавливает чёрную грань на всех5просмотренных projections; новые whole-mask build references IoU0,67629→0,91737,recall0,70816→0,97026. Это не independent gold, старые2D references неполны. VLM completion остаётся experiment, default не меняется.
 
 Штатные semantics/catalog используют обновлённые masks:unit `wall-mounted device`, fire cabinet `fire hose box`. Каталоги V12/27_recovery_transfer/catalog_v1 и26_camera_completion/catalog_v1; observed OBB, physical-size unknown. Далее распространение полного scope на старые2D masks и Knaack; общий recovery budget в DAG пока не включён.
+
+
+## 33. Полный scope перенесён в старые2D masks
+
+V12/28_scope_propagation/REVIEW_RU.md. `refinement-schedule --balance-error-modes` резервирует второй crop объекта для другого типа foreground/background ошибки, сохраняя бюджет и defaults. В общем18-stage профиле доступно `--balance-refinement-errors`. Unit:вместо000348+004192 выбраны000348+003285; две tracker замены приняты прежними other-timestamp gates. Чёрная грань появилась в старой2D маске, native2041IDs/5TS сохраняет полноту. Все5reverse comparisons просмотрены; изменения3D metrics малы и не трактуются как independent accuracy. Semantic sheets/ответ совпали с Stage27, итоговый catalog в28_scope_propagation/catalog_v1.1288tests/64,41с. ReplayFactory6crops не меняет, Knaack заменяет1из12; новый Knaack crop требует проверки.

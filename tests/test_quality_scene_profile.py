@@ -75,6 +75,13 @@ def test_profile_compiles_into_existing_dag_with_explicit_budgets_and_runtimes(
     for name in ("appearance", "catalog"):
         cmd = by_id[name]["command"]
         assert cmd[cmd.index("--native") + 1].endswith("/refined_native/manifest.json")
+    assert "--balance-error-modes" not in by_id["refinement_schedule"]["command"]
+    args.balance_refinement_errors = True
+    write(plan_path, compile_plan(args))
+    balanced = plan_to_public_dict(load_plan(plan_path), tmp_path / "balanced_run")
+    schedule = next(s for s in balanced["stages"] if s["id"] == "refinement_schedule")
+    assert "--balance-error-modes" in schedule["command"]
+    assert len(balanced["stages"]) == 18
     args.refinement_crops = 33
     with pytest.raises(ValueError, match="budget"):
         compile_plan(args)

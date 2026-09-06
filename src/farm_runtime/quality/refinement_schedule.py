@@ -25,7 +25,7 @@ from tools.farm_shaper_bridge import gaussian_lift as lift
 from tools.farm_shaper_bridge.common import open_graphdeco_ply
 
 
-def select_observations(rows, budget, per_object=2):
+def select_observations(rows, budget, per_object=2, *, balance_error_modes=False):
     """Prioritize actual contradictions, with object diversity and one vote per TS."""
     if type(budget) is not int or not 1 <= budget <= 32:
         raise ValueError("crop budget must be in 1..32")
@@ -65,6 +65,33 @@ def select_observations(rows, budget, per_object=2):
             if row["timestamp"] not in timestamps:
                 queue.append(row)
                 timestamps.add(row["timestamp"])
+        if balance_error_modes and per_object >= 2 and len(queue) > 1:
+
+            def modes(row):
+                metrics = row["metrics"]
+                return {
+                    name
+                    for name, present in (
+                        (
+                            "foreground_deficit",
+                            metrics["foreground_recall"]
+                            < POLICY["minimum_foreground_recall"],
+                        ),
+                        (
+                            "background_contamination",
+                            metrics["background_fraction"]
+                            > POLICY["maximum_background_fraction"],
+                        ),
+                    )
+                    if present
+                }
+
+            covered = modes(queue[0])
+            alternative = next(
+                (i for i, row in enumerate(queue[1:], 1) if modes(row) - covered), None
+            )
+            if alternative is not None:
+                queue.insert(1, queue.pop(alternative))
         queues[oid] = queue[:per_object]
     selected = []
     for rank in range(per_object):
@@ -97,6 +124,11 @@ def main(argv=None):
     p.add_argument("--world-up", type=float, nargs=3, required=True)
     p.add_argument("--crop-budget", type=int, default=12)
     p.add_argument("--crops-per-object", type=int, default=2)
+    p.add_argument(
+        "--balance-error-modes",
+        action="store_true",
+        help="Reserve a second object crop for another foreground/background failure mode when available",
+    )
     args = p.parse_args(argv)
     select_observations([], args.crop_budget, args.crops_per_object)
     up = np.asarray(args.world_up, float)
@@ -198,7 +230,12 @@ def main(argv=None):
                 )
                 diagnostics.append(row)
                 maps[oid, frame.image_id] = (raw, mass, frame_record, excluded)
-    selected = select_observations(diagnostics, args.crop_budget, args.crops_per_object)
+    selected = select_observations(
+        diagnostics,
+        args.crop_budget,
+        args.crops_per_object,
+        balance_error_modes=args.balance_error_modes,
+    )
     rows = []
     for item in selected:
         oid, image_id = item["object_id"], item["image_id"]
@@ -287,6 +324,7 @@ def main(argv=None):
             policy=POLICY,
             crop_budget=args.crop_budget,
             crops_per_object=args.crops_per_object,
+            balance_error_modes=args.balance_error_modes,
             eligible_object_ids=sorted(wanted),
             diagnostics=diagnostics,
             selected=selected,

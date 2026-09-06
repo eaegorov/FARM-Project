@@ -82,3 +82,35 @@ def test_scheduler_uses_attainable_gain_when_recall_and_background_pass_absolute
     result = select_observations([observation], 12)
     assert len(result) == 1
     assert result[0]["priority"] > 0.13
+
+
+def test_balanced_mode_preserves_a_foreground_deficit_with_same_crop_budget():
+    rows = [
+        row(0, 0, "a", recall=0.999, background=0.15),
+        row(0, 1, "b", recall=0.94, background=0.1),
+        row(0, 2, "c", recall=0.895, background=0.02),
+    ]
+    assert [r["image_id"] for r in select_observations(rows, 2)] == [0, 1]
+    selected = select_observations(rows, 2, balance_error_modes=True)
+    assert [r["image_id"] for r in selected] == [0, 2]
+    assert selected == select_observations(
+        list(reversed(rows)), 2, balance_error_modes=True
+    )
+    assert select_observations(
+        rows, 1, balance_error_modes=True
+    ) == select_observations(rows, 1)
+
+
+def test_balanced_modes_keep_timestamp_and_global_object_diversity():
+    rows = [
+        row(0, 0, "a", recall=0.99, background=0.2),
+        row(0, 1, "a", recall=0.89, background=0.02),
+        row(0, 2, "b", recall=0.89, background=0.02),
+        row(1, 3, "c", recall=0.88, background=0.02),
+    ]
+    selected = select_observations(rows, 3, balance_error_modes=True)
+    assert [(r["object_id"], r["image_id"]) for r in selected] == [
+        (0, 0),
+        (1, 3),
+        (0, 2),
+    ]

@@ -865,6 +865,11 @@ def compile_plan(args):
                 final_native,
                 "--crop-budget",
                 crop_budget,
+                *(
+                    ["--balance-error-modes"]
+                    if getattr(args, "balance_refinement_errors", False)
+                    else []
+                ),
                 *up_args,
                 "--output",
                 schedule,
@@ -1043,6 +1048,11 @@ def main(argv=None):
         alternatives=16,
     ).items():
         q.add_argument("--" + field.replace("_", "-"), type=int, default=value)
+    q.add_argument(
+        "--balance-refinement-errors",
+        action="store_true",
+        help="Opt in to foreground/background error diversity within the existing crop budget",
+    )
     args = p.parse_args(argv)
     if args.output.exists():
         raise ValueError("new output required")

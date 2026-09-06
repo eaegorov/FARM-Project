@@ -145,3 +145,6 @@ quality release.
 
 
 Для следующей итерации recovery: `quality scene-profile cohort --validation VALIDATION --group-id ID --output NEW_DIR`. Выходы `manifest.json` и `transients.json` можно передать в `proposal-geometry` на том же зарегистрированном RGBD, затем снова в `surface-evidence`. Исходные и дополнительные accepted masks/person exclusions сохраняются без inference и без изменения logits. Новое group-ID namespace нужно читать из geometry результата: не переносите старый integer ID без проверки provenance. Требуются хотя бы2timestamps, accepted geometry selection и неизменённые source artifacts. Unit replay проверен на полном совпадении1252Gaussian IDs. VLM completeness/bbox pilot Stage27 пока не встроен в scene-profile.
+
+
+При включённом refinement можно добавить `scene-profile plan --balance-refinement-errors`: второй crop одного объекта, если он доступен в том же бюджете, выбирается по другому типу ошибки (foreground deficit/background contamination). Standalone эквивалент: `refinement-schedule --balance-error-modes`. Default и18-stage структура сохранены. Опция протестирована на переносе полной маски unit в старый ракурс; это не замена gates и не увеличение crop budget. Knaack replay меняет1из12crop requests, полноценная проверка этого изменения ещё нужна.
