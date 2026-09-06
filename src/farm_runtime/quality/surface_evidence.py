@@ -125,7 +125,7 @@ class SurfaceInputs:
         return members, points, timestamps, radii
 
 
-def rank_views(points, core, existing_timestamps, inputs, limit):
+def rank_views(points, core, existing_timestamps, inputs, limit, allowed_names=None):
     """Prioritize visible disconnected support while retaining object context.
 
     This geometric ranking precedes transient segmentation. It never casts
@@ -138,6 +138,8 @@ def rank_views(points, core, existing_timestamps, inputs, limit):
         priority = np.ones(len(points))
     candidates = []
     for name, row in inputs.frames.items():
+        if allowed_names is not None and name not in allowed_names:
+            continue  # Restrict before reading depth, not after ranking.
         if str(row["frame_id"]) in existing_timestamps:
             continue
         frame = inputs.frame(name)
@@ -200,7 +202,15 @@ def rank_views(points, core, existing_timestamps, inputs, limit):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--geometry", type=Path, required=True)
-    parser.add_argument("--group-id", type=int, action="append", required=True)
+    selection = parser.add_mutually_exclusive_group(required=True)
+    selection.add_argument("--group-id", type=int, action="append")
+    selection.add_argument(
+        "--auto-groups",
+        type=int,
+        help="Select up to 16 unconfirmed single-timestamp groups",
+    )
+    parser.add_argument("--candidate-budget", type=int, default=64)
+    parser.add_argument("--view-budget", type=int, default=12)
     parser.add_argument("--plan", type=Path, required=True)
     parser.add_argument("--extra-views", type=int, default=2)
     parser.add_argument("--output", type=Path, required=True)
@@ -209,17 +219,47 @@ def main(argv=None):
         raise ValueError(
             "new output and one to four extra timestamps per group required"
         )
+    if args.auto_groups is not None and (
+        not 1 <= args.auto_groups <= 16
+        or not args.auto_groups <= args.candidate_budget <= 128
+        or not 1 <= args.view_budget <= 24
+    ):
+        raise ValueError(
+            "recovery budgets: groups1..16, candidates>=groups up to128, views1..24"
+        )
     plan = json.loads(args.plan.read_text())
     if plan.get("test_opened") is not False:
         raise ValueError("development-only sampling plan required")
     started = time.monotonic()
     inputs = SurfaceInputs(args.geometry)
     by_id = {g["id"]: g for g in inputs.geometry["groups"]}
-    if not set(args.group_id) <= by_id.keys():
+    from farm_runtime.quality.recovery_schedule import (
+        recovery_candidates,
+        budgeted_views,
+    )
+
+    automatic = args.auto_groups is not None
+    candidate_rows, available = (
+        recovery_candidates(
+            inputs.geometry, args.candidate_budget, set(plan["sources"])
+        )
+        if automatic
+        else ([], None)
+    )
+    group_ids = [r["group_id"] for r in candidate_rows] if automatic else args.group_id
+    if not set(group_ids) <= by_id.keys():
         raise ValueError("unknown group ID")
+    for gid in group_ids:
+        if any(
+            inputs.nodes[i]["frame"] not in plan["sources"]
+            for i in by_id[gid]["members"]
+        ):
+            raise ValueError("source group outside development plan")
     args.output.mkdir(parents=True)
-    rows, arrays, names, prompts = [], {}, [], []
-    for group_id in dict.fromkeys(args.group_id):
+    rows, arrays, names, prompts, screened = [], {}, [], [], []
+    for group_id in dict.fromkeys(group_ids):
+        if automatic and len(rows) >= args.auto_groups:
+            break
         group = by_id[group_id]
         members, points, timestamps, radii = inputs.support(group)
         labels, components = surface_components(points, timestamps, radii)
@@ -236,8 +276,33 @@ def main(argv=None):
         counts = aggregate_timestamps(observations, len(points), timestamps)
         core = counts["corroborated"] | (labels == components[0]["id"])
         candidates, selected = rank_views(
-            points, core, set(timestamps), inputs, args.extra_views
+            points,
+            core,
+            set(timestamps),
+            inputs,
+            args.extra_views,
+            allowed_names=set(plan["sources"]),
         )
+        if automatic:
+            kept = budgeted_views(selected, names, args.view_budget)
+            screened.append(
+                dict(
+                    group_id=group_id,
+                    selected_views=kept,
+                    reason=(
+                        "scheduled"
+                        if kept
+                        else (
+                            "view_budget"
+                            if selected
+                            else "no_depth_visible_new_timestamp"
+                        )
+                    ),
+                )
+            )
+            selected = kept
+            if not selected:
+                continue
         for name in [r["name"] for r in selected]:
             if name not in plan["sources"]:
                 raise ValueError("selected registered view not in development plan")
@@ -311,6 +376,23 @@ def main(argv=None):
             point_evidence=describe_file(args.output / "point_evidence.npz"),
             adaptive_plan=describe_file(args.output / "plan.json"),
             concepts=describe_file(args.output / "concepts.txt"),
+            recovery_schedule=(
+                dict(
+                    policy="Single-timestamp; source/relative-size thirds round robin, static depth support descending; then registered visibility",
+                    group_budget=args.auto_groups,
+                    candidate_budget=args.candidate_budget,
+                    view_budget=args.view_budget,
+                    eligible_single_timestamp_groups=available,
+                    candidates=candidate_rows,
+                    screened=screened,
+                    selected_group_ids=[r["group_id"] for r in rows],
+                    selected_unique_rgb=len(names),
+                    source_semantics_used=False,
+                    segmentation_calls=0,
+                )
+                if automatic
+                else None
+            ),
             total_seconds=time.monotonic() - started,
             closed_test_opened=False,
             native_gaussian_ownership_changed=False,

@@ -114,6 +114,32 @@ def test_profile_compiles_into_existing_dag_with_explicit_budgets_and_runtimes(
     ):
         assert str(args.complementary_model_root / checkpoint) in fingerprints
     assert "--max-primary-iou" in by_id["complementary_proposals"]["command"]
+    args.recovery_groups = 8
+    write(plan_path, compile_plan(args))
+    recovery = plan_to_public_dict(load_plan(plan_path), tmp_path / "recovery")
+    by_id = {s["id"]: s for s in recovery["stages"]}
+    assert len(recovery["stages"]) == 27
+    assert by_id["recovery_views"]["needs"] == ["geometry"]
+    assert by_id["native"]["needs"] == ["recovery_completed_validation"]
+    cmd = by_id["recovery_views"]["command"]
+    assert "--group-id" not in cmd and cmd[cmd.index("--auto-groups") + 1] == "8"
+    assert cmd[cmd.index("--view-budget") + 1] == "12"
+    cmd = by_id["native"]["command"]
+    validation = cmd[cmd.index("--recovery-validation") + 1]
+    assert validation.endswith("/recovery/completed_validation/manifest.json")
+    assert validation in by_id["native"]["fingerprint_inputs"]
+    for name in (
+        "recovery_validation",
+        "recovery_tracker_validation",
+        "recovery_completed_validation",
+    ):
+        assert "--partial-view-association" in by_id[name]["command"]
+    assert "--scope-completion" in by_id["recovery_completed_validation"]["command"]
+    for invalid in (-1, 17, True):
+        args.recovery_groups = invalid
+        with pytest.raises(ValueError, match="budget"):
+            compile_plan(args)
+    args.recovery_groups = 0
     args.complementary_model_root = None
     args.complementary_vocabulary = tmp_path / "vocabulary.txt"
     with pytest.raises(ValueError, match="model root"):

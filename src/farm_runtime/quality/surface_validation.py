@@ -85,6 +85,7 @@ def select_observation(
     partial_context=None,
     scope_review=None,
     completion_preference=None,
+    group_id=None,
 ):
     """Require visible core support and reciprocal static surface overlap.
 
@@ -97,7 +98,9 @@ def select_observation(
     candidates = [
         i
         for i, d in enumerate(detections)
-        if d["label"] != "person" and (labels is None or d["label"] in labels)
+        if d["label"] != "person"
+        and (labels is None or d["label"] in labels)
+        and (group_id is None or d.get("source_group_id", group_id) == group_id)
     ]
     groups = equivalent_masks(
         [masks[i] for i in candidates], [detections[i]["score"] for i in candidates]
@@ -438,6 +441,7 @@ def main(argv=None):
                 max(0.04, float(np.median(radii))),
                 scope_review=scope_choices.get((group_id, name)),
                 completion_preference=completion_preferences.get((group_id, name)),
+                group_id=group_id,
                 partial_context=(
                     {"target_name": name, "references": references}
                     if references is not None

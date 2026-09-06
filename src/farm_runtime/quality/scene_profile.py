@@ -695,10 +695,14 @@ def compile_plan(args):
     partial_view = getattr(args, "partial_view_association", False)
     if complementary_vocabulary and not complementary_root:
         raise ValueError("complementary vocabulary requires a model root")
+    recovery_budget = getattr(args, "recovery_groups", 0)
+    if type(recovery_budget) is not int or not 0 <= recovery_budget <= 16:
+        raise ValueError("recovery group budget must be in 0..16")
     crop_budget = getattr(args, "refinement_crops", 0)
     if type(crop_budget) is not int or not 0 <= crop_budget <= 32:
         raise ValueError("refinement crop budget must be in 0..32")
     budgets = dict(
+        recovery_groups=recovery_budget,
         refinement_crops=crop_budget,
         initial=args.initial_views,
         adaptive=args.adaptive_views,
@@ -939,6 +943,129 @@ def compile_plan(args):
             [primary, supplement],
         )
     geometry("geometry", final_proposals)
+    recovery_validation = None
+    if recovery_budget:
+        recovery = f"{q}/recovery"
+        audit = f"{recovery}/views/manifest.json"
+        proposals = f"{recovery}/segmentation/manifest.json"
+        tracker = f"{recovery}/tracker/manifest.json"
+        first_validation = f"{recovery}/validation/manifest.json"
+        tracked_validation = f"{recovery}/tracker_validation/manifest.json"
+        completion = f"{recovery}/completion/manifest.json"
+        recovery_validation = f"{recovery}/completed_validation/manifest.json"
+        add(
+            "recovery_views",
+            "surface-evidence",
+            [
+                "--geometry",
+                f"{q}/geometry/manifest.json",
+                "--plan",
+                f"{q}/input/plan.json",
+                "--auto-groups",
+                recovery_budget,
+                "--candidate-budget",
+                64,
+                "--view-budget",
+                12,
+                "--extra-views",
+                2,
+                "--output",
+                f"{recovery}/views",
+            ],
+            audit,
+            [f"{q}/geometry/manifest.json", f"{q}/input/plan.json"],
+        )
+        add(
+            "recovery_segmentation",
+            "scene-profile",
+            [
+                "segment",
+                "--plan",
+                f"{recovery}/views/plan.json",
+                "--vocabulary",
+                f"{recovery}/views/concepts.txt",
+                "--model",
+                args.sam_model,
+                "--views",
+                12,
+                *up_args,
+                "--output",
+                f"{recovery}/segmentation",
+            ],
+            proposals,
+            [audit, f"{recovery}/views/plan.json", f"{recovery}/views/concepts.txt"],
+        )
+
+        def recovery_check(name, directory, supplements=(), completed=False):
+            add(
+                name,
+                "surface-validation",
+                [
+                    "--audit",
+                    audit,
+                    "--proposals",
+                    proposals,
+                    *[x for p in supplements for x in ("--supplement", p)],
+                    *(["--scope-completion", completion] if completed else []),
+                    *(["--partial-view-association"] if partial_view else []),
+                    *up_args,
+                    "--output",
+                    f"{recovery}/{directory}",
+                ],
+                f"{recovery}/{directory}/manifest.json",
+                [audit, proposals, *supplements, *([completion] if completed else [])],
+            )
+
+        recovery_check("recovery_validation", "validation")
+        add(
+            "recovery_tracker",
+            "surface-tracker",
+            [
+                "--audit",
+                audit,
+                "--proposals",
+                proposals,
+                "--validation",
+                first_validation,
+                "--model",
+                args.sam_model,
+                "--crop-budget",
+                2 * recovery_budget,
+                "--output",
+                f"{recovery}/tracker",
+            ],
+            tracker,
+            [audit, proposals, first_validation],
+        )
+        recovery_check("recovery_tracker_validation", "tracker_validation", [tracker])
+        add(
+            "recovery_completion",
+            "scope-completion",
+            [
+                "--tracker",
+                tracker,
+                "--validation",
+                tracked_validation,
+                "--model",
+                args.vlm_model,
+                "--sam-model",
+                args.sam_model,
+                "--crop-budget",
+                min(8, 2 * recovery_budget),
+                "--crops-per-object",
+                2,
+                "--output",
+                f"{recovery}/completion",
+            ],
+            completion,
+            [tracker, tracked_validation],
+        )
+        recovery_check(
+            "recovery_completed_validation",
+            "completed_validation",
+            [tracker],
+            completed=True,
+        )
     add(
         "native",
         "scene-profile",
@@ -946,6 +1073,11 @@ def compile_plan(args):
             "native",
             "--geometry",
             f"{q}/geometry/manifest.json",
+            *(
+                ["--recovery-validation", recovery_validation]
+                if recovery_validation
+                else []
+            ),
             "--ply",
             args.ply,
             "--config",
@@ -959,7 +1091,11 @@ def compile_plan(args):
             f"{q}/native",
         ],
         f"{q}/native/manifest.json",
-        [f"{q}/geometry/manifest.json", args.ply],
+        [
+            f"{q}/geometry/manifest.json",
+            args.ply,
+            *([recovery_validation] if recovery_validation else []),
+        ],
         "geometry",
     )
     final_native = f"{q}/native/manifest.json"
@@ -1111,6 +1247,18 @@ def compile_plan(args):
                 if crop_budget
                 else "disabled by crop budget 0"
             ),
+            recovery=(
+                dict(
+                    candidate_budget=64,
+                    unique_rgb_budget=12,
+                    timestamps_per_object=2,
+                    tracker_crops=2 * recovery_budget,
+                    scope_crops=min(8, 2 * recovery_budget),
+                    scope="unconfirmed single-timestamp groups",
+                )
+                if recovery_budget
+                else None
+            ),
             scope_resolution="preserve nested alternatives; no automatic physical merging",
             release_eligible=False,
         ),
@@ -1178,6 +1326,7 @@ def main(argv=None):
 
     q.add_argument("--world-up", type=float, nargs=3, required=True)
     for field, value in dict(
+        recovery_groups=0,
         refinement_crops=0,
         initial_views=12,
         adaptive_views=8,
