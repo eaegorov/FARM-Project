@@ -135,6 +135,36 @@ def test_profile_compiles_into_existing_dag_with_explicit_budgets_and_runtimes(
     ):
         assert "--partial-view-association" in by_id[name]["command"]
     assert "--scope-completion" in by_id["recovery_completed_validation"]["command"]
+    # Coverage shares the same seven recovery stages and one native build.
+    args.coverage_groups = 4
+    write(plan_path, compile_plan(args))
+    mixed = plan_to_public_dict(load_plan(plan_path), tmp_path / "mixed")
+    mixed_by_id = {s["id"]: s for s in mixed["stages"]}
+    assert len(mixed["stages"]) == len(recovery["stages"])
+    cmd = mixed_by_id["recovery_views"]["command"]
+    assert cmd[cmd.index("--auto-groups") + 1] == "8"
+    assert cmd[cmd.index("--coverage-groups") + 1] == "4"
+    assert cmd[cmd.index("--view-budget") + 1] == "20"
+    cmd = mixed_by_id["recovery_segmentation"]["command"]
+    assert cmd[cmd.index("--views") + 1] == "20"
+    cmd = mixed_by_id["recovery_tracker"]["command"]
+    assert cmd[cmd.index("--crop-budget") + 1] == "24"
+    assert sum(s["id"] == "native" for s in mixed["stages"]) == 1
+    for invalid in (-1, 17, True, 9):
+        args.coverage_groups = invalid
+        with pytest.raises(ValueError, match="budget"):
+            compile_plan(args)
+    args.coverage_groups = 4
+    args.recovery_groups = 0
+    write(plan_path, compile_plan(args))
+    coverage_only = plan_to_public_dict(
+        load_plan(plan_path), tmp_path / "coverage_only"
+    )
+    cmd = next(s for s in coverage_only["stages"] if s["id"] == "recovery_views")[
+        "command"
+    ]
+    assert cmd[cmd.index("--auto-groups") + 1] == "0"
+    args.coverage_groups = 0
     for invalid in (-1, 17, True):
         args.recovery_groups = invalid
         with pytest.raises(ValueError, match="budget"):

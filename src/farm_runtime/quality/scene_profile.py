@@ -698,11 +698,19 @@ def compile_plan(args):
     recovery_budget = getattr(args, "recovery_groups", 0)
     if type(recovery_budget) is not int or not 0 <= recovery_budget <= 16:
         raise ValueError("recovery group budget must be in 0..16")
+    coverage_budget = getattr(args, "coverage_groups", 0)
+    if type(coverage_budget) is not int or not 0 <= coverage_budget <= 16:
+        raise ValueError("coverage group budget must be in 0..16")
+    total_recovery = recovery_budget + coverage_budget
+    if total_recovery > 16:
+        raise ValueError("combined recovery/coverage group budget must be at most16")
+    recovery_views = min(24, 12 + 2 * coverage_budget)
     crop_budget = getattr(args, "refinement_crops", 0)
     if type(crop_budget) is not int or not 0 <= crop_budget <= 32:
         raise ValueError("refinement crop budget must be in 0..32")
     budgets = dict(
         recovery_groups=recovery_budget,
+        coverage_groups=coverage_budget,
         refinement_crops=crop_budget,
         initial=args.initial_views,
         adaptive=args.adaptive_views,
@@ -944,7 +952,7 @@ def compile_plan(args):
         )
     geometry("geometry", final_proposals)
     recovery_validation = None
-    if recovery_budget:
+    if total_recovery:
         recovery = f"{q}/recovery"
         audit = f"{recovery}/views/manifest.json"
         proposals = f"{recovery}/segmentation/manifest.json"
@@ -963,10 +971,11 @@ def compile_plan(args):
                 f"{q}/input/plan.json",
                 "--auto-groups",
                 recovery_budget,
+                *(["--coverage-groups", coverage_budget] if coverage_budget else []),
                 "--candidate-budget",
                 64,
                 "--view-budget",
-                12,
+                recovery_views,
                 "--extra-views",
                 2,
                 "--output",
@@ -987,7 +996,7 @@ def compile_plan(args):
                 "--model",
                 args.sam_model,
                 "--views",
-                12,
+                recovery_views,
                 *up_args,
                 "--output",
                 f"{recovery}/segmentation",
@@ -1030,7 +1039,7 @@ def compile_plan(args):
                 "--model",
                 args.sam_model,
                 "--crop-budget",
-                2 * recovery_budget,
+                2 * total_recovery,
                 "--output",
                 f"{recovery}/tracker",
             ],
@@ -1051,7 +1060,7 @@ def compile_plan(args):
                 "--sam-model",
                 args.sam_model,
                 "--crop-budget",
-                min(8, 2 * recovery_budget),
+                min(8, 2 * total_recovery),
                 "--crops-per-object",
                 2,
                 "--output",
@@ -1327,6 +1336,7 @@ def main(argv=None):
     q.add_argument("--world-up", type=float, nargs=3, required=True)
     for field, value in dict(
         recovery_groups=0,
+        coverage_groups=0,
         refinement_crops=0,
         initial_views=12,
         adaptive_views=8,

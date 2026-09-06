@@ -156,3 +156,127 @@ def budgeted_views(selected, used_names, view_budget):
             kept.append(row)
             used.add(row["name"])
     return kept
+
+
+def coverage_candidates(inputs, budget, allowed_names):
+    """Rank incompletely corroborated surfaces with an existing multiview anchor.
+
+    Votes count physical timestamps. Equal timestamp weights prevent a densely
+    sampled close view from hiding missing support in a smaller distant view.
+    The score is a scheduling heuristic, never an identity or completeness gate.
+    """
+    from farm_runtime.surface_evidence import aggregate_timestamps, point_observation
+
+    if type(budget) is not int or not 1 <= budget <= 128:
+        raise ValueError("coverage candidate budget must be in 1..128")
+    by_source = defaultdict(list)
+    for group in inputs.geometry["groups"]:
+        if group["independent_timestamps"] < 2:
+            continue
+        nodes = [inputs.nodes[i] for i in group["members"]]
+        # Restrict the entire group before reading any masks or registered depth.
+        if any(n["frame"] not in allowed_names for n in nodes):
+            continue
+        if not nodes or any(n["representative_detection"] is None for n in nodes):
+            continue
+        members, points, timestamps, _ = inputs.support(group)
+        if len(points) < 20 or len(np.unique(timestamps)) < 2:
+            continue
+        counts = aggregate_timestamps(
+            [
+                (
+                    n["timestamp"],
+                    point_observation(
+                        points, inputs.mask(n), **inputs.frame(n["frame"])
+                    ),
+                )
+                for n in members
+            ],
+            len(points),
+            timestamps,
+        )
+        missing = ~counts["corroborated"] & ~counts["contradicted"]
+        by_timestamp = []
+        for timestamp in np.unique(timestamps):
+            selected = timestamps == timestamp
+            by_timestamp.append(
+                dict(
+                    timestamp=str(timestamp),
+                    fraction=float(missing[selected].mean()),
+                    missing_points=int(missing[selected].sum()),
+                    source_points=int(selected.sum()),
+                    corroborated_fraction=float(
+                        counts["corroborated"][selected].mean()
+                    ),
+                )
+            )
+        worst = max(
+            by_timestamp,
+            key=lambda r: (r["fraction"], r["source_points"], r["timestamp"]),
+        )
+        if worst["fraction"] < 0.25 or worst["missing_points"] < 20:
+            continue
+        witness = max(
+            [n for n in members if n["timestamp"] == worst["timestamp"]],
+            key=lambda n: (n["mask_pixels"], -n["id"]),
+        )
+        anchor = float(np.mean([r["corroborated_fraction"] for r in by_timestamp]))
+        priority = min(n.get("source_priority", 0) for n in members)
+        by_source[priority].append(
+            dict(
+                group_id=group["id"],
+                source_priority=priority,
+                source_node_id=witness["id"],
+                source_frame=witness["frame"],
+                mask_pixels=witness["mask_pixels"],
+                worst_timestamp_unconfirmed_fraction=worst["fraction"],
+                balanced_unconfirmed_fraction=float(
+                    np.mean([r["fraction"] for r in by_timestamp])
+                ),
+                corroborated_anchor_fraction=anchor,
+                coverage_gain_score=worst["fraction"] * anchor,
+                timestamps=by_timestamp,
+            )
+        )
+    strata = {}
+    for priority, rows in sorted(by_source.items()):
+        rows.sort(key=lambda r: (r["mask_pixels"], r["group_id"]))
+        for index, row in enumerate(rows):
+            row["size_band"] = min(2, 3 * index // len(rows))
+            strata.setdefault((priority, row["size_band"]), []).append(row)
+    for rows in strata.values():
+        rows.sort(
+            key=lambda r: (
+                -r["coverage_gain_score"],
+                -r["balanced_unconfirmed_fraction"],
+                r["mask_pixels"],
+                r["group_id"],
+            )
+        )
+    ordered = [
+        strata[key][index]
+        for index in range(max(map(len, strata.values()), default=0))
+        for key in sorted(strata)
+        if index < len(strata[key])
+    ]
+    return ordered[:budget], len(ordered)
+
+
+def candidate_cohorts(singletons, coverage):
+    """Interleave independent cohorts before applying per-cohort group quotas.
+
+    Failed visibility checks do not spend a group slot. A caller continues down
+    that cohort's bounded candidate pool; no group can enter both cohorts.
+    """
+    if {r["group_id"] for r in singletons} & {r["group_id"] for r in coverage}:
+        raise ValueError("recovery candidate cohorts must be disjoint")
+    return [
+        dict(row, candidate_kind=kind)
+        for index in range(max(len(singletons), len(coverage)))
+        for kind, rows in (
+            ("single_timestamp", singletons),
+            ("incomplete_multiview", coverage),
+        )
+        if index < len(rows)
+        for row in [rows[index]]
+    ]

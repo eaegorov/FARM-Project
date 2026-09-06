@@ -207,9 +207,20 @@ def main(argv=None):
     selection.add_argument(
         "--auto-groups",
         type=int,
-        help="Select up to 16 unconfirmed single-timestamp groups",
+        help="Single-timestamp group quota; use zero for coverage-only scheduling",
     )
-    parser.add_argument("--candidate-budget", type=int, default=64)
+    parser.add_argument(
+        "--coverage-groups",
+        type=int,
+        default=0,
+        help="Additional incomplete multiview group quota; combined maximum16",
+    )
+    parser.add_argument(
+        "--candidate-budget",
+        type=int,
+        default=64,
+        help="Candidates per active cohort; maximum128 each",
+    )
     parser.add_argument("--view-budget", type=int, default=12)
     parser.add_argument("--plan", type=Path, required=True)
     parser.add_argument("--extra-views", type=int, default=2)
@@ -219,13 +230,19 @@ def main(argv=None):
         raise ValueError(
             "new output and one to four extra timestamps per group required"
         )
+    if args.coverage_groups and args.auto_groups is None:
+        raise ValueError("--coverage-groups requires --auto-groups")
     if args.auto_groups is not None and (
-        not 1 <= args.auto_groups <= 16
-        or not args.auto_groups <= args.candidate_budget <= 128
+        args.auto_groups < 0
+        or args.coverage_groups < 0
+        or not 1 <= args.auto_groups + args.coverage_groups <= 16
+        or not max(args.auto_groups, args.coverage_groups)
+        <= args.candidate_budget
+        <= 128
         or not 1 <= args.view_budget <= 24
     ):
         raise ValueError(
-            "recovery budgets: groups1..16, candidates>=groups up to128, views1..24"
+            "recovery budgets: combined groups1..16, candidates>=cohort quota up to128, views1..24"
         )
     plan = json.loads(args.plan.read_text())
     if plan.get("test_opened") is not False:
@@ -235,6 +252,8 @@ def main(argv=None):
     by_id = {g["id"]: g for g in inputs.geometry["groups"]}
     from farm_runtime.quality.recovery_schedule import (
         recovery_candidates,
+        coverage_candidates,
+        candidate_cohorts,
         budgeted_views,
     )
 
@@ -246,9 +265,24 @@ def main(argv=None):
             set(plan["sources"]),
             mask_reader=inputs.mask,
         )
-        if automatic
-        else ([], None)
+        if automatic and args.auto_groups
+        else ([], 0 if automatic else None)
     )
+    coverage_available = 0
+    if automatic and args.coverage_groups:
+        coverage_rows, coverage_available = coverage_candidates(
+            inputs, args.candidate_budget, set(plan["sources"])
+        )
+        candidate_rows = candidate_cohorts(candidate_rows, coverage_rows)
+    quota = {
+        "single_timestamp": args.auto_groups or 0,
+        "incomplete_multiview": args.coverage_groups,
+    }
+    scheduled = dict.fromkeys(quota, 0)
+    kinds = {
+        r["group_id"]: r.get("candidate_kind", "single_timestamp")
+        for r in candidate_rows
+    }
     group_ids = [r["group_id"] for r in candidate_rows] if automatic else args.group_id
     if not set(group_ids) <= by_id.keys():
         raise ValueError("unknown group ID")
@@ -261,8 +295,11 @@ def main(argv=None):
     args.output.mkdir(parents=True)
     rows, arrays, names, prompts, screened = [], {}, [], [], []
     for group_id in dict.fromkeys(group_ids):
-        if automatic and len(rows) >= args.auto_groups:
-            break
+        if automatic:
+            if len(rows) >= sum(quota.values()):
+                break
+            if scheduled[kinds[group_id]] >= quota[kinds[group_id]]:
+                continue
         group = by_id[group_id]
         members, points, timestamps, radii = inputs.support(group)
         labels, components = surface_components(points, timestamps, radii)
@@ -306,6 +343,7 @@ def main(argv=None):
             selected = kept
             if not selected:
                 continue
+            scheduled[kinds[group_id]] += 1
         for name in [r["name"] for r in selected]:
             if name not in plan["sources"]:
                 raise ValueError("selected registered view not in development plan")
@@ -381,8 +419,23 @@ def main(argv=None):
             concepts=describe_file(args.output / "concepts.txt"),
             recovery_schedule=(
                 dict(
-                    policy="Single-timestamp; source/relative-size thirds round robin, static depth support times same-frame multiview mask novelty descending; then registered visibility",
-                    group_budget=args.auto_groups,
+                    policy=(
+                        "Interleaved singleton novelty and incomplete multiview coverage cohorts; source/relative-size strata, missing fraction times corroborated anchor; then registered visibility"
+                        if args.coverage_groups
+                        else "Single-timestamp; source/relative-size thirds round robin, static depth support times same-frame multiview mask novelty descending; then registered visibility"
+                    ),
+                    group_budget=args.auto_groups + args.coverage_groups,
+                    **(
+                        dict(
+                            single_timestamp_group_budget=args.auto_groups,
+                            coverage_group_budget=args.coverage_groups,
+                            eligible_incomplete_multiview_groups=coverage_available,
+                            candidate_budget_per_cohort=args.candidate_budget,
+                            scheduled_by_cohort=scheduled,
+                        )
+                        if args.coverage_groups
+                        else {}
+                    ),
                     candidate_budget=args.candidate_budget,
                     view_budget=args.view_budget,
                     eligible_single_timestamp_groups=available,
