@@ -226,6 +226,9 @@ def _require_sections(config: Mapping[str, Any]) -> None:
         finite("candidate", "surface_voxel_m", minimum=0, minimum_open=True)
     if config["candidate"].get("depth_gate_policy", "surface") not in ("surface", "not_behind"):
         raise ValueError("candidate.depth_gate_policy must be surface or not_behind")
+    if "rendered_recovery_budget" in config["candidate"]:
+        if integer("candidate", "rendered_recovery_budget", minimum=0) > 8:
+            raise ValueError("candidate.rendered_recovery_budget must be at most 8")
     finite("candidate", "minimum_opacity", minimum=0, maximum=1)
     finite("candidate", "maximum_radius_m", minimum=0, minimum_open=True)
 

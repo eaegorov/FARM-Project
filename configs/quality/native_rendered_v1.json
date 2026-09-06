@@ -36,7 +36,8 @@
     "domain": "obb_mask_surface",
     "surface_pixel_stride": 4,
     "surface_voxel_m": 0.01,
-    "depth_gate_policy": "not_behind"
+    "depth_gate_policy": "not_behind",
+    "rendered_recovery_budget": 4
   },
   "mask": {
     "erosion_pixels": 2,

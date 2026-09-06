@@ -861,6 +861,27 @@ def main(argv=None):
         owner, confidence, support, object_rows, conflicts, blocked = lift.make_claims(
             evidence, table.count, config
         )
+        contributor_recovery = None
+        if config["candidate"].get("rendered_recovery_budget", 0):
+            from farm_runtime.quality.contributor_recovery import (
+                recover_contributor_candidates,
+            )
+
+            contributor_recovery = recover_contributor_candidates(
+                variant, gaussians, split, evidence, config, object_rows
+            )
+            if contributor_recovery["updated_object_ids"]:
+                for candidate in candidates:
+                    oid = candidate["object_id"]
+                    if oid in contributor_recovery["updated_object_ids"]:
+                        candidate["initial_spatial_candidate_gaussians"] = candidate[
+                            "candidate_gaussians"
+                        ]
+                        candidate["candidate_gaussians"] = len(evidence[oid].indices)
+                        candidate["search"]["rendered_recovery"] = True
+                owner, confidence, support, object_rows, conflicts, blocked = (
+                    lift.make_claims(evidence, table.count, config)
+                )
         owner, confidence, support, refinement = refine_connected_claims(
             gaussians.means_m,
             gaussians.radius_m,
@@ -927,6 +948,7 @@ def main(argv=None):
             native_geometry=native_geometry,
             bank=describe_file(dest / "proposal_bank.npz"),
             scope_alternatives=alternatives,
+            contributor_recovery=contributor_recovery,
             visuals=visuals,
             closed_test_opened=False,
             release_eligible=False,
