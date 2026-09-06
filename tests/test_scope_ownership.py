@@ -68,3 +68,134 @@ def test_target_cannot_exclude_itself():
         resolve_scope_alternative(
             {1: item(1, [0])}, 1, {1}, np.zeros((2, 3)), np.ones(2), {}
         )
+
+
+def current_fixture(tmp_path, *, same_timestamp=False):
+    from farm_runtime.quality.native_observations import write_native_mask
+    from tools.farm_shaper_bridge.common import MaskObservation
+
+    frames = [
+        SimpleNamespace(
+            image_id=i,
+            source_image=f"frame_{i}.png",
+            depth_size=(8, 8),
+            physical_timestamp=str(0 if same_timestamp else i),
+        )
+        for i in range(2)
+    ]
+    large = np.ones((8, 8), bool)
+    small = np.zeros((8, 8), bool)
+    small[2:6, 2:6] = True
+    overrides = {}
+    objects = []
+    for oid, mask in [(1, large), (2, small)]:
+        observations = []
+        for frame in frames:
+            path = tmp_path / f"{oid}_{frame.image_id}.npz"
+            write_native_mask(path, mask, mask.shape, 0)
+            overrides[oid, frame.image_id] = path
+            observations.append(MaskObservation(oid, frame.image_id, path.name, {}))
+        objects.append(SimpleNamespace(object_id=oid, observations=tuple(observations)))
+    run = SimpleNamespace(
+        run_dir=tmp_path,
+        objects=tuple(objects),
+        frames=tuple(frames),
+        frame=lambda image_id: frames[image_id],
+        mask_overrides=overrides,
+        observation_exclusions=None,
+    )
+    times = sorted({f.physical_timestamp for f in frames})
+    split = dict(
+        build_timestamps=times,
+        heldout_timestamps=[],
+        objects=[dict(object_id=oid, build_timestamps=times) for oid in [1, 2]],
+    )
+    return run, split, large, small
+
+
+def test_current_masks_include_recovered_view_and_remove_quarantined_view(tmp_path):
+    from farm_runtime.quality.scope_ownership import current_scope_containment
+
+    run, split, _, _ = current_fixture(tmp_path)
+    neighbors, rows, nodes = current_scope_containment(run, split, {1, 2})
+    assert neighbors == {1: {2}, 2: {1}}
+    assert rows[0]["independent_timestamps"] == 2
+    assert all(n["mask"]["sha256"] for n in nodes)
+    # A quarantined observation is absent from the effective native input.
+    run.objects[1].observations = run.objects[1].observations[:1]
+    neighbors, rows, _ = current_scope_containment(run, split, {1, 2})
+    assert neighbors == {}
+    assert rows[0]["status"] == "single_timestamp"
+
+
+def test_current_masks_do_not_count_two_virtual_views_as_two_timestamps(tmp_path):
+    from farm_runtime.quality.scope_ownership import current_scope_containment
+
+    run, split, _, _ = current_fixture(tmp_path, same_timestamp=True)
+    neighbors, rows, _ = current_scope_containment(run, split, {1, 2})
+    assert neighbors == {}
+    assert rows[0]["independent_timestamps"] == 1
+
+
+def test_current_replacement_can_reverse_containment(tmp_path):
+    from farm_runtime.quality.scope_ownership import current_scope_containment
+    from farm_runtime.quality.native_observations import write_native_mask
+
+    run, split, large, small = current_fixture(tmp_path)
+    write_native_mask(run.mask_overrides[1, 1], small, small.shape, 0)
+    write_native_mask(run.mask_overrides[2, 1], large, large.shape, 0)
+    neighbors, rows, _ = current_scope_containment(run, split, {1, 2})
+    assert neighbors == {}
+    assert len(rows) == 2
+    assert {row["status"] for row in rows} == {"conflicting_directions"}
+
+
+def test_current_masks_never_open_heldout_or_per_object_nonbuild(tmp_path):
+    from farm_runtime.quality.scope_ownership import current_scope_containment
+
+    run, split, _, _ = current_fixture(tmp_path)
+    # Missing heldout files must never be opened, even for overlap statistics.
+    for oid in [1, 2]:
+        run.mask_overrides[oid, 1].unlink()
+    split["build_timestamps"] = ["0"]
+    split["heldout_timestamps"] = ["1"]
+    assert current_scope_containment(run, split, {1, 2})[0] == {}
+    split["build_timestamps"] = ["0", "1"]
+    split["heldout_timestamps"] = []
+    for row in split["objects"]:
+        row["build_timestamps"] = ["0"]
+    assert current_scope_containment(run, split, {1, 2})[0] == {}
+
+
+def test_current_masks_remove_transient_exclusions(tmp_path):
+    from farm_runtime.quality.scope_ownership import current_scope_containment
+    from farm_runtime.quality_baseline import describe_file
+
+    run, split, _, small = current_fixture(tmp_path)
+    path = tmp_path / "excluded.npy"
+    np.save(path, small)
+    run.observation_exclusions = {i: describe_file(path) for i in [0, 1]}
+    neighbors, rows, nodes = current_scope_containment(run, split, {1, 2})
+    assert not neighbors and not rows
+    assert {node["object_id"] for node in nodes} == {1}
+
+
+def test_current_masks_reject_duplicate_observation_and_inactive_input(tmp_path):
+    from farm_runtime.quality.scope_ownership import current_scope_containment
+
+    run, split, _, _ = current_fixture(tmp_path)
+    assert current_scope_containment(run, split, {1}) == ({}, [], [])
+    with pytest.raises(ValueError, match="known active"):
+        current_scope_containment(run, split, {9})
+    run.objects[0].observations += run.objects[0].observations[:1]
+    with pytest.raises(ValueError, match="unique aligned"):
+        current_scope_containment(run, split, {1, 2})
+
+
+def test_current_masks_reject_mixed_build_heldout(tmp_path):
+    from farm_runtime.quality.scope_ownership import current_scope_containment
+
+    run, split, _, _ = current_fixture(tmp_path)
+    split["heldout_timestamps"] = ["0"]
+    with pytest.raises(ValueError, match="disjoint"):
+        current_scope_containment(run, split, {1, 2})

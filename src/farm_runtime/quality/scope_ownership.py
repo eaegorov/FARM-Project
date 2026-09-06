@@ -31,6 +31,100 @@ def competing_scopes(groups, nodes, pairs, active_ids):
     return neighbors, relations
 
 
+def current_scope_containment(run, split, active_ids):
+    """Measure nesting from masks actually used by the lift, including recovery.
+
+    Only build observations participate. Same-timestamp virtual/sensor views
+    provide one vote; transient exclusions never supply containment evidence.
+    """
+    from collections import defaultdict
+    from itertools import combinations
+
+    from tools.farm_shaper_bridge.common import (
+        load_mask_pair,
+        load_observation_exclusion,
+        resolve_mask_path,
+    )
+
+    active = set(active_ids)
+    objects = {obj.object_id: obj for obj in run.objects}
+    if len(objects) != len(run.objects) or not active <= objects.keys():
+        raise ValueError("unique known active object IDs required")
+    allowed = set(split["build_timestamps"])
+    if allowed & set(split["heldout_timestamps"]):
+        raise ValueError("build and heldout timestamps must be disjoint")
+    object_build = {
+        row["object_id"]: set(row["build_timestamps"]) for row in split["objects"]
+    }
+    by_frame = defaultdict(list)
+    for oid in sorted(active):
+        seen = set()
+        for obs in objects[oid].observations:
+            frame = run.frame(obs.image_id)
+            if obs.image_id in seen or obs.object_id != oid:
+                raise ValueError("unique aligned object/frame observations required")
+            seen.add(obs.image_id)
+            if (
+                frame.physical_timestamp in allowed
+                and frame.physical_timestamp in object_build[oid]
+            ):
+                by_frame[obs.image_id].append(obs)
+    members = {oid: [] for oid in sorted(active)}
+    nodes, pairs = [], []
+    for image_id, observations in sorted(by_frame.items()):
+        if len(observations) < 2:
+            continue
+        frame = run.frame(image_id)
+        excluded, exclusion_source = load_observation_exclusion(run, frame)
+        masks = []
+        for obs in observations:
+            path = resolve_mask_path(run, obs)
+            mask, _, digest = load_mask_pair(path, frame.depth_size)
+            if excluded is not None:
+                mask &= ~excluded
+            yy, xx = np.nonzero(mask)
+            if not len(xx):
+                continue
+            node_id = len(nodes)
+            nodes.append(
+                dict(
+                    id=node_id,
+                    frame=frame.source_image,
+                    timestamp=frame.physical_timestamp,
+                    object_id=obs.object_id,
+                    image_id=image_id,
+                    mask=dict(path=str(path), sha256=digest),
+                    exclusion=exclusion_source,
+                )
+            )
+            members[obs.object_id].append(node_id)
+            masks.append(
+                (
+                    node_id,
+                    mask,
+                    len(xx),
+                    (
+                        int(xx.min()),
+                        int(yy.min()),
+                        int(xx.max()) + 1,
+                        int(yy.max()) + 1,
+                    ),
+                )
+            )
+        for (a, ma, na, ba), (b, mb, nb, bb) in combinations(masks, 2):
+            x0, y0 = max(ba[0], bb[0]), max(ba[1], bb[1])
+            x1, y1 = min(ba[2], bb[2]), min(ba[3], bb[3])
+            if x0 >= x1 or y0 >= y1:
+                continue
+            overlap = np.count_nonzero(ma[y0:y1, x0:x1] & mb[y0:y1, x0:x1])
+            ca, cb = overlap / na, overlap / nb
+            if (ca >= 0.85 and cb < 0.80) or (cb >= 0.85 and ca < 0.80):
+                pairs.append(dict(a=a, b=b, containments=[ca, cb]))
+    groups = [dict(id=oid, members=ids) for oid, ids in members.items()]
+    neighbors, relations = competing_scopes(groups, nodes, pairs, active)
+    return neighbors, relations, nodes
+
+
 def resolve_scope_alternative(evidence, target, excluded, means, radii, config):
     """Rerun ownership on cached VJP, retaining every unrelated competitor."""
     if (
@@ -71,6 +165,9 @@ def preserve_scope_alternatives(
     object_rows,
     output,
     budget,
+    *,
+    run,
+    split,
 ):
     """A bounded CPU stage; all costly rendered contributions are reused."""
     if type(budget) is not int or not 1 <= budget <= 16:
@@ -80,12 +177,8 @@ def preserve_scope_alternatives(
     geometry = json.loads(geometry_path.read_text())
     if geometry.get("test_opened") is not False:
         raise ValueError("development geometry required")
-    pair_evidence = json.loads(checked_file(geometry["evidence_artifact"]).read_text())
-    neighbors, relations = competing_scopes(
-        geometry["groups"],
-        geometry["nodes"],
-        pair_evidence["scope_alternatives"],
-        evidence.keys(),
+    neighbors, relations, observation_nodes = current_scope_containment(
+        run, split, evidence.keys()
     )
     rows_by_id = {row["object_id"]: row for row in object_rows}
     lost = {
@@ -133,6 +226,8 @@ def preserve_scope_alternatives(
         schema="farm.native-scope-alternatives.v1",
         source_geometry=describe_file(geometry_path),
         relations=relations,
+        relation_node_namespace="current_native_observations",
+        observation_nodes=observation_nodes,
         objects=results,
         deferred_object_ids=scheduled[budget:],
         maximum_alternatives=budget,

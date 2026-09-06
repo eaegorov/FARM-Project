@@ -889,6 +889,8 @@ def main(argv=None):
                 object_rows,
                 dest / "scope_alternatives",
                 args.scope_alternative_budget,
+                run=variant,
+                split=split,
             )
         native_geometry = []
         for obj in run.objects:
