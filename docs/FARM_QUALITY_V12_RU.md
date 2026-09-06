@@ -483,3 +483,13 @@ Stage42: global contributor search334→2016 не помогает при ста
 ED сохранена корректно и уже нормализована по opacity; source render совпал точно. Scene alpha≈1, вклад трубы≈0,44/0,54, средняя depth≈6,8/6,6м, глубина её Gaussian≈8,1/7,9м. Из E[z²] измерен sigma≈2м: среднее смеси не является точной поверхностью.2*sigma — эвристика, не калиброванный confidence interval.
 
 Следующий конкретный этап — bounded contributor fallback для групп с0supported claims до конкуренции: сейчас Factory0таких случаев,Knaack1. Реальныеcontributors + depth spread, прежние multiview/purity/exclusion gates, затем полная общая конкуренция и проверка старых masks. Budget≤4objects,≤4TS/8views, bounded candidates. Пока prototype, defaults не менялись. Отчёт V12/42_contributor_candidates/REVIEW_RU.md. Closed test не открыт, physical dimensions не валидированы.
+
+## 47. Contributor fallback включён в общий native pipeline (2026-09-06)
+
+Stage43,b41225c,1404tests/71,59с. Quality-config budget4; только0supported claims до конкуренции,2–4TS/≤8views,≤65536candidates, visible-background negatives. Exact contributors и measured depth spread проходят затем общую конкуренцию всех объектов и прежний connected refinement. Неизвестные/heldout pixels и budgets не обходятся.
+
+Knaack native46,488с:37→38масок,63получил622IDs; все37старых memberships точны. Fallback2VJP/0,288с. Factory160,878с:все117масок точны,0fallback VJP. Новая труба и оба native JPEG совпали с просмотренным Stage42 prototype. Gaussian/PLY исходники не менялись.
+
+Semantics retain-stage сохранил42/68ответов без VLM; refresh0,402/0,609с, catalogs2,258/2,704с. Каталоги V12/43_contributor_recovery/knaack/catalog_v1 иfactory/catalog_v1:42/38/42 и132/117/68. Labels/captions прежние, включая известные ошибки. Observed OBB трубы1,738×0,665×1,384м tail-sensitive, физические размеры не приняты. Отчёт V12/43_contributor_recovery/REVIEW_RU.md.
+
+Следующий приоритет — novelty при выборе recovery объектов: не тратить ранние слоты на уже покрытую панель490, проверить coverage для634и новых физических объектов без ручных ID. Затем ограниченный добор зарегистрированных ракурсов для неполных масок. Closed test не открыт, Project B/C не меняются.
