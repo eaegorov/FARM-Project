@@ -147,4 +147,20 @@ quality release.
 Для следующей итерации recovery: `quality scene-profile cohort --validation VALIDATION --group-id ID --output NEW_DIR`. Выходы `manifest.json` и `transients.json` можно передать в `proposal-geometry` на том же зарегистрированном RGBD, затем снова в `surface-evidence`. Исходные и дополнительные accepted masks/person exclusions сохраняются без inference и без изменения logits. Новое group-ID namespace нужно читать из geometry результата: не переносите старый integer ID без проверки provenance. Требуются хотя бы2timestamps, accepted geometry selection и неизменённые source artifacts. Unit replay проверен на полном совпадении1252Gaussian IDs. VLM completeness/bbox pilot Stage27 пока не встроен в scene-profile.
 
 
-При включённом refinement можно добавить `scene-profile plan --balance-refinement-errors`: второй crop одного объекта, если он доступен в том же бюджете, выбирается по другому типу ошибки (foreground deficit/background contamination). Standalone эквивалент: `refinement-schedule --balance-error-modes`. Default и18-stage структура сохранены. Опция протестирована на переносе полной маски unit в старый ракурс; это не замена gates и не увеличение crop budget. Knaack replay меняет1из12crop requests, полноценная проверка этого изменения ещё нужна.
+При включённом refinement можно добавить `scene-profile plan --balance-refinement-errors`: второй crop одного объекта, если он доступен в том же бюджете, выбирается по другому типу ошибки (foreground deficit/background contamination). Standalone эквивалент: `refinement-schedule --balance-error-modes`. Default и18-stage структура сохранены. Опция протестирована на переносе полной маски unit в старый ракурс; это не замена gates и не увеличение crop budget. Knaack replay меняет1из12crop requests; Stage29 подтвердил abstention из-за разного scope конкурирующих масок. Native bank сохранён.
+
+Для проверки **видимых пропущенных интегральных частей** в уже принятой tracker-маске:
+
+```bash
+python -m farm_runtime.cli quality scope-completion \
+  --tracker /absolute/surface_tracker/manifest.json \
+  --validation /absolute/surface_validation/manifest.json \
+  --model /absolute/qwen3_vl_4b_checkpoint \
+  --sam-model /absolute/sam3_checkpoint \
+  --crop-budget 4 --crops-per-object 2 \
+  --output /absolute/new_scope_proposals
+```
+
+Validation должна связывать тот же audit/base proposals и содержать tracker в supplements. Проверяются принятый detection, его принадлежность объекту и crop coordinates; ambiguous identity пропускается. Бюджет1..16crops/1..3distinct timestamps на объект, очередь разделяется между объектами. VLM видит RGB и бинарную схему; её bbox не может исключить bbox уже выбранной маски. Она может ошибаться в точках, поэтому выход — дополнительные proposals для `surface-validation --supplement`, затем accepted native lift. Если нужен fallback на прежние tracker masks, передавайте их отдельным supplement наряду с новыми proposals. Старые thresholds сохраняются.
+
+Модели загружаются один раз на этап. Empty/unresolved очередь обходится без весов; при complete/uncertain ответе SAM не запускается. V12/30_scope_completion:unit2RGB17,81с, все12logits точны кпрототипу; complete cabinet8,08с/0SAM calls. Это отдельный opt-in этап; глобальный recovery budget в scene-profile ещё не реализован.

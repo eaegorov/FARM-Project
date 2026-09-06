@@ -403,3 +403,9 @@ Stage27показал, что1387/1393corroborated points могут описы�
 ## 33. Полный scope перенесён в старые2D masks
 
 V12/28_scope_propagation/REVIEW_RU.md. `refinement-schedule --balance-error-modes` резервирует второй crop объекта для другого типа foreground/background ошибки, сохраняя бюджет и defaults. В общем18-stage профиле доступно `--balance-refinement-errors`. Unit:вместо000348+004192 выбраны000348+003285; две tracker замены приняты прежними other-timestamp gates. Чёрная грань появилась в старой2D маске, native2041IDs/5TS сохраняет полноту. Все5reverse comparisons просмотрены; изменения3D metrics малы и не трактуются как independent accuracy. Semantic sheets/ответ совпали с Stage27, итоговый catalog в28_scope_propagation/catalog_v1.1288tests/64,41с. ReplayFactory6crops не меняет, Knaack заменяет1из12; новый Knaack crop требует проверки.
+
+## 34. Проверка Knaack и общий visible-scope completion
+
+Knaack balanced scheduling не снял ambiguity88/image8. Все14candidates просмотрены; исходный bank сохранён. Crop и модельные arrays совпадают с ранним Stage19: нужен reuse, не повторный inference того же запроса. V12/29_knaack_balance/REVIEW_RU.md.
+
+Новый `quality scope-completion` работает только с SHA-bound accepted surface-tracker masks, учитывает flattened supplement indices и несколько объектов в одном кадре. Бюджет4crops/2distinct timestamps per object; VLM→SAM только при high-confidence видимой недостающей части, bbox текущего объекта сохраняется. Новые masks должны пройти прежнюю geometry validation. Cabinet control complete→SAM не загружается. Unit12logits точны кStage27; native2087IDs/5TS точны, float confidence отличается≤1,2e-7. Все3новые sheets просмотрены.1308tests/65,23с. V12/30_scope_completion/REVIEW_RU.md; актуальный refined unit catalog остаётся Stage28. Модуль ещё не включён в18-stage DAG; следующий этап — global recovery budget/reuse.

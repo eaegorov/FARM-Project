@@ -18,6 +18,7 @@ ACTIONS = {
     "surface-validation": "surface_validation",
     "surface-tracker": "surface_tracker",
     "scope-review": "scope_review",
+    "scope-completion": "scope_completion",
     "camera-completion": "camera_completion",
     "native-observations": "native_observations",
     "native-review": "native_review",
