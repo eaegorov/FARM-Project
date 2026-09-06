@@ -855,7 +855,13 @@ def compile_plan(args):
                 f"{q}/complementary_segmentation",
             ],
             supplement,
-            [primary, vocabulary, complementary_root],
+            [
+                primary,
+                vocabulary,
+                complementary_root / "yoloe/yoloe-v8l-seg-pf.pt",
+                complementary_root / "yoloe/yoloe-v8l-seg.pt",
+                complementary_root / "mobileclip/mobileclip_blt.pt",
+            ],
         )
         final_proposals = "complementary_proposals"
         add(

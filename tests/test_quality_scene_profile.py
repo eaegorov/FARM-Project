@@ -105,10 +105,14 @@ def test_profile_compiles_into_existing_dag_with_explicit_budgets_and_runtimes(
     )
     assert by_id["geometry"]["needs"] == ["complementary_proposals"]
     assert by_id["complementary_proposals"]["needs"] == ["complementary_segmentation"]
-    assert (
-        str(args.complementary_model_root)
-        in by_id["complementary_segmentation"]["fingerprint_inputs"]
-    )
+    fingerprints = by_id["complementary_segmentation"]["fingerprint_inputs"]
+    assert str(args.complementary_model_root) not in fingerprints
+    for checkpoint in (
+        "yoloe/yoloe-v8l-seg-pf.pt",
+        "yoloe/yoloe-v8l-seg.pt",
+        "mobileclip/mobileclip_blt.pt",
+    ):
+        assert str(args.complementary_model_root / checkpoint) in fingerprints
     assert "--max-primary-iou" in by_id["complementary_proposals"]["command"]
     args.complementary_model_root = None
     args.complementary_vocabulary = tmp_path / "vocabulary.txt"

@@ -92,6 +92,9 @@ def test_runtime_checkpoint_mismatch_does_not_create_outputs(tmp_path, monkeypat
     primary, row = cohort(tmp_path)
     root = tmp_path / "models"
     (root / "yoloe").mkdir(parents=True)
+    (root / "yoloe/yoloe-v8l-seg.pt").write_bytes(b"base")
+    (root / "mobileclip").mkdir()
+    (root / "mobileclip/mobileclip_blt.pt").write_bytes(b"text")
     (root / "yoloe/yoloe-v8l-seg-pf.pt").write_bytes(b"weights")
     vocab = tmp_path / "vocab.txt"
     vocab.write_text("person\nbox\n")
@@ -111,6 +114,9 @@ def test_empty_primary_skips_inference_and_nonempty_result_is_bound(
     primary, row = cohort(tmp_path)
     root = tmp_path / "models"
     (root / "yoloe").mkdir(parents=True)
+    (root / "yoloe/yoloe-v8l-seg.pt").write_bytes(b"base")
+    (root / "mobileclip").mkdir()
+    (root / "mobileclip/mobileclip_blt.pt").write_bytes(b"text")
     weights = root / "yoloe/yoloe-v8l-seg-pf.pt"
     weights.write_bytes(b"weights")
     vocab = tmp_path / "vocab.txt"
@@ -125,7 +131,9 @@ def test_empty_primary_skips_inference_and_nonempty_result_is_bound(
         write(output / "results.json", dict(model_components={}))
 
     monkeypatch.setattr(discovery, "infer", infer)
-    monkeypatch.setattr(runtime_paths, "find_model_file", lambda *args: weights)
+    monkeypatch.setattr(
+        runtime_paths, "find_model_file", lambda name, folder: root / folder / name
+    )
     manifest = run(primary, root, vocab, [0, -1, 0], tmp_path / "nonempty")
     result = json.loads(manifest.read_text())
     assert len(calls) == 1
@@ -138,3 +146,43 @@ def test_empty_primary_skips_inference_and_nonempty_result_is_bound(
     assert len(calls) == 1
     assert result["observations"] == []
     assert result["no_inference_reason"] == "no_primary_views"
+
+
+@pytest.mark.parametrize(
+    "variable",
+    ["MOBILECLIP_BLT_CKPT", "MOBILECLIP_CHECKPOINT", "MOBILECLIP_WEIGHTS_DIR"],
+)
+def test_external_text_weights_cannot_escape_pipeline_fingerprint(
+    tmp_path, monkeypatch, variable
+):
+    from scene_graph import runtime_paths
+
+    primary, _ = cohort(tmp_path)
+    root = tmp_path / "models"
+    (root / "yoloe").mkdir(parents=True)
+    for name in ("yoloe-v8l-seg.pt", "yoloe-v8l-seg-pf.pt"):
+        (root / "yoloe" / name).write_bytes(b"weights")
+    (root / "mobileclip").mkdir()
+    (root / "mobileclip/mobileclip_blt.pt").write_bytes(b"text")
+    external = tmp_path / "external"
+    external.mkdir()
+    checkpoint = external / "mobileclip_blt.pt"
+    checkpoint.write_bytes(b"other")
+    for name in (
+        "MOBILECLIP_BLT_CKPT",
+        "MOBILECLIP_CHECKPOINT",
+        "MOBILECLIP_WEIGHTS_DIR",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv(
+        variable, str(external if variable.endswith("_DIR") else checkpoint)
+    )
+    monkeypatch.setattr(
+        runtime_paths, "find_model_file", lambda name, folder: root / folder / name
+    )
+    vocab = tmp_path / "vocab.txt"
+    vocab.write_text("person")
+    output = tmp_path / "output"
+    with pytest.raises(ValueError, match="MobileCLIP checkpoint"):
+        run(primary, root, vocab, [0, -1, 0], output)
+    assert not output.exists()

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 import time
 
@@ -82,9 +83,30 @@ def run(primary, model_root, vocabulary, world_up, output):
         # Refuse a mismatch instead of attributing another checkpoint to this run.
         from scene_graph.runtime_paths import find_model_file
 
-        resolved = find_model_file(weights.name, "yoloe")
-        if resolved is None or resolved.resolve() != weights.resolve():
-            raise ValueError("runtime YOLOE checkpoint differs from --model-root")
+        for checkpoint in (weights, model_root / "yoloe/yoloe-v8l-seg.pt"):
+            resolved = find_model_file(checkpoint.name, "yoloe")
+            if resolved is None or resolved.resolve() != checkpoint.resolve():
+                raise ValueError("runtime YOLOE checkpoint differs from --model-root")
+        text_checkpoint = model_root / "mobileclip/mobileclip_blt.pt"
+        # The existing text backend tries these overrides before the model root.
+        # External files would otherwise escape the compiled stage fingerprint.
+        text_candidates = [
+            Path(os.environ[name]).expanduser()
+            for name in ("MOBILECLIP_BLT_CKPT", "MOBILECLIP_CHECKPOINT")
+            if os.environ.get(name)
+        ]
+        if os.environ.get("MOBILECLIP_WEIGHTS_DIR"):
+            text_candidates.append(
+                Path(os.environ["MOBILECLIP_WEIGHTS_DIR"]).expanduser()
+                / text_checkpoint.name
+            )
+        text_candidates.append(text_checkpoint)
+        resolved_text = next((p for p in text_candidates if p.is_file()), None)
+        if (
+            resolved_text is None
+            or resolved_text.resolve() != text_checkpoint.resolve()
+        ):
+            raise ValueError("runtime MobileCLIP checkpoint differs from --model-root")
     output.mkdir(parents=True)
     write_json(output / "plan.json", plan)
     dest = output / "yoloe"
