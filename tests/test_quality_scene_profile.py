@@ -353,3 +353,151 @@ def test_complementary_union_requires_primary_view_and_person_authority(tmp_path
     write(first, a)
     with pytest.raises(ValueError, match="person query"):
         union_proposals(first, [second], tmp_path / "no_exclusions")
+
+
+@pytest.mark.parametrize(
+    "invalid", [None, "ineligible", "same_timestamp", "changed_tile"]
+)
+def test_validated_cohort_preserves_masks_exclusions_and_flattened_indices(
+    tmp_path, monkeypatch, invalid
+):
+    from farm_runtime.quality.scene_profile import validated_cohort
+    from farm_runtime.quality import surface_evidence
+    from farm_runtime.quality.proposal_geometry import read_masks
+
+    image = tmp_path / "rgb.png"
+    Image.new("RGB", (4, 4)).save(image)
+    expected = {}
+
+    def source(name, timestamp, labels):
+        directory = tmp_path / name
+        (directory / "masks").mkdir(parents=True)
+        arrays = {
+            f"mask_{i}": (np.arange(16).reshape(4, 4) - i - 7).astype(np.float16)
+            for i in range(len(labels))
+        }
+        target = directory / "masks" / "view.npz"
+        np.savez_compressed(target, **arrays)
+        row = dict(
+            name="source" if name == "original" else "extra",
+            timestamp=timestamp,
+            source_image=describe_file(image),
+            grid_shape_hw=[4, 4],
+            applied_quarter_turns=0,
+            queries=[dict(prompt="person")],
+            detections=[
+                dict(
+                    index=i,
+                    label=label,
+                    score=0.9,
+                    logit_key=f"mask_{i}",
+                    grid_window_xyxy=[0, 0, 4, 4],
+                )
+                for i, label in enumerate(labels)
+            ],
+            mask_artifact=describe_file(target),
+        )
+        path = write(
+            directory / "manifest.json", dict(test_opened=False, observations=[row])
+        )
+        expected[name] = arrays
+        return path, row
+
+    original, first = source("original", "1", ["box", "person"])
+    extra, second = source(
+        "extra", "1" if invalid == "same_timestamp" else "2", ["person"]
+    )
+    supplement, third = source(
+        "supplement", second["timestamp"], ["unrelated", "device"]
+    )
+    transient = dict(first, detections=[first["detections"][1]])
+    transient_path = write(
+        original.parent / "transients.json",
+        dict(test_opened=False, observations=[transient]),
+    )
+    geometry = write(tmp_path / "geometry.json", dict(groups=[dict(id=7, members=[0])]))
+    inputs = SimpleNamespace(
+        geometry=json.loads(geometry.read_text()),
+        geometry_path=geometry,
+        nodes={0: dict(frame="source", representative_detection=0)},
+        observations={"source": first},
+        transients={"source": transient},
+        proposals_path=original,
+        transients_path=transient_path,
+    )
+    monkeypatch.setattr(surface_evidence, "SurfaceInputs", lambda path: inputs)
+    audit = write(
+        tmp_path / "audit.json", dict(source_geometry=describe_file(geometry))
+    )
+    validation = write(
+        tmp_path / "validation.json",
+        dict(
+            closed_test_opened=False,
+            release_eligible=False,
+            source_audit=describe_file(audit),
+            source_proposals=describe_file(extra),
+            supplements=[describe_file(supplement)],
+            groups=[
+                dict(
+                    group_id=7,
+                    extra_matches=[
+                        dict(
+                            name="extra",
+                            selected_detection=2,
+                            decision="matched_static_surface",
+                            candidates=[
+                                dict(
+                                    detection_index=2, eligible=invalid != "ineligible"
+                                )
+                            ],
+                        )
+                    ],
+                )
+            ],
+        ),
+    )
+    if invalid == "changed_tile":
+        np.savez_compressed(
+            Path(third["mask_artifact"]["path"]),
+            mask_0=np.ones((4, 4)),
+            mask_1=np.ones((4, 4)),
+        )
+    output = tmp_path / "output"
+    if invalid:
+        with pytest.raises(
+            ValueError,
+            match={
+                "ineligible": "geometrically accepted",
+                "same_timestamp": "two independent timestamps",
+                "changed_tile": "proposal mask changed",
+            }[invalid],
+        ):
+            validated_cohort(validation, 7, output)
+        assert not (output / "manifest.json").exists()
+        return
+    validated_cohort(validation, 7, output)
+    cohort = json.loads((output / "manifest.json").read_text())
+    rows = cohort["observations"]
+    assert [r["timestamp"] for r in rows] == ["1", "2"]
+    assert [[d["label"] for d in r["detections"]] for r in rows] == [
+        ["box", "person"],
+        ["device", "person"],
+    ]
+    for row, keys in zip(
+        rows,
+        [
+            [("original", "mask_0"), ("original", "mask_1")],
+            [("supplement", "mask_1"), ("extra", "mask_0")],
+        ],
+    ):
+        masks = read_masks(row, output)
+        with np.load(Path(row["mask_artifact"]["path"])) as archive:
+            for i, (name, key) in enumerate(keys):
+                np.testing.assert_array_equal(
+                    archive[row["detections"][i]["logit_key"]], expected[name][key]
+                )
+                np.testing.assert_array_equal(masks[i], expected[name][key] > 0)
+    assert rows[1]["detections"][0]["cohort_source"]["detection_index"] == 1
+    transients = json.loads((output / "transients.json").read_text())["observations"]
+    assert all([d["label"] for d in r["detections"]] == ["person"] for r in transients)
+    assert cohort["inference_calls"] == 0 and cohort["original_group_id"] == 7

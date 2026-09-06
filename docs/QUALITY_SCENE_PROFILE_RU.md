@@ -142,3 +142,6 @@ quality release.
 4. Принятые observations передаются в `native-observations`; проверяйте reverse renders и extent stability. Повторное использование устаревшего review отклоняется.
 
 Это отдельные bounded development commands. Автоматический global recovery budget/reuse в scene-profile пока не реализован. Положительный результат для fire cabinet не означает доказанный перенос на все сцены или подтверждение физических размеров.
+
+
+Для следующей итерации recovery: `quality scene-profile cohort --validation VALIDATION --group-id ID --output NEW_DIR`. Выходы `manifest.json` и `transients.json` можно передать в `proposal-geometry` на том же зарегистрированном RGBD, затем снова в `surface-evidence`. Исходные и дополнительные accepted masks/person exclusions сохраняются без inference и без изменения logits. Новое group-ID namespace нужно читать из geometry результата: не переносите старый integer ID без проверки provenance. Требуются хотя бы2timestamps, accepted geometry selection и неизменённые source artifacts. Unit replay проверен на полном совпадении1252Gaussian IDs. VLM completeness/bbox pilot Stage27 пока не встроен в scene-profile.

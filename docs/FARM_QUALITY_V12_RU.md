@@ -1,7 +1,7 @@
 # FARM V12: воспроизводимость и независимая оценка качества
 
 Документ содержит инфраструктуру F0/F1 и обновление реализации FARM от 2026-09-05.
-Текущий отчёт и изображения: `output/farm_pipeline/factory/experiments/factory-universal-v12-quality-v1/26_camera_completion/REVIEW_RU.md` относительно `3dgs_work`.
+Текущий отчёт и изображения: `output/farm_pipeline/factory/experiments/factory-universal-v12-quality-v1/27_recovery_transfer/REVIEW_RU.md` относительно `3dgs_work`.
 Реализованы rig-preserving RGB↔3DGS registration, angular/upright discovery ablation,
 расширение exact-lift кандидатов по build surface, native-support OBB и финальный CSR allowlist export.
 Шесть объектов имеют проверяемые masks/labels/captions/scope. Универсальная точность,
@@ -389,3 +389,12 @@ Opt-in `quality proposal-geometry --partial-view-association`: только дл
 ## 31. Полный camera pool и разрешение scope ambiguity
 
 V12/26_camera_completion/REVIEW_RU.md: новый camera-completion выбирает2 timestamps из6310 COLMAP metadata до RGB; регистрация8views сохраняет anchors/исходную поверхность. Из двух новых направлений одно окклюдировано: depth screening должен идти до SAM. Geometric crop + Qwen scope-review с двумя порядками кандидатов восстанавливают целый fire cabinet. VLM допускается только при согласии с уже лучшим геометрическим кандидатом; immutable inputs/candidate evidence проверяются. Native3timestamps/13872IDs вместо5120: на тех же3build views meanIoU0,67918→0,95375,recall0,69541→0,99005. Все3сравнения просмотрены, внешняя труба исключена, небольшие погрешности границ остаются. Это не independent accuracy; observed thickness0,265m чувствительна на40%, physical extent неизвестен.1282tests/64,86с. Эти opt-in utilities ещё не входят в общий18-stage DAG; далее перенос на unit/Knaack и глобальный recovery budget.
+
+
+## 32. Повторное использование observations и полнота unit
+
+`scene-profile cohort --validation PATH --group-id ID --output NEW` сохраняет logits/person exclusions/flattened source indices и связывает следующий recovery с принятыми observations. Replayunit воспроизвёл1252Gaussian IDs точно. Четыре новых теста;1286fulltests/64,22с.
+
+Stage27показал, что1387/1393corroborated points могут описывать лишь неполную светлую часть unit. Ещё2готовых RGBD views и projection-tracker повторяют ошибку;YOLOE не обнаруживает unit. Targeted VLM bbox с сохранением уже подтверждённого bbox дал2полные SAM masks, принятые существующим geometry validator. Варианты с VLM point на стене не выбраны. Native5timestamps/2087IDs восстанавливает чёрную грань на всех5просмотренных projections; новые whole-mask build references IoU0,67629→0,91737,recall0,70816→0,97026. Это не independent gold, старые2D references неполны. VLM completion остаётся experiment, default не меняется.
+
+Штатные semantics/catalog используют обновлённые masks:unit `wall-mounted device`, fire cabinet `fire hose box`. Каталоги V12/27_recovery_transfer/catalog_v1 и26_camera_completion/catalog_v1; observed OBB, physical-size unknown. Далее распространение полного scope на старые2D masks и Knaack; общий recovery budget в DAG пока не включён.

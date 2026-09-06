@@ -285,6 +285,150 @@ def union_proposals(primary, supplements, output, *, maximum_primary_iou=None):
     )
 
 
+def validated_cohort(validation_path, group_id, output):
+    """Reuse accepted observations in a later recovery iteration, without inference.
+
+    Original logits and person exclusions are copied with exact source bindings.
+    The cohort does not assert a new association or promote model labels.
+    """
+    from farm_runtime.quality.proposal_geometry import read_masks, read_observations
+    from farm_runtime.quality.surface_evidence import SurfaceInputs
+
+    validation = read(validation_path)
+    if (
+        output.exists()
+        or validation.get("closed_test_opened") is not False
+        or validation.get("release_eligible") is not False
+    ):
+        raise ValueError("new output and development validation required")
+    audit = read(checked_file(validation["source_audit"]))
+    inputs = SurfaceInputs(checked_file(audit["source_geometry"]))
+    groups = {g["id"]: g for g in inputs.geometry["groups"]}
+    rows = {g["group_id"]: g for g in validation["groups"]}
+    if group_id not in groups or group_id not in rows:
+        raise ValueError("group absent from validation/geometry")
+    fields = ("timestamp", "source_image", "grid_shape_hw", "applied_quarter_turns")
+    extras = {}
+    for descriptor in [
+        validation["source_proposals"],
+        *validation.get("supplements", []),
+    ]:
+        path = checked_file(descriptor)
+        _, observations = read_observations(path)
+        for obs in observations:
+            name = obs["name"]
+            if name in extras and any(obs[k] != extras[name][0][1][k] for k in fields):
+                raise ValueError("cohort supplement identity/grid mismatch")
+            extras.setdefault(name, []).append((path, obs))
+    selected = {}
+    for node_id in groups[group_id]["members"]:
+        node = inputs.nodes[node_id]
+        name = node["frame"]
+        obs = inputs.observations[name]
+        transient = inputs.transients[name]
+        people = [
+            (inputs.transients_path, transient, i)
+            for i, d in enumerate(transient["detections"])
+            if d["label"] == "person"
+        ]
+        if name in selected:
+            raise ValueError("duplicate source group/frame")
+        selected[name] = (
+            obs,
+            [(inputs.proposals_path, obs, node["representative_detection"]), *people],
+        )
+    for match in rows[group_id]["extra_matches"]:
+        index = match["selected_detection"]
+        if index is None:
+            continue
+        eligible = {c["detection_index"] for c in match["candidates"] if c["eligible"]}
+        if match["decision"] != "matched_static_surface" or index not in eligible:
+            raise ValueError("cohort requires geometrically accepted observations")
+        name = match["name"]
+        if name in selected or name not in extras:
+            raise ValueError("duplicate or absent additional group/frame")
+        bindings = [
+            (path, obs, i)
+            for path, obs in extras[name]
+            for i in range(len(obs["detections"]))
+        ]
+        if (
+            not 0 <= index < len(bindings)
+            or bindings[index][1]["detections"][bindings[index][2]]["label"] == "person"
+        ):
+            raise ValueError("invalid additional object mask index")
+        people = [b for b in bindings if b[1]["detections"][b[2]]["label"] == "person"]
+        selected[name] = (extras[name][0][1], [bindings[index], *people])
+    if len({obs["timestamp"] for obs, _ in selected.values()}) < 2:
+        raise ValueError("cohort requires at least two independent timestamps")
+    output.mkdir(parents=True)
+    (output / "masks").mkdir()
+    observations, transients = [], []
+    for number, (name, (base, bindings)) in enumerate(selected.items()):
+        if not any(q["prompt"] == "person" for q in base["queries"]):
+            raise ValueError("explicit person exclusion query required")
+        checked_file(base["source_image"])
+        arrays, detections = {}, []
+        for j, (path, obs, index) in enumerate(bindings):
+            if any(obs[k] != base[k] for k in fields):
+                raise ValueError("cohort mask source identity/grid mismatch")
+            read_masks(obs, path.parent)
+            detection = obs["detections"][index]
+            key = f"mask_{j:04d}"
+            with np.load(
+                checked_file(obs["mask_artifact"]), allow_pickle=False
+            ) as archive:
+                arrays[key] = archive[detection["logit_key"]].copy()
+            detections.append(
+                dict(
+                    detection,
+                    index=j,
+                    logit_key=key,
+                    cohort_source=dict(
+                        manifest=describe_file(path),
+                        detection_index=index,
+                        source_logit_semantics=obs.get("logit_semantics"),
+                    ),
+                )
+            )
+        target = output / "masks" / f"view_{number:04d}.npz"
+        np.savez_compressed(target, **arrays)
+        row = dict(
+            base,
+            detections=detections,
+            mask_artifact=describe_file(target),
+            logit_semantics="Original uncalibrated source logits copied unchanged; >0 foreground; see cohort_source.",
+        )
+        observations.append(row)
+        transients.append(
+            dict(
+                row,
+                detections=detections[1:],
+                queries=[q for q in base["queries"] if q["prompt"] == "person"],
+            )
+        )
+    common = dict(
+        schema="farm.validated-observation-cohort.v1",
+        source_validation=describe_file(validation_path),
+        source_geometry=describe_file(inputs.geometry_path),
+        original_group_id=group_id,
+        observations=observations,
+        inference_calls=0,
+        test_opened=False,
+        closed_test_opened=False,
+        release_eligible=False,
+    )
+    write_json(output / "manifest.json", common)
+    write_json(
+        output / "transients.json",
+        dict(
+            common,
+            observations=transients,
+            role="unchanged validation person exclusions",
+        ),
+    )
+
+
 def segment(args):
     from farm_runtime.quality import concept_discovery
 
@@ -869,6 +1013,8 @@ def main(argv=None):
     q = command("union", ["primary"])
     q.add_argument("--supplement", type=Path, action="append", required=True)
     q.add_argument("--max-primary-iou", type=float, default=None)
+    q = command("cohort", ["validation"])
+    q.add_argument("--group-id", type=int, required=True)
     q = command("segment", ["plan", "vocabulary", "model"])
     q.add_argument("--views", type=int, required=True)
     q.add_argument("--world-up", type=float, nargs=3, required=True)
@@ -913,6 +1059,8 @@ def main(argv=None):
             args.output,
             maximum_primary_iou=args.max_primary_iou,
         )
+    elif args.phase == "cohort":
+        validated_cohort(args.validation, args.group_id, args.output)
     elif args.phase == "segment":
         segment(args)
     elif args.phase == "native":
