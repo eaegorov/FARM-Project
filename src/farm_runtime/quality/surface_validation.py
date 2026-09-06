@@ -73,6 +73,44 @@ def reference_surfaces(inputs, members):
     return references
 
 
+def source_support_conflicts(evidence, source_counts):
+    """Reject new masks that erase enough visible original foreground.
+
+    Check each source separately so a densely sampled view cannot hide loss
+    from a smaller source. Occluded, excluded and boundary-uncertain points
+    never count as background. Expansion beyond an incomplete source is allowed.
+    """
+    policy = GeometryPolicy()
+    if any(type(count) is not int or count < 0 for _, count in source_counts):
+        raise ValueError("nonnegative source point counts required")
+    if sum(count for _, count in source_counts) != len(evidence["visible"]):
+        raise ValueError("source point partition changed")
+    start = 0
+    rows = []
+    for name, count in source_counts:
+        end = start + count
+        visible = int(evidence["visible"][start:end].sum())
+        negative = int(evidence["negative"][start:end].sum())
+        enough = (
+            visible >= policy.min_points
+            and visible / max(1, count) >= policy.min_visible_fraction
+        )
+        rows.append(
+            dict(
+                source_name=name,
+                source_points=count,
+                visible_points=visible,
+                definite_background_points=negative,
+                source_foreground_contradicted=bool(
+                    enough
+                    and negative / max(1, visible) > policy.negative_mask_fraction
+                ),
+            )
+        )
+        start = end
+    return rows
+
+
 def select_observation(
     points,
     core,
@@ -86,6 +124,7 @@ def select_observation(
     scope_review=None,
     completion_preference=None,
     group_id=None,
+    source_counts=None,
 ):
     """Require visible core support and reciprocal static surface overlap.
 
@@ -157,6 +196,15 @@ def select_observation(
                 and r["reason"] == "partial_view_surface_support"
                 for r in partial_evidence
             ) and not any(r["decision"] == "separate" for r in partial_evidence)
+        preservation = (
+            source_support_conflicts(evidence, source_counts)
+            if source_counts is not None
+            else None
+        )
+        if preservation and any(
+            row["source_foreground_contradicted"] for row in preservation
+        ):
+            accepted = False
         score = 2 * agreement * reciprocal / max(1e-9, agreement + reciprocal)
         rows.append(
             dict(
@@ -170,6 +218,11 @@ def select_observation(
                 reciprocal_surface_agreement=reciprocal,
                 score=score,
                 eligible=accepted,
+                **(
+                    {"source_support_preservation": preservation}
+                    if preservation is not None
+                    else {}
+                ),
                 **(
                     {"partial_view_evidence": partial_evidence}
                     if partial_evidence
@@ -445,6 +498,10 @@ def main(argv=None):
                 scope_review=scope_choices.get((group_id, name)),
                 completion_preference=completion_preferences.get((group_id, name)),
                 group_id=group_id,
+                source_counts=[
+                    (node["frame"], len(inputs.clouds[f"node_{node['id']:04d}"]))
+                    for node in members
+                ],
                 partial_context=(
                     {"target_name": name, "references": references}
                     if references is not None
@@ -574,6 +631,7 @@ def main(argv=None):
             source_proposals=describe_file(args.proposals),
             supplements=supplements,
             matching_labels_are_not_identity=True,
+            source_support_policy="reject_visible_original_foreground_contradictions",
             partial_view_association=args.partial_view_association,
             **(
                 {
