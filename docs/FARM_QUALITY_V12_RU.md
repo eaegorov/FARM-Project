@@ -465,3 +465,21 @@ Stage39:8cases/2TS, Factory14/153/159/490/517/614,Knaack63/399.5-field scope:16c
 Две панели CONTEXT+MASKED PHOTO и4поля:8calls/31,364с,8/8valid,1360input tokens. Исправлены окно14 и пол153, но панель490 стала целым industrial cabinet, плоская399 — box. Общего улучшения нет; production defaults и каталоги сохранены. На просмотренных изображениях вырезы159 действительно входят в target, материал399 не установлен. Отчёт V12/39_compact_scope/REVIEW_RU.md.
 
 Дальше: контроль альтернативной VLM на этих же пикселях с учётом прошлых Qwen3.5-9B тестов, диагноз пустыхnative63/490, затем coverage/ranking и ограниченный добор зарегистрированных ракурсов. Physical dimensions остаютсяnull, универсальное качество не заявлено, closed test не открыт. Только Project A.
+
+## 44. Сравнение другой VLM на коротком описании
+
+Stage40: Qwen3.5-9B проверена на тех же8cases×2layouts,32 JPEG побайтно совпали с4B inputs.16запросов/248,930с, из них153,935с загрузка.15ответов обёрнуты в JSON fence, один проходит исходный validator; raw сохранены, payload разобран отдельно только для анализа. Есть исправления окна и некоторых панелей, но появились tape dispenser/white plastic pipe и неподтверждённые материалы. Общего выигрыша нет, модель/default не заменены. Веса уже имелись после Stage04/07. Отчёт V12/40_semantic_model_transfer/REVIEW_RU.md.
+
+## 45. Scope relations используют текущий native input
+
+Stage41,345d4e6,1391tests/76,62с: вложенность пересчитывается после recovery/refinement/quarantine по действующим build masks. Heldout не читается, transient pixels исключены, один физический timestamp — один голос. Factory45→47 связей без потерь старых; Knaack2→2. Пересчёт1,668/0,340с. Primary memberships и timestamp support обеих сцен точны, max confidence delta1,788e-7. Factory alternatives134:+32IDs,338:+1227/-4;13остальных общих точны, все4Knaack точны. Три old/new boards просмотрены.
+
+Пустая490 — в основном конкуренция с уже существующей294:1474из1819supported IDs принадлежат294. На двух просмотренных видах обе выбирают одну панель; создавать второй физический объект неверно. Диагностическое исключение294 даёт2112IDs, не применено. Knaack63 имеет другую причину:333из334spatial candidates без положительного timestamp, один имеет только один. Отчёт V12/41_current_scope/REVIEW_RU.md.
+
+## 46. Пустая труба: contributors и смесь rendered depth
+
+Stage42: global contributor search334→2016 не помогает при старом center-depth gate. Без этого gate получены679IDs; с сохранением проверки и допуском max(старый,2*depth_sigma) —622IDs. Все четыре native views просмотрены: маска следует висящей трубе, без заметного захвата стены/пола; верхний/скрытый участок не полностью восстановлен. Пересечения с прежним primary bank нет, но конкуренция всех объектов ещё должна быть повторена.
+
+ED сохранена корректно и уже нормализована по opacity; source render совпал точно. Scene alpha≈1, вклад трубы≈0,44/0,54, средняя depth≈6,8/6,6м, глубина её Gaussian≈8,1/7,9м. Из E[z²] измерен sigma≈2м: среднее смеси не является точной поверхностью.2*sigma — эвристика, не калиброванный confidence interval.
+
+Следующий конкретный этап — bounded contributor fallback для групп с0supported claims до конкуренции: сейчас Factory0таких случаев,Knaack1. Реальныеcontributors + depth spread, прежние multiview/purity/exclusion gates, затем полная общая конкуренция и проверка старых masks. Budget≤4objects,≤4TS/8views, bounded candidates. Пока prototype, defaults не менялись. Отчёт V12/42_contributor_candidates/REVIEW_RU.md. Closed test не открыт, physical dimensions не валидированы.
