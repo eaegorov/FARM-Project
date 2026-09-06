@@ -681,66 +681,79 @@ def load_prepared(path):
 
 
 def reverse_review(gaussians, run, bank, config, input_manifest, output):
+    """Render bounded batches of objects sharing a frame; retain output order."""
     by_id = {
         int(oid): bank["indices"][bank["indptr"][i] : bank["indptr"][i + 1]]
         for i, oid in enumerate(bank["object_ids"])
     }
     frames = {r["image_id"]: r for r in input_manifest["frames"]}
-    rows = []
+    jobs = {}
+    order = []
     for obj in run.objects:
         if obj.object_id not in by_id:
             continue
-        selected = []
         timestamps = set()
         for obs in obj.observations:
             frame = run.frame(obs.image_id)
-            if frame.physical_timestamp not in timestamps:
-                selected.append(obs)
-                timestamps.add(frame.physical_timestamp)
-        for obs in selected:
-            frame = run.frame(obs.image_id)
+            if frame.physical_timestamp in timestamps:
+                continue
+            timestamps.add(frame.physical_timestamp)
+            jobs.setdefault(obs.image_id, []).append((obj.object_id, obs))
+            order.append((obj.object_id, obs.image_id))
+    rows = {}
+    for image_id, items in jobs.items():
+        frame = run.frame(image_id)
+        with Image.open(checked_file(frames[image_id]["source"])) as im:
+            rgb = np.asarray(
+                im.convert("RGB").resize((frame.depth_size[1], frame.depth_size[0]))
+            )
+        # Eight objects use17 render channels, within lift's32-channel contract.
+        # Keep memory bounded independently of the scene's total object count.
+        for start in range(0, len(items), 8):
+            batch = items[start : start + 8]
+            object_ids = [oid for oid, _ in batch]
             decoded, _, _, _ = lift._load_view_masks(
-                run, frame, {obj.object_id: [obs]}, config
+                run, frame, {oid: [obs] for oid, obs in batch}, config
             )
-            mass = lift.reverse_render(gaussians, run, frame, [obj.object_id], by_id)[
-                0
-            ][..., 0]
-            raw = decoded[obj.object_id]["raw"]
-            predicted = mass >= config["heldout"]["alpha_threshold"]
-            with Image.open(checked_file(frames[frame.image_id]["source"])) as im:
-                rgb = np.asarray(im.convert("RGB").resize((raw.shape[1], raw.shape[0])))
-            layers = []
-            for mask, color in [
-                (None, None),
-                (raw, [30, 205, 255]),
-                (predicted, [240, 170, 35]),
-            ]:
-                panel = rgb.copy()
-                if mask is not None:
-                    panel[mask] = (panel[mask] * 0.5 + np.asarray(color) * 0.5).astype(
-                        np.uint8
+            masses = lift.reverse_render(gaussians, run, frame, object_ids, by_id)[0]
+            for column, (oid, obs) in enumerate(batch):
+                raw = decoded[oid]["raw"]
+                predicted = masses[..., column] >= config["heldout"]["alpha_threshold"]
+                layers = []
+                for mask, color in [
+                    (None, None),
+                    (raw, [30, 205, 255]),
+                    (predicted, [240, 170, 35]),
+                ]:
+                    panel = rgb.copy()
+                    if mask is not None:
+                        panel[mask] = (
+                            panel[mask] * 0.5 + np.asarray(color) * 0.5
+                        ).astype(np.uint8)
+                    panel = Image.fromarray(
+                        rotate_image(panel, frames[image_id]["applied_quarter_turns"])
                     )
-                panel = Image.fromarray(
-                    rotate_image(panel, frames[frame.image_id]["applied_quarter_turns"])
+                    panel.thumbnail((640, 640))
+                    layers.append(panel)
+                sheet = Image.new("RGB", (1920, 680), "#111827")
+                draw = ImageDraw.Draw(sheet)
+                draw.text(
+                    (8, 8),
+                    f"group {oid} | {frame.source_image} | BUILD consistency, not heldout accuracy",
+                    fill="white",
                 )
-                panel.thumbnail((640, 640))
-                layers.append(panel)
-            sheet = Image.new("RGB", (1920, 680), "#111827")
-            draw = ImageDraw.Draw(sheet)
-            draw.text(
-                (8, 8),
-                f"group {obj.object_id} | {frame.source_image} | BUILD consistency, not heldout accuracy",
-                fill="white",
-            )
-            for i, (panel, label) in enumerate(
-                zip(layers, ["RGB", "2D source mask", "Native Gaussian reverse render"])
-            ):
-                draw.text((i * 640 + 8, 27), label, fill="white")
-                sheet.paste(panel, (i * 640, 40))
-            path = output / f"group_{obj.object_id:04d}_view_{frame.image_id:04d}.jpg"
-            sheet.save(path, quality=94)
-            rows.append(describe_file(path))
-    return rows
+                for i, (panel, label) in enumerate(
+                    zip(
+                        layers,
+                        ["RGB", "2D source mask", "Native Gaussian reverse render"],
+                    )
+                ):
+                    draw.text((i * 640 + 8, 27), label, fill="white")
+                    sheet.paste(panel, (i * 640, 40))
+                path = output / f"group_{oid:04d}_view_{image_id:04d}.jpg"
+                sheet.save(path, quality=94)
+                rows[oid, image_id] = describe_file(path)
+    return [rows[key] for key in order]
 
 
 def retained_timestamp_counts(path, geometry_path):

@@ -30,13 +30,23 @@ def evidence_rows(path, geometry, native, checked):
         if not record or record["sha256"] != expected["sha256"]:
             raise ValueError("appearance evidence binding mismatch")
         checked_file(record)
-    groups, seen = defaultdict(list), set()
+    groups, seen, seen_sources = defaultdict(list), set(), set()
     for row in document["observations"]:
         key = (row["object_id"], row["image_id"])
         if key in seen:
             raise ValueError("duplicate appearance observation")
         seen.add(key)
+        name = row.get("source_name")
+        if not isinstance(name, str) or not name:
+            raise ValueError("stable appearance source name required")
+        source_key = row["object_id"], name
+        if source_key in seen_sources:
+            raise ValueError("duplicate appearance source observation")
+        seen_sources.add(source_key)
         normalized = dict(row)
+        # The frame number is local to a prepared view list. The source name,
+        # timestamp, RGB, mask, crop and their order still bind the annotation.
+        normalized.pop("image_id")
         for field in ("source_image", "crop", "masks", "native_mask"):
             record = row.get(field)
             if record is None and field == "native_mask":
@@ -111,6 +121,32 @@ def refresh_appearance(previous_stage, evidence, model, output):
     for oid in retained:
         for sheet in objects[oid]["sheets"]:
             checked_file(sheet)
+    rebindings = []
+    preserved = []
+    for oid in retained:
+        old_ids = [r["image_id"] for r in old["observations"] if r["object_id"] == oid]
+        new_views = [r for r in fresh["observations"] if r["object_id"] == oid]
+        new_ids = [r["image_id"] for r in new_views]
+        item = objects[oid]
+        if old_ids != new_ids:
+            rebindings.append(
+                dict(
+                    group_id=oid,
+                    previous_image_ids=old_ids,
+                    current_image_ids=new_ids,
+                    source_names=[r["source_name"] for r in new_views],
+                )
+            )
+            parsed = item.get("parsed")
+            if isinstance(parsed, dict) and "observed_image_ids" in parsed:
+                if parsed["observed_image_ids"] != old_ids:
+                    raise ValueError(
+                        "retained annotation image IDs differ from its evidence"
+                    )
+                # Preserve raw model output and sheets with their old provenance;
+                # only translate parsed references into the current local IDs.
+                item = dict(item, parsed=dict(parsed, observed_image_ids=new_ids))
+        preserved.append(item)
     output.mkdir(parents=True)
     new = None
     if changed:
@@ -147,7 +183,7 @@ def refresh_appearance(previous_stage, evidence, model, output):
         new if new else prior,
         proposals=describe_file(evidence),
         objects=sorted(
-            [objects[oid] for oid in retained] + (new["objects"] if new else []),
+            preserved + (new["objects"] if new else []),
             key=lambda r: r["object_id"],
         ),
         model_load_seconds=new["model_load_seconds"] if new else 0.0,
@@ -156,6 +192,7 @@ def refresh_appearance(previous_stage, evidence, model, output):
             previous_stage=describe_file(previous_stage),
             previous_appearance=describe_file(prior_path),
             retained_group_ids=retained,
+            image_id_rebindings=rebindings,
             refreshed_group_ids=changed,
             new_review_requests=len(changed),
             mode="preserve_existing_annotations_on_identical_evidence",

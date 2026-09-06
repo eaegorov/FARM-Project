@@ -170,7 +170,6 @@ def test_unchanged_evidence_preserves_raw_annotations_without_model_load(case):
         "source_image",
         "native_mask",
         "timestamp",
-        "image_id",
         "source_name",
         "crop_source_xyxy",
         "turns",
@@ -186,7 +185,6 @@ def test_changed_object_is_reviewed_without_relabeling_unchanged_objects(case, f
     else:
         row[field] = {
             "timestamp": "3",
-            "image_id": 3,
             "source_name": "other_camera",
             "crop_source_xyxy": [1, 0, 20, 20],
             "turns": 1,
@@ -236,3 +234,34 @@ def test_reordered_views_require_new_review(case):
     result = run(case)
     assert case["calls"] == [[7]]
     assert result["annotation_retention"]["retained_group_ids"] == [9]
+
+
+def test_local_frame_renumbering_retains_annotation_and_translates_parsed_ids(case):
+    previous = json.loads(case["stage"].read_text())
+    path = Path(previous["appearance"]["path"])
+    appearance = json.loads(path.read_text())
+    for obj in appearance["objects"]:
+        obj["parsed"]["observed_image_ids"] = [1, 2]
+    write_json(path, appearance)
+    previous["appearance"] = describe_file(path)
+    write_json(case["stage"], previous)
+    for row in case["fresh"]["observations"]:
+        row["image_id"] += 100
+    result = run(case)
+    assert case["calls"] == []
+    for item, original in zip(result["objects"], appearance["objects"]):
+        assert item["raw"] == original["raw"]
+        assert item["sheets"] == original["sheets"]
+        assert item["parsed"]["label"] == original["parsed"]["label"]
+        assert item["parsed"]["observed_image_ids"] == [101, 102]
+    assert [
+        r["group_id"] for r in result["annotation_retention"]["image_id_rebindings"]
+    ] == [7, 9]
+
+
+def test_different_local_ids_cannot_disguise_duplicate_source_frame(case):
+    rows = case["fresh"]["observations"]
+    rows[1]["source_name"] = rows[0]["source_name"]
+    with pytest.raises(ValueError, match="duplicate appearance source"):
+        run(case)
+    assert case["calls"] == []
