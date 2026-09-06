@@ -120,8 +120,11 @@ def select_observation(
             else 0.0
         )
         fraction = visible / max(1, int(core.sum()))
+        # Dense source samples can collapse onto a few target pixels.
+        # Require the same minimum static surface support at both ends.
         accepted = (
-            visible >= 20
+            len(candidate) >= 20
+            and visible >= 20
             and fraction >= 0.25
             and agreement >= 0.8
             and reciprocal >= 0.3

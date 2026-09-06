@@ -305,3 +305,59 @@ def test_partial_additional_view_keeps_visible_background_and_exclusions():
             )[0]
             is None
         )
+
+
+def test_dense_source_samples_do_not_replace_independent_target_depth_support():
+    from farm_runtime.proposal_geometry import surface_points
+    from farm_runtime.quality.surface_validation import select_observation
+
+    f = frame()
+    for target_pixels in (4, 19, 20):
+        f = frame()
+        mask = np.zeros((20, 20), bool)
+        mask[6:12, 6:13] = True
+        # Erosion leaves 4x5 independent target depth pixels.
+        positions = [(y, x) for y in range(7, 11) for x in range(7, 12)]
+        for y, x in positions[target_pixels:]:
+            f["excluded"][y, x] = True
+        distinct, metrics = surface_points(mask, **f)
+        assert metrics["sampled_points"] == target_pixels
+        # A dense source can put hundreds of 3D samples on just a few target
+        # pixels. Reciprocal agreement=1 does not provide more target evidence.
+        points = np.repeat(distinct, 40, axis=0)
+        selected, rows, _ = select_observation(
+            points,
+            np.ones(len(points), bool),
+            [mask],
+            [dict(label="panel", score=0.99)],
+            f,
+            None,
+            0.05,
+        )
+        assert rows[0]["core_visible_points"] == len(points)
+        assert rows[0]["reciprocal_surface_agreement"] == 1
+        assert rows[0]["core_mask_agreement"] == 1
+        assert selected == (0 if target_pixels >= 20 else None)
+
+
+def test_completion_preference_cannot_accept_an_underresolved_target_surface():
+    from farm_runtime.proposal_geometry import surface_points
+    from farm_runtime.quality.surface_validation import select_observation
+
+    f = frame()
+    mask = np.zeros((20, 20), bool)
+    mask[8:12, 8:12] = True
+    points, metrics = surface_points(mask, **f)
+    assert metrics["sampled_points"] == 4
+    points = np.repeat(points, 40, axis=0)
+    selected, rows, _ = select_observation(
+        points,
+        np.ones(len(points), bool),
+        [mask],
+        [dict(label="panel", score=0.99)],
+        f,
+        None,
+        0.05,
+        completion_preference=dict(fallback_detection=0, candidate_indices=[0]),
+    )
+    assert selected is None and rows[0]["eligible"] is False
