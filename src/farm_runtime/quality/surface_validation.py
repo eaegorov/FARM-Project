@@ -263,6 +263,22 @@ def select_observation(
                 for r in preferred[1:]
             )
             if not ambiguous:
+                # Among the same scope, prefer a mask reproduced by both SAM
+                # prompt variants. Reciprocal overlap with a clipped source can
+                # otherwise reward holes. This never resolves scope ambiguity
+                # and never adds candidates that failed geometry/core preservation.
+                for candidate in preferred:
+                    variants = {
+                        detections[i].get("variant")
+                        for i in candidate["equivalent_detection_indices"]
+                        if i in completion_preference["candidate_indices"]
+                    }
+                    if {"vlm_box", "vlm_missing_parts"} <= variants and mask_overlap(
+                        masks[best["detection_index"]],
+                        masks[candidate["detection_index"]],
+                    )[0] >= 0.8:
+                        best = candidate
+                        break
                 return best["detection_index"], rows, "matched_static_surface"
         if any(r["detection_index"] == fallback for r in eligible):
             return fallback, rows, "matched_static_surface"

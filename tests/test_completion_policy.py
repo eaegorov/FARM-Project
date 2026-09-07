@@ -298,3 +298,79 @@ def test_ambiguous_completion_binds_policy_and_geometric_best(tmp_path, fault):
             candidate_indices=[6, 8], seed_detection=3, fallback_detection=None
         )
         assert result[8, "view.png"]["fallback_detection"] == 4
+
+
+def test_consistent_completion_can_restore_extent_without_weakening_geometry():
+    frame, partial, full, points = selection_case()
+    incomplete = full.copy()
+    incomplete[2:4] = False
+    masks = [partial, incomplete, full, full.copy()]
+    detections = [
+        dict(label="object", score=0.95, variant=variant)
+        for variant in ("tracker", "vlm_box", "vlm_box", "vlm_missing_parts")
+    ]
+    preference = dict(candidate_indices=[1, 2, 3], fallback_detection=0)
+    args = (points, np.ones(len(points), bool), masks, detections, frame, None, 0.05)
+    selected, evidence, _ = select_observation(*args, completion_preference=preference)
+    assert selected == 2
+    assert next(r for r in evidence if r["detection_index"] == 2)["eligible"]
+    # Same masks and scores with only one prompt variant retain the old ranking.
+    single_variant = [dict(d, variant="vlm_box") for d in detections]
+    old, before, _ = select_observation(
+        *args[:3], single_variant, *args[4:], completion_preference=preference
+    )
+    assert old == 1
+    assert before == evidence
+
+
+def test_prompt_consistency_does_not_settle_competing_scopes():
+    frame, partial, _, points = selection_case()
+    first, second = np.zeros_like(partial), np.zeros_like(partial)
+    first[2:17, 2:17] = True
+    second[3:18, 3:18] = True
+    masks = [partial, first, first.copy(), second, second.copy()]
+    detections = [
+        dict(label="object", score=0.95, variant=v)
+        for v in (
+            "tracker",
+            "vlm_box",
+            "vlm_missing_parts",
+            "vlm_box",
+            "vlm_missing_parts",
+        )
+    ]
+    selected, _, _ = select_observation(
+        points,
+        np.ones(len(points), bool),
+        masks,
+        detections,
+        frame,
+        None,
+        0.05,
+        completion_preference=dict(
+            candidate_indices=[1, 2, 3, 4], seed_detection=0, fallback_detection=None
+        ),
+    )
+    assert selected is None
+
+
+def test_prompt_consistency_cannot_jump_to_a_different_extent():
+    frame, partial, full, points = selection_case()
+    masks = [partial, partial.copy(), full, full.copy()]
+    detections = [
+        dict(label="object", score=0.95, variant=v)
+        for v in ("tracker", "vlm_box", "vlm_box", "vlm_missing_parts")
+    ]
+    # Keep tracker and proposed duplicate separate in equivalence representative:
+    detections[1]["score"] = 0.99
+    selected, _, _ = select_observation(
+        points,
+        np.ones(len(points), bool),
+        masks,
+        detections,
+        frame,
+        None,
+        0.05,
+        completion_preference=dict(candidate_indices=[1, 2, 3], fallback_detection=0),
+    )
+    assert selected == 1
