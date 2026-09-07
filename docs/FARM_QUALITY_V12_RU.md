@@ -1,7 +1,7 @@
 # FARM V12: воспроизводимость и независимая оценка качества
 
-Документ содержит инфраструктуру F0/F1 и обновление реализации FARM по 2026-09-06.
-Текущий отчёт и изображения: `output/farm_pipeline/factory/experiments/factory-universal-v12-quality-v1/45_resolved_view_support/REVIEW_RU.md` относительно `3dgs_work`.
+Документ содержит инфраструктуру F0/F1 и обновление реализации FARM по 2026-09-07.
+Текущий отчёт и изображения: **output/farm_pipeline/factory/experiments/factory-universal-v12-quality-v1/53_semantic_evidence/REVIEW_RU.md** относительно **3dgs_work**. Общий Factory catalog: 138 кандидатов, 123 непустые native masks, 75 описаний. Это development inventory, не число подтверждённых физических объектов.
 Реализованы rig-preserving RGB↔3DGS registration, angular/upright discovery ablation,
 расширение exact-lift кандидатов по build surface, native-support OBB и финальный CSR allowlist export.
 Шесть объектов имеют проверяемые masks/labels/captions/scope. Универсальная точность,
@@ -576,3 +576,18 @@ Stage51,95e5135: quality registered-frames сохраняет исходную g
 
 Отчёт V12/51_registered_frame_extension/REVIEW_RU.md. Это cohort replay, не итог всей сцены и не полностью автоматический object scheduler. Далее — объединить предыдущие5подтверждённых recovery групп40/159/0/614/517 с7новыми в общей native конкуренции (суммарно12≤16), затем refinement/catalog и сохранность прежних объектов. Общие каталоги пока Stage48Factory/Stage47Knaack; физические размеры и universal quality не приняты.
 
+## 57. Объединённый recovery проверен в общей сцене (2026-09-07)
+
+Stage52, c5d4335: 2–4 validated batches объединяются перед native при едином geometry namespace и точных camera/frame contracts. Только подтверждённые группы, общий лимит 16; conflicting same-frame masks отклоняются, exact duplicates не добавляют timestamps, person exclusions сохраняются. Single-source путь сохранён. 1485 tests /67,41 с.
+
+Factory Stage48+51:12 групп/32 object-view observations/56 кадров;8 обычных стадий 431,117 с от готовых geometry/validation. Итог 138/123/73.112/117 старых memberships точны; изменились 37/44/159/321/338. Новые 46:1337,97:2585,167:166,168:543,379:410,634:8530 IDs. Шкаф 634 и его 3 JPEG точны относительно проверенного cohort;88 пуст. Просмотрены 18 изменённых native/OBB строк и 14 новых semantic views. Сохраняются большие пропуски корпусов/панелей и неверные captions; OBB не доказывает полноту. Отчёт 52_combined_recovery/REVIEW_RU.md.
+
+## 58. Semantic quota стабилизирован; VLM ablations не приняты (2026-09-07)
+
+Stage53,56e4763: базовый semantic rank использует original independent timestamps, ограниченные retained evidence; recovery получает собственный резерв и не вытесняет прежние base candidates. Quarantine продолжает исключать группы без двух независимых наблюдений.34 focused /1,50 с;1486 fulltests /67,61 с.
+
+Appearance→catalog49,747 с без native rerun. Все 67 старых аннотаций точны по label/caption/uncertainty/raw/sheets; всего 75 описаний. Восстановлена 84, добавлена 113. Геометрия и quality138 объектов, native bank и scope bindings точны. Текущий Factory catalog:53_semantic_evidence/factory/runs/stable-v1/quality/catalog/catalog.json;native/OBB—Stage52. Knaack—Stage47.
+
+15development cases/30 исходных sheets: localPHOTO+maskedRGB, self-verification и candidate names.45 requests /87,752+51,417 с,44/45schema-valid; все 30 исходных sheets воспроизведены побайтно,30 localforeground views и 2 views113 просмотрены. Foreground исправляет 46/88/153, но создаёт tile167/leaf614; self-review сохраняет ошибки; candidate hypotheses исправляют window14/panel88, но не 634/153. Ни один variant не принят глобально. Model uncertainty не калибрована.
+
+Следующая работа — object/part/collection для 37/44/88/97/321/338 перед final ownership/OBB, foreground-grounded labels, прозрачный контейнер 46 и полностью автоматический raw-camera cohort. Отчёт 53_semantic_evidence/REVIEW_RU.md, аудит factory_audit_v1.json. Все physical dimensions null;closed test не открыт;универсальное качество не подтверждено.
