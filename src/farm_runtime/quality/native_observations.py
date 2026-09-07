@@ -159,10 +159,26 @@ def validation_observations(validation_path, geometry_path=None):
     return inputs, validation, observations, source_rows, extra, masks
 
 
-def confirmed_recovery_groups(geometry_path, validation_path):
+def recovery_observations(validation_path, geometry_path, supplements=()):
+    if not supplements:
+        return validation_observations(validation_path, geometry_path)
+    from farm_runtime.quality.recovery_observations import combine_recovery_batches
+
+    paths = [validation_path, *supplements]
+    if len({Path(p).resolve() for p in paths}) != len(paths):
+        raise ValueError("unique recovery validation sources required")
+    if len(paths) > 4:
+        raise ValueError("at most four recovery validations required")
+    return combine_recovery_batches(
+        [validation_observations(p, geometry_path) for p in paths],
+        [describe_file(p) for p in paths],
+    )
+
+
+def confirmed_recovery_groups(geometry_path, validation_path, supplements=()):
     """Add a bounded recovery cohort without displacing the original native budget."""
-    inputs, validation, observations, _, _, _ = validation_observations(
-        validation_path, geometry_path
+    inputs, validation, observations, _, _, _ = recovery_observations(
+        validation_path, geometry_path, supplements
     )
     if len(validation["groups"]) > 16:
         raise ValueError("recovery cohort must contain at most 16 groups")
@@ -198,7 +214,14 @@ def prepare(validation_path, config, output):
 
 
 def prepare_geometry(
-    geometry_path, config, output, world_up, group_ids=None, *, recovery_validation=None
+    geometry_path,
+    config,
+    output,
+    world_up,
+    group_ids=None,
+    *,
+    recovery_validation=None,
+    recovery_supplements=(),
 ):
     """Freeze observed multi-timestamp groups without inventing validation data.
 
@@ -211,8 +234,8 @@ def prepare_geometry(
     z_up_rotation(world_up)  # Validate before using gravity in the existing fitter.
     recovery, extra, extra_masks = {}, {}, {}
     if recovery_validation:
-        inputs, validation, recovery, _, extra, extra_masks = validation_observations(
-            recovery_validation, geometry_path
+        inputs, validation, recovery, _, extra, extra_masks = recovery_observations(
+            recovery_validation, geometry_path, recovery_supplements
         )
         if len(validation["groups"]) > 16:
             raise ValueError("recovery cohort must contain at most 16 groups")
@@ -316,6 +339,11 @@ def prepare_geometry(
         source_validation=(
             describe_file(recovery_validation) if recovery_validation else None
         ),
+        recovery_validations=(
+            [describe_file(p) for p in [recovery_validation, *recovery_supplements]]
+            if recovery_supplements
+            else []
+        ),
     )
 
 
@@ -369,6 +397,7 @@ def _prepare_native(
     output,
     *,
     source_validation=None,
+    recovery_validations=(),
 ):
     prep_path = getattr(
         inputs, "prep_manifest_path", inputs.frames_path.parent / "run_manifest.json"
@@ -537,6 +566,11 @@ def _prepare_native(
     manifest = dict(
         schema="farm.native-observation-input.v1",
         source_validation=source_validation,
+        **(
+            {"recovery_validations": recovery_validations}
+            if recovery_validations
+            else {}
+        ),
         source_geometry=describe_file(inputs.geometry_path),
         observation_origin=(
             "validated_additional_views"
@@ -804,6 +838,7 @@ def main(argv=None):
     parser.add_argument("--group-id", type=int, action="append")
     parser.add_argument("--world-up", type=float, nargs=3)
     parser.add_argument("--recovery-validation", type=Path)
+    parser.add_argument("--recovery-supplement", type=Path, action="append", default=[])
     source.add_argument("--input", type=Path, help="Reuse a frozen prepared input")
     for name in ("ply", "config", "output"):
         parser.add_argument("--" + name, type=Path, required=True)
@@ -826,6 +861,8 @@ def main(argv=None):
         raise ValueError(
             "--world-up is required only with --geometry; --group-id requires --geometry"
         )
+    if args.recovery_supplement and not args.recovery_validation:
+        raise ValueError("recovery supplements require a primary validation")
     if args.recovery_validation and not args.geometry:
         raise ValueError("--recovery-validation requires --geometry")
     if not 0 <= args.scope_alternative_budget <= 16:
@@ -844,6 +881,7 @@ def main(argv=None):
             args.world_up,
             args.group_id,
             recovery_validation=args.recovery_validation,
+            recovery_supplements=args.recovery_supplement,
         )
         input_path = args.output / "input" / "manifest.json"
     else:

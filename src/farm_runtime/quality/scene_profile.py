@@ -491,9 +491,14 @@ def native(args):
 
     chosen, deferred = bounded_groups(read(args.geometry), args.groups)
     recovery_validation = getattr(args, "recovery_validation", None)
+    supplements = getattr(args, "recovery_supplement", [])
+    if supplements and not recovery_validation:
+        raise ValueError("recovery supplements require a primary validation")
     recovered = (
         native_observations.confirmed_recovery_groups(
-            args.geometry, recovery_validation
+            args.geometry,
+            recovery_validation,
+            **({"supplements": supplements} if supplements else {}),
         )
         if recovery_validation
         else []
@@ -522,6 +527,7 @@ def native(args):
             "--output",
             str(args.output),
             *[x for g in chosen for x in ("--group-id", str(g))],
+            *[x for p in supplements for x in ("--recovery-supplement", str(p))],
             *(
                 ["--recovery-validation", str(recovery_validation)]
                 if recovery_validation
@@ -539,6 +545,11 @@ def native(args):
             candidate_budget=args.groups,
             recovery_added_group_ids=added,
             recovery_additional_budget_limit=16,
+            **(
+                {"source_recovery_supplements": [describe_file(p) for p in supplements]}
+                if supplements
+                else {}
+            ),
             source_recovery_validation=(
                 describe_file(recovery_validation) if recovery_validation else None
             ),
@@ -1302,6 +1313,7 @@ def main(argv=None):
     q.add_argument("--world-up", type=float, nargs=3, required=True)
     q = command("native", ["geometry", "ply", "config"])
     q.add_argument("--recovery-validation", type=Path)
+    q.add_argument("--recovery-supplement", type=Path, action="append", default=[])
     q.add_argument("--groups", type=int, default=128)
     q.add_argument("--alternatives", type=int, default=16)
     q.add_argument("--world-up", type=float, nargs=3, required=True)
