@@ -21,6 +21,7 @@ ACTIONS = {
     "scope-review": "scope_review",
     "scope-completion": "scope_completion",
     "camera-completion": "camera_completion",
+    "registered-frames": "registered_frames",
     "native-observations": "native_observations",
     "native-review": "native_review",
     "native-evaluation": "native_evaluation",

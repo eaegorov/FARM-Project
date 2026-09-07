@@ -20,6 +20,7 @@ from farm_runtime.proposal_geometry import project_evidence
 from farm_runtime.quality.mask_refinement import checked_file
 from farm_runtime.quality.proposal_geometry import read_masks, read_observations
 from farm_runtime.quality.surface_evidence import SurfaceInputs
+from farm_runtime.quality.registered_frames import extension_kwargs
 from farm_runtime.quality_baseline import describe_file, write_json
 from farm_runtime.segmentation_refinement import CachedSAMRefiner, prompt_variants
 
@@ -126,7 +127,9 @@ def main(argv=None):
             for m in g["extra_matches"]
             if m["selected_detection"] is None
         }
-    inputs = SurfaceInputs(checked_file(audit["source_geometry"]))
+    inputs = SurfaceInputs(
+        checked_file(audit["source_geometry"]), **extension_kwargs(audit)
+    )
     with np.load(checked_file(audit["point_evidence"]), allow_pickle=False) as z:
         clouds = {k: z[k] for k in z.files}
     requests = [

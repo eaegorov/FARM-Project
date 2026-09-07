@@ -22,6 +22,7 @@ from farm_runtime.native_object_geometry import fit_native_obb
 from farm_runtime.quality.mask_refinement import checked_file
 from farm_runtime.quality.proposal_geometry import read_masks, read_observations
 from farm_runtime.quality.surface_evidence import SurfaceInputs
+from farm_runtime.quality.registered_frames import extension_kwargs
 from farm_runtime.quality_baseline import describe_file, write_json
 from tools.farm_shaper_bridge import gaussian_lift as lift
 from tools.farm_shaper_bridge.common import (
@@ -75,7 +76,7 @@ def validation_observations(validation_path, geometry_path=None):
         describe_file(geometry_path)["sha256"] != audit["source_geometry"]["sha256"]
     ):
         raise ValueError("recovery belongs to a different geometry namespace")
-    inputs = SurfaceInputs(source_geometry)
+    inputs = SurfaceInputs(source_geometry, **extension_kwargs(audit))
     extra_path = checked_file(validation["source_proposals"])
     _, extras = read_observations(extra_path)
     extra = {r["name"]: r for r in extras}
@@ -369,7 +370,9 @@ def _prepare_native(
     *,
     source_validation=None,
 ):
-    prep_path = inputs.frames_path.parent / "run_manifest.json"
+    prep_path = getattr(
+        inputs, "prep_manifest_path", inputs.frames_path.parent / "run_manifest.json"
+    )
     prep = json.loads(prep_path.read_text())
     summary = json.loads(
         checked_file(inputs.geometry["inputs"]["prep_summary"]).read_text()
@@ -541,6 +544,11 @@ def _prepare_native(
             else "geometric_association_only"
         ),
         source_frames=describe_file(inputs.frames_path),
+        **(
+            {"registered_extension": inputs.registered_extension}
+            if getattr(inputs, "registered_extension", None)
+            else {}
+        ),
         source_prep_manifest=describe_file(prep_path),
         source_ply=source_ply,
         object_id_namespace="source geometry group IDs; distinct from legacy FARM IDs",
@@ -582,6 +590,18 @@ def load_prepared(path):
         or manifest.get("closed_test_opened") is not False
     ):
         raise ValueError("development native-observation input required")
+    if manifest.get("registered_extension"):
+        from farm_runtime.quality.registered_frames import load_extension
+
+        extension = load_extension(
+            checked_file(manifest["registered_extension"]),
+            checked_file(manifest["source_geometry"]),
+        )
+        if (
+            extension["merged_frames"] != manifest["source_frames"]
+            or extension["source_prep_manifest"] != manifest["source_prep_manifest"]
+        ):
+            raise ValueError("native registered extension binding changed")
     index = json.loads(checked_file(manifest["source_frames"]).read_text())
     prep = json.loads(checked_file(manifest["source_prep_manifest"]).read_text())
     config = prep["fingerprint_payload"]["config"]

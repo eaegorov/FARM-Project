@@ -23,12 +23,24 @@ from farm_runtime.surface_evidence import (
 
 
 class SurfaceInputs:
-    def __init__(self, geometry_path):
+    def __init__(self, geometry_path, *, registered_extension=None):
         self.geometry_path = geometry_path
         self.geometry = json.loads(geometry_path.read_text())
         if self.geometry.get("test_opened") is not False:
             raise ValueError("development-only geometry required")
         self.frames_path = checked_file(self.geometry["inputs"]["frames"])
+        self.prep_manifest_path = self.frames_path.parent / "run_manifest.json"
+        self.registered_extension = None
+        self.new_frame_names = None
+        if registered_extension is not None:
+            from farm_runtime.quality.registered_frames import load_extension
+
+            extension = load_extension(
+                registered_extension, geometry_path, self.frames_path
+            )
+            self.frames_path = checked_file(extension["merged_frames"])
+            self.registered_extension = describe_file(registered_extension)
+            self.new_frame_names = set(extension["new_names"])
         index = json.loads(self.frames_path.read_text())
         prep = json.loads(
             checked_file(self.geometry["inputs"]["prep_summary"]).read_text()
@@ -224,6 +236,7 @@ def main(argv=None):
     parser.add_argument("--view-budget", type=int, default=12)
     parser.add_argument("--plan", type=Path, required=True)
     parser.add_argument("--extra-views", type=int, default=2)
+    parser.add_argument("--registered-extension", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args(argv)
     if args.output.exists() or not 1 <= args.extra_views <= 4:
@@ -248,7 +261,14 @@ def main(argv=None):
     if plan.get("test_opened") is not False:
         raise ValueError("development-only sampling plan required")
     started = time.monotonic()
-    inputs = SurfaceInputs(args.geometry)
+    inputs = SurfaceInputs(
+        args.geometry,
+        **(
+            {"registered_extension": args.registered_extension}
+            if args.registered_extension
+            else {}
+        ),
+    )
     by_id = {g["id"]: g for g in inputs.geometry["groups"]}
     from farm_runtime.quality.recovery_schedule import (
         recovery_candidates,
@@ -321,7 +341,8 @@ def main(argv=None):
             set(timestamps),
             inputs,
             args.extra_views,
-            allowed_names=set(plan["sources"]),
+            allowed_names=set(plan["sources"])
+            & (getattr(inputs, "new_frame_names", None) or set(plan["sources"])),
         )
         if automatic:
             kept = budgeted_views(selected, names, args.view_budget)
@@ -410,6 +431,11 @@ def main(argv=None):
         args.output / "manifest.json",
         dict(
             schema="farm.surface-evidence.v1",
+            **(
+                {"registered_extension": inputs.registered_extension}
+                if getattr(inputs, "registered_extension", None)
+                else {}
+            ),
             source_geometry=describe_file(args.geometry),
             source_plan=describe_file(args.plan),
             groups=rows,

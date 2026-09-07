@@ -25,6 +25,7 @@ from farm_runtime.proposal_geometry import (
 from farm_runtime.quality.mask_refinement import checked_file
 from farm_runtime.quality.proposal_geometry import read_masks, read_observations
 from farm_runtime.quality.surface_evidence import SurfaceInputs
+from farm_runtime.quality.registered_frames import extension_kwargs
 from farm_runtime.quality_baseline import describe_file, write_json
 from farm_runtime.surface_evidence import aggregate_timestamps, point_observation
 from scripts.geometry.refine_farm_object_geometry import _fit_robust_obb
@@ -395,7 +396,7 @@ def main(argv=None):
     if audit.get("closed_test_opened") is not False:
         raise ValueError("development-only point audit required")
     geometry_path = checked_file(audit["source_geometry"])
-    inputs = SurfaceInputs(geometry_path)
+    inputs = SurfaceInputs(geometry_path, **extension_kwargs(audit))
     _, extra = read_observations(args.proposals)
     extra_plan = json.loads(checked_file(audit["adaptive_plan"]).read_text())
     source_manifest = json.loads(args.proposals.read_text())

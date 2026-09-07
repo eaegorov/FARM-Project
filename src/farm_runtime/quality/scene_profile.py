@@ -298,6 +298,7 @@ def validated_cohort(validation_path, group_id, output):
     """
     from farm_runtime.quality.proposal_geometry import read_masks, read_observations
     from farm_runtime.quality.surface_evidence import SurfaceInputs
+    from farm_runtime.quality.registered_frames import extension_kwargs
 
     validation = read(validation_path)
     if (
@@ -307,7 +308,9 @@ def validated_cohort(validation_path, group_id, output):
     ):
         raise ValueError("new output and development validation required")
     audit = read(checked_file(validation["source_audit"]))
-    inputs = SurfaceInputs(checked_file(audit["source_geometry"]))
+    inputs = SurfaceInputs(
+        checked_file(audit["source_geometry"]), **extension_kwargs(audit)
+    )
     groups = {g["id"]: g for g in inputs.geometry["groups"]}
     rows = {g["group_id"]: g for g in validation["groups"]}
     if group_id not in groups or group_id not in rows:
