@@ -363,3 +363,42 @@ def test_ambiguous_proposals_choose_best_eligible_tracker_without_accepting_it(
         tracker, validation, allow_ambiguous=True
     )
     assert [r["record"]["group_id"] for r in requests] == [22]
+
+
+@pytest.mark.parametrize("turns", range(4))
+def test_completion_context_preserves_raw_pixels_and_round_trips_grid(tmp_path, turns):
+    # Nonsquare image, unequal source/grid scaling, clipped expansion at left/top.
+    grid = np.zeros((12, 20), bool)
+    grid[2:6, 1:7] = True
+    rgb = np.arange(24 * 60 * 3, dtype=np.uint16).reshape(24, 60, 3).astype(np.uint8)
+    source = tmp_path / "source.png"
+    Image.fromarray(rgb).save(source)
+    source_box = [3, 4, 21, 12]
+    crop_path = tmp_path / "prior.png"
+    Image.fromarray(completion.rotate_image(rgb[4:12, 3:21], turns)).save(crop_path)
+    record = dict(
+        crop=describe_file(crop_path),
+        source_image=describe_file(source),
+        crop_grid_xyxy=[1, 2, 7, 6],
+        turns=turns,
+    )
+    prior, current, window, box = completion.completion_crop(record, grid)
+    assert window == [1, 2, 7, 6] and box is None
+    assert np.array_equal(np.asarray(prior), np.asarray(Image.open(crop_path)))
+    crop, current, window, box = completion.completion_crop(record, grid, 0.5)
+    assert window == [0, 0, 10, 9] and box == [0, 0, 30, 18]
+    assert np.array_equal(
+        np.asarray(crop), completion.rotate_image(rgb[:18, :30], turns)
+    )
+    tile = completion.restore_crop_logits(np.where(current, 20.0, -20.0), turns, window)
+    restored = np.zeros_like(grid)
+    x0, y0, x1, y1 = window
+    restored[y0:y1, x0:x1] = tile > 0
+    assert np.array_equal(restored, grid)
+    assert record["crop_grid_xyxy"] == [1, 2, 7, 6]
+
+
+@pytest.mark.parametrize("padding", [-0.1, 0.51, float("nan"), float("inf")])
+def test_invalid_completion_context_rejected_before_image_decode(padding):
+    with pytest.raises(ValueError, match="context padding"):
+        completion.completion_crop({}, np.ones((10, 10), bool), padding)

@@ -267,6 +267,50 @@ def review_canvas(crop, current, prompts, candidates):
     return canvas
 
 
+def completion_crop(record, mask, padding=0.0):
+    """Add bounded RGB context without changing the selected seed or its grid."""
+    if not np.isfinite(padding) or not 0 <= padding <= 0.5:
+        raise ValueError("context padding must be from 0 to 0.5")
+    mask = np.asarray(mask, bool)
+    h, w = mask.shape
+    x0, y0, x1, y1 = record["crop_grid_xyxy"]
+    if not 0 <= x0 < x1 <= w or not 0 <= y0 < y1 <= h:
+        raise ValueError("crop window must be inside the observation grid")
+    source_crop = checked_file(record["crop"])
+    window, source_box = [x0, y0, x1, y1], None
+    if padding:
+        margin = max(1, round(padding * max(x1 - x0, y1 - y0)))
+        window = [
+            max(0, x0 - margin),
+            max(0, y0 - margin),
+            min(w, x1 + margin),
+            min(h, y1 + margin),
+        ]
+        with Image.open(checked_file(record["source_image"])) as image:
+            source_box = [
+                round(v * (image.width / w if i % 2 == 0 else image.height / h))
+                for i, v in enumerate(window)
+            ]
+            crop = Image.fromarray(
+                rotate_image(
+                    np.asarray(image.convert("RGB").crop(source_box)), record["turns"]
+                )
+            )
+    else:
+        with Image.open(source_crop) as image:
+            crop = image.convert("RGB")
+    x0, y0, x1, y1 = window
+    current = np.asarray(
+        Image.fromarray(rotate_image(mask[y0:y1, x0:x1], record["turns"])).resize(
+            crop.size, Image.Resampling.NEAREST
+        ),
+        dtype=bool,
+    )
+    if not current.any():
+        raise ValueError("selected crop mask is empty")
+    return crop, current, window, source_box
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ("tracker", "validation", "model", "sam-model", "output"):
@@ -278,21 +322,34 @@ def main(argv=None):
         action="store_true",
         help="Propose completions from eligible ambiguous tracker seeds; no prior fallback",
     )
+    parser.add_argument(
+        "--context-padding",
+        type=float,
+        default=0.0,
+        help="Expand completion RGB crop by this fraction per side (0..0.5)",
+    )
     args = parser.parse_args(argv)
     if (
         args.output.exists()
         or not 1 <= args.crop_budget <= 16
         or not 1 <= args.crops_per_object <= 3
+        or not np.isfinite(args.context_padding)
+        or not 0 <= args.context_padding <= 0.5
     ):
         raise ValueError(
-            "new output, crop budget 1..16 and per-object budget 1..3 required"
+            "new output, crop budget 1..16, per-object budget 1..3 and context padding 0..0.5 required"
         )
     requests, skipped = validated_requests(
         args.tracker, args.validation, allow_ambiguous=args.ambiguous_scope_proposals
     )
     selected = bounded_requests(requests, args.crop_budget, args.crops_per_object)
     args.output.mkdir(parents=True)
-    for folder in ("masks", "visuals", "diagrams"):
+    for folder in (
+        "masks",
+        "visuals",
+        "diagrams",
+        *(["crops"] if args.context_padding else []),
+    ):
         (args.output / folder).mkdir()
     (args.output / "prompt.txt").write_text(PROMPT)
     tick = time.monotonic()
@@ -303,21 +360,22 @@ def main(argv=None):
         if name not in mask_cache:
             mask_cache[name] = read_masks(obs, args.tracker.parent)
         mask = mask_cache[name][request["detection_index"]]
-        x0, y0, x1, y1 = record["crop_grid_xyxy"]
-        with Image.open(checked_file(record["crop"])) as image:
-            crop = image.convert("RGB")
-        current = np.asarray(
-            Image.fromarray(rotate_image(mask[y0:y1, x0:x1], record["turns"])).resize(
-                crop.size, Image.Resampling.NEAREST
-            ),
-            dtype=bool,
+        crop, current, window, source_box = completion_crop(
+            record, mask, args.context_padding
         )
-        if not current.any():
-            raise ValueError("selected crop mask is empty")
         diagram = Image.fromarray(current).convert("RGB")
         stem = f'{record["group_id"]:04d}_{Path(name).stem}'
         diagram_path = args.output / "diagrams" / (stem + ".png")
         diagram.save(diagram_path)
+        context = {}
+        if args.context_padding:
+            crop_path = args.output / "crops" / (stem + ".png")
+            crop.save(crop_path)
+            context = dict(
+                completion_crop=describe_file(crop_path),
+                completion_grid_xyxy=window,
+                completion_source_xyxy=source_box,
+            )
         if reviewer is None:
             from farm_runtime.semantic_refinement import LocalObjectReviewer
 
@@ -332,7 +390,9 @@ def main(argv=None):
         else:
             parsed = None
         prompts = completion_prompts(parsed, current)
-        packets.append((request, crop, current, response, prompts, diagram_path))
+        packets.append(
+            (request, crop, current, response, prompts, diagram_path, window, context)
+        )
     used_reviewer = reviewer is not None
     if used_reviewer:
         del reviewer
@@ -342,7 +402,16 @@ def main(argv=None):
         torch.cuda.empty_cache()
     packed, outputs = {}, []
     sam_seconds = 0.0
-    for request, crop, current, response, prompts, diagram_path in packets:
+    for (
+        request,
+        crop,
+        current,
+        response,
+        prompts,
+        diagram_path,
+        window,
+        context,
+    ) in packets:
         record, obs = request["record"], request["observation"]
         name = record["name"]
         candidates = []
@@ -356,9 +425,7 @@ def main(argv=None):
             sam_seconds += time.monotonic() - start
         arrays, detections, _ = packed.setdefault(name, ({}, [], obs))
         for candidate in candidates:
-            tile = restore_crop_logits(
-                candidate["logits"], record["turns"], record["crop_grid_xyxy"]
-            )
+            tile = restore_crop_logits(candidate["logits"], record["turns"], window)
             key = f"mask_{len(detections):04d}"
             arrays[key] = tile
             detections.append(
@@ -367,7 +434,7 @@ def main(argv=None):
                     score=candidate["predicted_iou"],
                     score_kind="tracker_predicted_iou",
                     logit_key=key,
-                    grid_window_xyxy=record["crop_grid_xyxy"],
+                    grid_window_xyxy=window,
                     positive_grid_pixels=int((tile > 0).sum()),
                     source_group_id=record["group_id"],
                     variant=candidate["variant"],
@@ -383,6 +450,7 @@ def main(argv=None):
                 source_crop=record["crop"],
                 source_image=record["source_image"],
                 source_mask=describe_file(diagram_path),
+                **context,
                 selected_detection=request["selected_detection"],
                 **({"ambiguous_seed": True} if request.get("ambiguous_seed") else {}),
                 local_detection_index=request["detection_index"],
@@ -433,6 +501,11 @@ def main(argv=None):
             sam_prediction_seconds=sam_seconds,
             total_seconds=time.monotonic() - tick,
             preserve_core_box=True,
+            **(
+                {"context_padding": args.context_padding}
+                if args.context_padding
+                else {}
+            ),
             **(
                 {"ambiguous_scope_proposals": True}
                 if args.ambiguous_scope_proposals
