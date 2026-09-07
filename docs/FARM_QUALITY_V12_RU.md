@@ -543,3 +543,19 @@ Production revalidation пяти сохранённых наборов точн�
 66 аннотаций сохранены, один VLM-запрос для изменившейся 3. Её название вернулось к прежнему ошибочному ceiling panel — правильную семантику это исправление не доказывает. 1449 tests / 67,47 с. Каталог V12/48_source_support_preservation/factory/runs/preservation-v1/quality/catalog; Knaack актуален V12/47_pipeline_efficiency/knaack/runs/retention-v1/quality/catalog. Отчёт и визуализации в 48_source_support_preservation. Physical dimensions null; coverage opt-in, closed test не открыт.
 
 Следующие практические приоритеты: общий добор raw COLMAP-камер для неполных/пропущенных объектов (особенно текущие geometry-группы 634 и 46), качественный whole/part scope и подписи, привязанные к foreground. Текущие ID относятся только к Stage34 geometry namespace, не к legacy FARM. Повторные полные прогоны запускать при изменении входов; проверенное точное сохранение не требует нового inference.
+
+## 53. Добор исходных COLMAP-камер (2026-09-07)
+
+Stage49: metadata-only greedy selection четырёх train/dev timestamps 000983/003304/004201/006439 покрывает 60/64 clipped candidates по frustum proxy, не object recall. Подготовлены 8 новых stereo views и 4 anchors; 18,544 с. Исходные K/pose/depth anchors точны после сохранения исходного набора virtual families. Глобальные timestamps восстановлены по frame_id: локальные timestamp_ns разных preparations нельзя смешивать напрямую. COLMAP/PLY SHA проверены.
+
+Шесть автоматических depth-visible групп плюс инженерные controls 46/634 прошли семь recovery стадий за 128,772 с. Камеры выбраны автоматически, весь cohort — нет. Подтверждена идентичность legacy0→Stage34 group46 (прозрачный пластиковый контейнер), legacy108→634 (шкаф, труба исключается). В ближнем виде шкафа все пять eligible tracker masks покрывают только правую секцию; scope-review не может выбрать отсутствующий целый вариант. Отчёт V12/49_raw_camera_recovery/REVIEW_RU.md. Production frame extension ещё не интегрирован.
+
+## 54. Неоднозначные seeds, контекст и native проверка (2026-09-07)
+
+Stage50, f21edc4 + bb5ddfb: --ambiguous-scope-proposals даёт bounded proposals из лучшего eligible tracker seed без принятого fallback; --context-padding 0..0,5 расширяет RGB crop, сохраняя исходную маску и координаты. Оба default отключены. Сохраняются identity/partial-view/source-preservation gates и ≥90% seed foreground. 1463 tests / 66,96 с; 8 RGB inputs и 8 diagrams production helper точно совпали с real context prototype.
+
+Ambiguous completion+validation84,453 с, context79,089 с; по8 VLM calls, принятых extra observations11/9 против6 исходных. Просмотрены все20 accepted2D и14 native/OBB строк. Wider crop открыл левую часть шкафа; появились полные SAM candidates без внешней трубы. Но reciprocal ranking выбрал2640px с центральной дырой вместо геометрически допустимого3088px целого контура. Следующий короткий опыт — согласованность completion candidates между box/foreground prompts на уже готовых обеих сценах, без новых inference.
+
+Три cohort-native runs47,296 с: шкаф2392→7024→6540IDs; wider context полнее по внешней рамке, хотя IDs меньше. Контейнер1338 во всех вариантах, виден захват фона через пластик; чистая полная маска не принята. 97 имеет крупные пробелы и scope-конкуренцию с88. 167/168 — части модулей,379 — неполное покрытие. Полная конкуренция всей сцены ещё не выполнена; общие каталоги не обновлялись.
+
+Prototype native input ссылался на старый frame index и не открывался штатно. Отдельный inspection input сериализует фактически использованные камеры: K/pose/timestamps всех кадров точно сохранены, оригинальные banks/renders неизменны. Это выявляет обязательную задачу штатного registered-frame extension, не обход проверки. Отчёт V12/50_ambiguous_scope_completion/REVIEW_RU.md. Дальше: выбор полного scope → устойчивый индекс кадров → общий native/refinement/catalog → foreground captions и прозрачность. Физические размеры не валидированы; Project B/C не менялись.
