@@ -440,6 +440,155 @@ def test_complementary_union_preserves_tiles_primary_exclusions_and_source_prior
         assert not target.exists()
 
 
+
+@pytest.mark.parametrize("scale", [1, 3])
+@pytest.mark.parametrize(
+    "case,deferred",
+    [
+        ("whole_expansion", True),
+        ("same_extent", False),
+        ("small_boundary_change", False),
+        ("neighbor_overlap", False),
+        ("weak_primary_containment", False),
+        ("disconnected_added_object", False),
+        ("expansion_with_disconnected_neighbor", False),
+        ("existing_whole_duplicate", False),
+    ],
+)
+def test_complementary_union_defers_extent_gain_without_promoting_or_relabeling(
+    tmp_path, case, deferred, scale
+):
+    from farm_runtime.quality.proposal_geometry import read_masks
+    from farm_runtime.quality.scene_profile import union_proposals
+
+    primary = np.zeros((32, 40), bool)
+    primary[6:16, 6:16] = True
+    supplement = primary.copy()
+    if case in (
+        "whole_expansion",
+        "expansion_with_disconnected_neighbor",
+        "existing_whole_duplicate",
+    ):
+        supplement[6:16, 16:22] = True
+    elif case == "small_boundary_change":
+        supplement[6:16, 16] = True
+    elif case in ("neighbor_overlap", "weak_primary_containment"):
+        primary[6:18, 6:18] = True
+        supplement[:] = False
+        left = 8 if case == "neighbor_overlap" else 10
+        supplement[6:18, left:left + 12] = True
+    if case == "disconnected_added_object":
+        supplement[6:16, 26:32] = True
+    elif case == "expansion_with_disconnected_neighbor":
+        supplement[6:12, 26:32] = True
+    person = np.zeros_like(primary)
+    person[:2, :2] = True
+    primary_masks = [primary]
+    if case == "existing_whole_duplicate":
+        primary_masks.append(supplement)
+    primary_masks.append(person)
+    primary_masks = [
+        np.repeat(np.repeat(m, scale, axis=0), scale, axis=1)
+        for m in primary_masks
+    ]
+    supplement = np.repeat(np.repeat(supplement, scale, axis=0), scale, axis=1)
+    height, width = supplement.shape
+    photo = tmp_path / "photo.png"
+    Image.new("RGB", (width, height)).save(photo)
+
+    def source(name, masks, labels, scores):
+        directory = tmp_path / name
+        (directory / "masks").mkdir(parents=True)
+        path = directory / "masks" / "frame.npz"
+        arrays = {
+            f"mask_{i}": np.where(m, 2.0, -2.0).astype(np.float16)
+            for i, m in enumerate(masks)
+        }
+        np.savez_compressed(path, **arrays)
+        row = dict(
+            name="frame.png", timestamp="100", source_image=describe_file(photo),
+            grid_shape_hw=[height, width], applied_quarter_turns=0,
+            queries=[dict(prompt="person")] if name == "primary" else [],
+            mask_artifact=describe_file(path),
+            detections=[dict(label=label, score=score, logit_key=f"mask_{i}",
+                             grid_window_xyxy=[0, 0, width, height])
+                        for i, (label, score) in enumerate(zip(labels, scores))],
+        )
+        return write(
+            directory / "manifest.json",
+            dict(test_opened=False, observations=[row]),
+        )
+
+    # Different names and lower supplementary confidence do not decide identity.
+    first = source(
+        "primary", primary_masks,
+        ["fragment"] * (len(primary_masks) - 1) + ["person"],
+        [0.99] * len(primary_masks),
+    )
+    second = source("supplement", [supplement], ["equipment"], [0.51])
+    out = tmp_path / "union"
+    union_proposals(first, [second], out, maximum_primary_iou=0.5)
+    result = json.loads((out / "manifest.json").read_text())
+    records = result["suppressed_proposals"]
+    assert len(records) == 1
+    assert result["admitted_supplementary_proposals"] == []
+    assert len(result["deferred_scope_expansions"]) == int(deferred)
+    assert result["connected_expansion_policy"]["admitted_to_main_detections"] is False
+    row = records[0]
+    reference = primary_masks[row["primary_detection_index"]]
+    overlap = int((reference & supplement).sum())
+    assert row["primary_coverage"] == pytest.approx(overlap / reference.sum())
+    assert row["supplement_coverage"] == pytest.approx(overlap / supplement.sum())
+    assert row["physical_identity_verified"] is False
+    assert row["reason"] == "overlapping_primary_proposal"
+    assert row["deferred_scope_expansion"] is deferred
+    if deferred:
+        assert row["connected_new_fraction"] == pytest.approx(0.375)
+        assert row["unanchored_component_fraction"] == 0
+    if case == "disconnected_added_object":
+        assert row["supplement_new_fraction"] == pytest.approx(0.375)
+        assert row["connected_new_fraction"] == 0
+    if case == "neighbor_overlap":
+        assert row["primary_coverage"] >= 0.8
+        assert row["supplement_to_primary_area_ratio"] == 1
+    if case == "weak_primary_containment":
+        assert row["primary_coverage"] < 0.8
+    if case == "expansion_with_disconnected_neighbor":
+        assert row["connected_new_fraction"] > 0.15
+        assert row["unanchored_component_fraction"] > 0.05
+    if case == "existing_whole_duplicate":
+        assert row["primary_detection_index"] == 1
+        assert row["primary_iou"] == 1
+    merged = result["observations"][0]
+    masks = read_masks(merged, out)
+    assert len(masks) == len(primary_masks)
+    for actual, expected in zip(masks, primary_masks):
+        np.testing.assert_array_equal(actual, expected)
+    if deferred:
+        pending = result["deferred_scope_expansions"][0]
+        assert pending["status"] == "pending_scope_review"
+        assert pending["admitted_to_main_detections"] is False
+        assert pending["mask_pixels_modified"] is False
+        assert pending["source_manifest"] == describe_file(second)
+        original = json.loads(second.read_text())["observations"][0]
+        assert pending["source_mask_artifact"] == original["mask_artifact"]
+        candidate = pending["observation"]
+        np.testing.assert_array_equal(read_masks(candidate, out)[0], supplement)
+        assert candidate["detections"][0]["score"] == 0.51
+        assert candidate["detections"][0]["source_priority"] == 1
+        assert candidate["source_image"] == merged["source_image"]
+        assert candidate["timestamp"] == merged["timestamp"]
+        with np.load(candidate["mask_artifact"]["path"]) as saved:
+            with np.load(original["mask_artifact"]["path"]) as source_masks:
+                np.testing.assert_array_equal(
+                    saved[candidate["detections"][0]["logit_key"]],
+                    source_masks[original["detections"][0]["logit_key"]],
+                )
+    transients = json.loads((out / "transients.json").read_text())["observations"][0]
+    assert [d["label"] for d in transients["detections"]] == ["person"]
+    np.testing.assert_array_equal(read_masks(transients, out)[0], primary_masks[-1])
+    assert result["model_scores_calibrated_across_sources"] is False
+
 def test_complementary_union_requires_primary_view_and_person_authority(tmp_path):
     from farm_runtime.quality.scene_profile import union_proposals
 

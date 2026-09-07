@@ -6,6 +6,7 @@ physical timestamps, fill a bounding-box volume, or bypass native lift gates.
 from __future__ import annotations
 
 import argparse
+from copy import deepcopy
 import json
 from pathlib import Path
 import time
@@ -99,6 +100,157 @@ def select_families(review, known_ids):
         separate_veto_ids=sorted(vetoed),
         nested_parent_ids_composed=sorted(set(proposed) & (set(flat) - set(families))),
         policy="unique_maximal_root_with_separate_veto")
+
+
+def merge_reviewed_same_object_edges(prior_review, identity_review, known_ids, *, pair_plan):
+    """Add reviewed aliases without asking a language model for size direction.
+
+    Pure application step: callers must load/hash-check the original prior
+    review and pair plan using their descriptors before passing these objects.
+    The identity envelope adds source_catalog/source_prior_review from that
+    verified plan; it must retain the immutable raw responses and image sheets.
+    No catalog, Gaussian mask, file or original review is changed here.
+    """
+    from farm_runtime.quality.scope_identity import (
+        GEOMETRY_POLICY, PROTOCOL, consensus, validate_pair_geometry,
+    )
+
+    if (prior_review.get("schema") != "farm.scope-family-review.v1"
+            or identity_review.get("schema") != "farm.symmetric-identity-experiment.v1"
+            or pair_plan.get("schema") != "farm.shared-root-pair-review.v1"
+            or any(doc.get("closed_test_opened") is not False
+                   for doc in (prior_review, identity_review, pair_plan))):
+        raise ValueError("bound development family, identity and pair-plan inputs required")
+    if pair_plan["policy"] != GEOMETRY_POLICY:
+        raise ValueError("pair geometry policy changed")
+    def digest(descriptor):
+        value = descriptor["sha256"]
+        if not isinstance(value, str) or len(value) != 64 or any(c not in "0123456789abcdef" for c in value):
+            raise ValueError("SHA-256 source binding required")
+        return value
+
+    if len({digest(doc["source_catalog"]) for doc in (prior_review, identity_review, pair_plan)}) != 1:
+        raise ValueError("source catalog namespace changed")
+    if digest(identity_review["source_prior_review"]) != digest(pair_plan["source_prior_review"]):
+        raise ValueError("source prior review changed")
+    digest(identity_review["source_pair_plan"])  # caller verifies these exact plan bytes
+    known = set(known_ids)
+    select_families(prior_review, known)  # also validates every parent/child ID
+    decisions = {row["parent_id"]: row for row in prior_review["decisions"]}
+    integral = {p: set(r["integral_ids"]) - set(r.get("separate_ids", []))
+                for p, r in decisions.items()
+                if r.get("accepted") is True and r.get("parent_scope") == "single_whole_object"}
+    def descendants(parent):
+        seen, pending = set(), [parent]
+        while pending:
+            item = pending.pop()
+            if item not in seen:
+                seen.add(item)
+                pending.extend(integral.get(item, ()))
+        return seen
+
+    planned = {}
+    for row in pair_plan["pairs"]:
+        key = tuple(sorted(row["proof"]["scope_ids"]))
+        if key in planned:
+            raise ValueError("duplicate planned identity pair")
+        planned[key] = row
+    scheduled = {tuple(sorted(row["scope_ids"])) for row in pair_plan["scheduled_pairs"]}
+    rows = identity_review["pairs"]
+    if len(rows) > GEOMETRY_POLICY["maximum_pairs"]:
+        raise ValueError("identity pair budget exceeded")
+    candidates, deferred, seen = [], [], set()
+    for index, row in enumerate(rows):
+        proof = row["proof"]
+        pair = tuple(sorted(proof["scope_ids"]))
+        if (len(pair) != 2 or any(type(g) is not int for g in pair)
+                or not set(pair) <= known or pair in seen or pair not in scheduled or pair not in planned):
+            raise ValueError("unique known scheduled identity pair required")
+        seen.add(pair)
+        source = planned[pair]
+        if proof != source["proof"]:
+            raise ValueError("immutable source geometry proof changed")
+        images = {tuple(r["scope_order"]): r["sheets"] for r in source["responses"]}
+        for response in row["responses"]:
+            if images.get(tuple(response["scope_order"])) != response.get("sheets"):
+                raise ValueError("identity review changed grounded source sheets")
+        reason = None
+        if not validate_pair_geometry(proof):
+            reason = "geometric_evidence_rejected"
+        elif not consensus(row["responses"], pair):
+            reason = "semantic_identity_consensus_failed"
+        elif any(p not in integral for p in pair):
+            reason = "parent_not_accepted_independent_whole"
+        else:
+            shared = integral[pair[0]] & integral[pair[1]]
+            shared &= set(proof["shared_child_ids"])
+            branches = descendants(pair[0]) | descendants(pair[1])
+            if any(set(decisions.get(g, {}).get("separate_ids", [])) & branches for g in branches):
+                reason = "explicit_separate_object_veto"
+            elif pair[0] in descendants(pair[1]) or pair[1] in descendants(pair[0]):
+                reason = "already_hierarchically_related"
+            elif len(shared) < 2:
+                reason = "insufficient_shared_reviewed_integral_parts"
+        if reason:
+            deferred.append(dict(scope_ids=list(pair), reason=reason, source_pair_index=index))
+        else:
+            candidates.append((index, proof))
+    counts = {}
+    for _, proof in candidates:
+        for oid in proof["scope_ids"]:
+            counts[oid] = counts.get(oid, 0) + 1
+    ambiguous = {oid for oid, count in counts.items() if count > 1}
+    updated, applied = deepcopy(prior_review), []
+    targets = {row["parent_id"]: row for row in updated["decisions"]}
+    for index, proof in candidates:
+        if set(proof["scope_ids"]) & ambiguous:
+            deferred.append(dict(scope_ids=proof["scope_ids"], reason="overlapping_accepted_pairs", source_pair_index=index))
+            continue
+        whole, partial = proof["geometric_whole_candidate"], proof["geometric_partial_candidate"]
+        parent = targets[whole]
+        parent["integral_ids"] = sorted(set(parent["integral_ids"]) | {partial})
+        parent["same_object_partial_scope_ids"] = sorted(set(parent.get("same_object_partial_scope_ids", [])) | {partial})
+        applied.append(dict(whole_scope_id=whole, partial_scope_id=partial,
+                            relation="partial_scope_of_same_object", physical_part_of_asserted=False,
+                            direction_source="source_geometric_proof", source_pair_index=index))
+    audit = dict(protocol=PROTOCOL, source_catalog=deepcopy(pair_plan["source_catalog"]),
+                 source_prior_review=deepcopy(pair_plan["source_prior_review"]),
+                 source_pair_plan=deepcopy(identity_review["source_pair_plan"]),
+                 applied_same_object_scope_edges=applied, deferred_pairs=deferred,
+                 overlapping_pair_scope_ids=sorted(ambiguous),
+                 semantic_consensus_recomputed=True, accepted_flag_used_as_evidence=False,
+                 geometric_measurements_recomputed=False, closed_test_opened=False, release_eligible=False)
+    updated["same_object_partial_scope_edges"] = deepcopy(applied)
+    updated["same_object_identity_application"] = deepcopy(audit)
+    updated["release_eligible"] = False
+    return updated, audit
+
+
+def load_reviewed_same_object_edges(family_path, identity_path, known_ids):
+    """Load an immutable identity result bound to the exact family/catalog files."""
+    family_record = describe_file(Path(family_path))
+    identity_record = describe_file(Path(identity_path))
+    prior = json.loads(checked_file(family_record).read_text())
+    identity = json.loads(checked_file(identity_record).read_text())
+    plan = json.loads(checked_file(identity["source_pair_plan"]).read_text())
+    checked_file(plan["source_catalog"])
+    checked_file(plan["source_prior_review"])
+    if family_record["sha256"] != plan["source_prior_review"]["sha256"]:
+        raise ValueError("identity plan belongs to a different --families review")
+    checked_file(prior["source_catalog"])
+    # Hydration is in memory only. Existing bindings may not be overwritten.
+    envelope = deepcopy(identity)
+    for key in ("source_catalog", "source_prior_review"):
+        if key in identity and identity[key]["sha256"] != plan[key]["sha256"]:
+            raise ValueError(f"identity result has a conflicting {key} binding")
+        envelope[key] = deepcopy(plan[key])
+    updated, audit = merge_reviewed_same_object_edges(
+        prior, envelope, known_ids, pair_plan=plan)
+    audit.update(identity_review=identity_record, family_review=family_record,
+                 application_code=describe_file(Path(__file__)),
+                 identity_protocol_code=describe_file(Path(__file__).with_name("scope_identity.py")))
+    updated["same_object_identity_application"] = deepcopy(audit)
+    return updated, audit
 
 
 def remap_scope_relations(relations, canonical):
@@ -277,6 +429,8 @@ def main(argv=None):
         parser.add_argument("--" + name, type=Path, required=True)
     parser.add_argument("--evidence-cache", type=Path,
                         help="manifest from a prior source/config-bound assembly run")
+    parser.add_argument("--identity-review", type=Path,
+                        help="optional immutable same-object review bound to --families")
     args = parser.parse_args(argv)
     if args.output.exists():
         raise ValueError("new output directory required")
@@ -311,12 +465,23 @@ def main(argv=None):
     run, split, inputs = load_prepared(checked_file(native["input"]))
     config, _ = lift.load_config(checked_file(native["config"]))
     objects = {o.object_id: o for o in run.objects}
+    identity_application = None
+    if args.identity_review:
+        review, identity_application = load_reviewed_same_object_edges(
+            args.families, args.identity_review, objects)
     families, selection_audit = select_families(review, objects)
     finish_stage("prepare_inputs", objects=len(objects), families=len(families))
     source_ply = checked_file(catalog["source_ply"])
     gs = lift.load_gaussians(open_graphdeco_ply(source_ply), run.meters_per_scene_unit)
     finish_stage("load_gaussians", gaussian_count=gs.count)
     args.output.mkdir(parents=True)
+    identity_provenance = {}
+    if identity_application is not None:
+        application_path = args.output / "identity_application.json"
+        write_json(application_path, identity_application)
+        identity_provenance = dict(
+            identity_review=identity_application["identity_review"],
+            identity_application=describe_file(application_path))
     source = dict(catalog=describe_file(args.catalog), native_input=native["input"],
                   native_config=native["config"], source_ply=catalog["source_ply"],
                   measurement_code={name: describe_file(Path(lift.__file__).parent / name)["sha256"]
@@ -387,6 +552,12 @@ def main(argv=None):
                        label=decision.get("label") or row.get("label"),
                        caption=decision.get("caption") or row.get("caption"),
                        semantic_status="unverified_whole_object_proposal")
+            if identity_application is not None:
+                applied = [edge for edge in identity_application["applied_same_object_scope_edges"]
+                           if {edge["whole_scope_id"], edge["partial_scope_id"]} <= set(families[g])]
+                if applied:
+                    row["object_family"].update(
+                        **identity_provenance, applied_same_object_scope_edges=applied)
         # Previous alternative banks and their OBBs have different competitors.
         row["alternative_scope"] = None
         selected_objects.append(row)
@@ -399,6 +570,7 @@ def main(argv=None):
                   part_records_preserved_in=describe_file(args.catalog),
                   primary_bank_exclusive=True, physical_ownership_assigned=False,
                   closed_test_opened=False, release_eligible=False)
+    result.update(identity_provenance)
     result["source_native_output"] = result.pop("native_output")
     result["native_bank_stage"] = "scope_assembly"
     result["native_bank_source"] = describe_file(bank_path)
@@ -424,6 +596,7 @@ def main(argv=None):
     finish_stage("export_catalog", objects=len(selected_objects))
     write_json(args.output / "manifest.json", dict(
         schema="farm.scope-assembly-run.v1", sources=source, family_review=describe_file(args.families),
+        **identity_provenance,
         catalog=describe_file(args.output / "catalog.json"), bank=describe_file(bank_path),
         families=families, family_selection=selection_audit, pooling=pool_audit,
         baseline_replay_exact=True, baseline_confidence_max_abs_error=confidence_error, baseline_object_rows=old_rows,

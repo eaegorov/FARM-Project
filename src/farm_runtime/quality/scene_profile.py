@@ -172,13 +172,27 @@ def union_proposals(primary, supplements, output, *, maximum_primary_iou=None):
 
     Primary near-duplicate masks keep priority. Supplementary detector scores
     are never interpreted as calibrated probabilities against the primary model.
-    The primary person queries remain the exclusion authority.
+    Material connected expansions are preserved outside the main detections
+    for later scope review. Extra pixels can be cargo or a neighboring object;
+    connected extent alone does not authorize admission. The primary person
+    queries remain the exclusion authority.
     """
     from farm_runtime.quality.proposal_geometry import read_masks, read_observations
 
     if maximum_primary_iou is not None and not 0 < maximum_primary_iou <= 1:
         raise ValueError("maximum primary IoU must be in (0,1]")
     from farm_runtime.proposal_geometry import mask_overlap
+    from scipy.ndimage import label as connected_components
+
+    expansion_policy = dict(
+        minimum_primary_coverage=0.80,
+        minimum_connected_new_fraction=0.15,
+        minimum_supplement_to_primary_area_ratio=1.10,
+        maximum_unanchored_component_fraction=0.05,
+        component_connectivity=8,
+        physical_identity_verified=False,
+        admitted_to_main_detections=False,
+    )
 
     paths = [primary, *supplements]
     if not supplements or len(set(paths)) != len(paths) or output.exists():
@@ -206,9 +220,10 @@ def union_proposals(primary, supplements, output, *, maximum_primary_iou=None):
                 raise ValueError("proposal source identity/grid differs")
     output.mkdir(parents=True)
     (output / "masks").mkdir()
-    combined_rows, transient_rows, suppressed = [], [], []
+    combined_rows, transient_rows, suppressed, admitted = [], [], [], []
+    deferred = []
     for name, first in base.items():
-        arrays, detections, people = {}, [], []
+        arrays, detections, people, frame_deferred = {}, [], [], []
         primary_masks = read_masks(first, primary.parent)
         for priority, (path, source) in enumerate(zip(paths, sources)):
             if name not in source:
@@ -219,25 +234,124 @@ def union_proposals(primary, supplements, output, *, maximum_primary_iou=None):
                 checked_file(row["mask_artifact"]), allow_pickle=False
             ) as archive:
                 for index, detection in enumerate(row["detections"]):
-                    if priority and maximum_primary_iou is not None:
+                    if priority:
                         overlaps = [
-                            (mask_overlap(masks[index], mask)[0], i)
+                            (*mask_overlap(mask, masks[index]), i)
                             for i, mask in enumerate(primary_masks)
                             if first["detections"][i]["label"] != "person"
                         ]
-                        best, primary_index = max(overlaps, default=(0.0, None))
-                        if best >= maximum_primary_iou:
-                            suppressed.append(
-                                dict(
-                                    name=name,
+                        best, primary_coverage, supplement_coverage, primary_index = max(
+                            overlaps, key=lambda item: (item[0], item[3]),
+                            default=(0.0, 0.0, 0.0, None),
+                        )
+                        primary_area = (
+                            int(primary_masks[primary_index].sum())
+                            if primary_index is not None else 0
+                        )
+                        supplement_area = int(masks[index].sum())
+                        evidence = dict(
+                            name=name,
+                            source_priority=priority,
+                            source_detection_index=index,
+                            primary_detection_index=primary_index,
+                            primary_iou=best,
+                            primary_pixels=primary_area,
+                            supplement_pixels=supplement_area,
+                            primary_coverage=primary_coverage,
+                            supplement_coverage=supplement_coverage,
+                            supplement_new_fraction=1.0 - supplement_coverage,
+                            supplement_to_primary_area_ratio=(
+                                supplement_area / max(1, primary_area)
+                                if primary_index is not None else None
+                            ),
+                            connected_new_fraction=None,
+                            unanchored_component_fraction=None,
+                            physical_identity_verified=False,
+                        )
+                        overlaps_primary = (
+                            maximum_primary_iou is not None
+                            and best >= maximum_primary_iou
+                        )
+                        connected_expansion = False
+                        if overlaps_primary:
+                            candidate = masks[index]
+                            reference = primary_masks[primary_index]
+                            components, _ = connected_components(
+                                candidate, structure=np.ones((3, 3), dtype=bool)
+                            )
+                            anchored_ids = np.unique(components[candidate & reference])
+                            anchored_ids = anchored_ids[anchored_ids != 0]
+                            anchored = np.isin(components, anchored_ids) & candidate
+                            area = max(1, supplement_area)
+                            connected_new = int((anchored & ~reference).sum()) / area
+                            unanchored = int((candidate & ~anchored).sum()) / area
+                            evidence.update(
+                                connected_new_fraction=connected_new,
+                                unanchored_component_fraction=unanchored,
+                            )
+                            connected_expansion = (
+                                primary_coverage
+                                >= expansion_policy["minimum_primary_coverage"]
+                                and connected_new
+                                >= expansion_policy["minimum_connected_new_fraction"]
+                                and evidence["supplement_to_primary_area_ratio"]
+                                >= expansion_policy[
+                                    "minimum_supplement_to_primary_area_ratio"
+                                ]
+                                and unanchored
+                                <= expansion_policy[
+                                    "maximum_unanchored_component_fraction"
+                                ]
+                            )
+                        if overlaps_primary:
+                            if connected_expansion:
+                                key = f"deferred_source_{priority:03d}_mask_{index:04d}"
+                                arrays[key] = archive[detection["logit_key"]].copy()
+                                pending_detection = dict(
+                                    detection,
+                                    index=0,
+                                    logit_key=key,
                                     source_priority=priority,
                                     source_detection_index=index,
-                                    primary_detection_index=primary_index,
-                                    primary_iou=best,
+                                    source_logit_semantics=row.get("logit_semantics"),
+                                )
+                                frame_deferred.append(
+                                    dict(
+                                        evidence,
+                                        status="pending_scope_review",
+                                        reason="material_connected_scope_expansion",
+                                        source_manifest=describe_file(path),
+                                        source_mask_artifact=row["mask_artifact"],
+                                        admitted_to_main_detections=False,
+                                        mask_pixels_modified=False,
+                                        observation=dict(
+                                            name=name,
+                                            timestamp=first["timestamp"],
+                                            source_image=first["source_image"],
+                                            grid_shape_hw=first["grid_shape_hw"],
+                                            applied_quarter_turns=first["applied_quarter_turns"],
+                                            detections=[pending_detection],
+                                        ),
+                                    )
+                                )
+                            suppressed.append(
+                                dict(
+                                    evidence,
                                     reason="overlapping_primary_proposal",
+                                    deferred_scope_expansion=connected_expansion,
                                 )
                             )
                             continue
+                        admitted.append(
+                            dict(
+                                evidence,
+                                reason=(
+                                    "overlap_filter_disabled"
+                                    if maximum_primary_iou is None
+                                    else "below_primary_overlap_threshold"
+                                ),
+                            )
+                        )
                     key = f"source_{priority:03d}_mask_{index:04d}"
                     arrays[key] = archive[detection["logit_key"]].copy()
                     entry = dict(
@@ -253,6 +367,9 @@ def union_proposals(primary, supplements, output, *, maximum_primary_iou=None):
                         people.append(entry)
         target = output / "masks" / (Path(name).stem + ".npz")
         np.savez_compressed(target, **arrays)
+        for pending in frame_deferred:
+            pending["observation"]["mask_artifact"] = describe_file(target)
+            deferred.append(pending)
         row = dict(
             first,
             detections=detections,
@@ -278,6 +395,9 @@ def union_proposals(primary, supplements, output, *, maximum_primary_iou=None):
         source_observation_count=sum(len(rows) for rows in sources),
         maximum_primary_iou=maximum_primary_iou,
         suppressed_proposals=suppressed,
+        admitted_supplementary_proposals=admitted,
+        deferred_scope_expansions=deferred,
+        connected_expansion_policy=expansion_policy,
         model_scores_calibrated_across_sources=False,
         primary_transients_preserved=True,
     )
