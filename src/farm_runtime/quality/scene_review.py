@@ -3,7 +3,9 @@
 Supply original-camera RGB, binary projected memberships and projected OBB
 segments on ONE pixel grid. Display roll is applied once, to every layer, with
 an expanded canvas. Mask holes, distant components and empty results are kept.
-No object or scene names enter selection. GPU rendering belongs to the caller.
+An optional original-resolution photo may supply object-card photography; it
+must have the same field of view and aspect ratio as the mask grid. No object
+or scene names enter selection. GPU rendering belongs to the caller.
 """
 
 from __future__ import annotations
@@ -30,6 +32,7 @@ class ReviewFrame:
     reference_instance_ids: np.ndarray | None = None
     rotation_degrees_ccw: float = 0.0
     source_label: str = ""
+    object_photo_rgb: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
@@ -133,6 +136,14 @@ def _validate(frame: ReviewFrame, options: ReviewOptions) -> None:
     rgb = np.asarray(frame.rgb)
     if rgb.ndim != 3 or rgb.shape[2] != 3 or rgb.dtype != np.uint8 or min(rgb.shape[:2]) == 0:
         raise ValueError("RGB must be a nonempty HxWx3 uint8 array")
+    if frame.object_photo_rgb is not None:
+        photo = np.asarray(frame.object_photo_rgb)
+        if (
+            photo.ndim != 3 or photo.shape[2] != 3 or photo.dtype != np.uint8
+            or min(photo.shape[:2]) == 0
+            or photo.shape[0] * rgb.shape[1] != photo.shape[1] * rgb.shape[0]
+        ):
+            raise ValueError("object photo must be uint8 RGB with the same camera field of view and aspect ratio")
     if not math.isfinite(frame.rotation_degrees_ccw):
         raise ValueError("finite display rotation required")
     for bank in (frame.native_masks, frame.input_masks, frame.reference_masks):
@@ -216,6 +227,28 @@ def _paste(canvas: Image.Image, image: Image.Image, box: tuple[int, int, int, in
     x, y, width, height = box
     contained = ImageOps.contain(image, (width, height), Image.Resampling.LANCZOS)
     canvas.paste(contained, (x + (width - contained.width) // 2, y + (height - contained.height) // 2))
+
+
+def _original_photo_crop(photo, grid_hw, scale, box, panel_wh):
+    """Sample the same expanded-grid crop directly from the original photo.
+
+    Both rotations use image centres. Expanded canvas sizes can round
+    differently, so matching their centres avoids a scaled rounding offset.
+    No low-resolution intermediate is made for the photographic column.
+    """
+    x0, y0, x1, y1 = box
+    grid_h, grid_w = grid_hw
+    extent = (
+        (x0 - grid_w / 2) * scale + photo.width / 2,
+        (y0 - grid_h / 2) * scale + photo.height / 2,
+        (x1 - grid_w / 2) * scale + photo.width / 2,
+        (y1 - grid_h / 2) * scale + photo.height / 2,
+    )
+    factor = min(panel_wh[0] / (x1 - x0), panel_wh[1] / (y1 - y0))
+    size = (max(1, round((x1 - x0) * factor)), max(1, round((y1 - y0) * factor)))
+    tile = photo.transform(size, Image.Transform.EXTENT, extent,
+                           Image.Resampling.BICUBIC, fillcolor=_BG)
+    return tile, list(extent)
 
 
 def _color(object_id: int) -> tuple[int, int, int]:
@@ -390,6 +423,10 @@ def render_object_sheet(
         stages.append((options.reference_title, frame.reference_masks, "reference"))
     stages.append((options.native_title, frame.native_masks, "native"))
     source = rotate_layer(frame.rgb, frame.rotation_degrees_ccw)
+    original_photo = None if frame.object_photo_rgb is None else Image.fromarray(
+        rotate_layer(frame.object_photo_rgb, frame.rotation_degrees_ccw)
+    )
+    photo_scale = None if original_photo is None else frame.object_photo_rgb.shape[1] / frame.rgb.shape[1]
     pad, gap = 24, 20
     card_width = len(stages) * options.object_panel_width + (len(stages) - 1) * 10
     columns = min(options.object_columns, len(ids))
@@ -427,15 +464,24 @@ def render_object_sheet(
         card = Image.new("RGB", (card_width, label_height + stage_label_height + options.object_panel_height + 43), (255, 255, 255))
         draw = ImageDraw.Draw(card)
         _text(draw, (10, 6), label, card_width - 20, 23, options, bold=True)
+        photo_extent = None
         for col, (caption, bank, key) in enumerate(stages):
             x = col * (options.object_panel_width + 10)
             _text(draw, (x, label_height), caption, options.object_panel_width, 19, options)
             image = crop if bank is None or key not in rotated else _overlay(crop, rotated[key][y0:y1, x0:x1], options.overlay_alpha)
-            _paste(card, Image.fromarray(image), (x, label_height + stage_label_height, options.object_panel_width, options.object_panel_height))
+            tile = Image.fromarray(image)
+            if bank is None and original_photo is not None:
+                tile, photo_extent = _original_photo_crop(
+                    original_photo, source.shape[:2], photo_scale, box,
+                    (options.object_panel_width, options.object_panel_height),
+                )
+            _paste(card, tile, (x, label_height + stage_label_height, options.object_panel_width, options.object_panel_height))
             note = "" if bank is None else "нет данных" if key not in rotated else "маска пустая" if areas[key] == 0 else ""
             if note:
                 _text(draw, (x + 8, card.height - 33), note, options.object_panel_width - 16, 18, options, fill=_MUTED)
         records.append({"object_id": object_id, "upright_crop_xyxy": list(box), "source_mask_pixels": areas, "all_stages_empty_or_missing": not bool(len(xx))})
+        if photo_extent is not None:
+            records[-1]["original_photo_crop_xyxy"] = photo_extent
         cards.append(card)
     row_heights = [max(c.height for c in cards[start:start + columns]) for start in range(0, len(cards), columns)]
     canvas = Image.new("RGB", (width, top + sum(row_heights) + gap * len(row_heights) + 18), _BG)
@@ -448,6 +494,12 @@ def render_object_sheet(
             canvas.paste(card, (pad + col * (card_width + gap), y))
         y += height + gap
     metadata = _base_metadata(frame)
+    if original_photo is not None:
+        metadata.update(
+            object_photo_source_hw=list(frame.object_photo_rgb.shape[:2]),
+            object_photo_sampling="Original RGB, same expanded-centre roll and crop extent; no downsample to mask grid before crop. Only photographic column.",
+            object_mask_grid_hw=list(frame.rgb.shape[:2]),
+        )
     metadata.update(
         displayed_object_ids=ids,
         requested_object_ids=ids,

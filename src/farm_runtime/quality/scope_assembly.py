@@ -380,7 +380,8 @@ def main(argv=None):
         row.update(native_gaussians=len(indices), observed_obb=obb)
         if g in families:
             decision = decision_by_parent[g]
-            row.update(object_family=dict(member_ids=families[g], policy="reviewed_integral_parts",
+            row.update(object_family=dict(member_ids=families[g], policy="reviewed_whole_object_scopes",
+                                          same_object_partial_scope_ids=decision.get("same_object_partial_scope_ids", []),
                                           family_review=describe_file(args.families)),
                        prior_label=row.get("label"), prior_caption=row.get("caption"),
                        label=decision.get("label") or row.get("label"),

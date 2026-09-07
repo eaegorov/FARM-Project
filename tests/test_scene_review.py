@@ -150,3 +150,41 @@ def test_owner_cannot_hide_supplied_masks_as_background():
     owner[frame.native_masks[9]] = 9
     with pytest.raises(ValueError, match="union"):
         render_scene_sheet(replace(frame, instance_ids=owner), "Bad", _options())
+
+
+def test_original_photo_changes_only_photographic_column_without_reframing_masks():
+    frame = replace(_frame(), rotation_degrees_ccw=31)
+    yy, xx = np.indices((160, 240))
+    detailed = np.repeat((((xx + yy) % 2) * 255).astype(np.uint8)[..., None], 3, axis=2)
+    options = _options()
+    before = render_object_sheet(frame, [9], "Same crop", options)
+    after = render_object_sheet(replace(frame, object_photo_rgb=detailed), [9], "Same crop", options)
+    assert before.image.size == after.image.size
+    a, b = before.metadata["object_records"][0], after.metadata["object_records"][0]
+    assert a["upright_crop_xyxy"] == b["upright_crop_xyxy"]
+    assert a["source_mask_pixels"] == b["source_mask_pixels"]
+    assert after.metadata["object_photo_source_hw"] == [160, 240]
+    assert after.metadata["object_mask_grid_hw"] == [80, 120]
+    changed = np.any(np.asarray(before.image) != np.asarray(after.image), axis=2)
+    _, changed_x = np.nonzero(changed)
+    assert len(changed_x) and changed_x.min() >= 24
+    assert changed_x.max() < 24 + options.object_panel_width
+    # Optional original photography must not change scene overlays at all.
+    scene_a = render_scene_sheet(frame, "Scene", options)
+    scene_b = render_scene_sheet(replace(frame, object_photo_rgb=detailed), "Scene", options)
+    assert np.array_equal(scene_a.image, scene_b.image)
+
+
+def test_original_photo_crop_matches_expanded_rotation_centres():
+    from PIL import Image
+    from farm_runtime.quality.scene_review import _original_photo_crop
+    # Noninteger expanded sizes must use centres, not multiply canvas edges.
+    photo = Image.new("RGB", (201, 149), (80, 90, 100))
+    _, extent = _original_photo_crop(photo, (74, 100), 2, (20, 10, 60, 50), (200, 200))
+    assert extent == [40.5, 20.5, 120.5, 100.5]
+
+
+def test_original_photo_rejects_different_aspect_ratio():
+    with pytest.raises(ValueError, match="aspect ratio"):
+        render_object_sheet(replace(_frame(), object_photo_rgb=np.zeros((160, 160, 3), np.uint8)),
+                            [9], "Wrong field of view", _options())
