@@ -559,3 +559,12 @@ Ambiguous completion+validation84,453 с, context79,089 с; по8 VLM calls, п�
 Три cohort-native runs47,296 с: шкаф2392→7024→6540IDs; wider context полнее по внешней рамке, хотя IDs меньше. Контейнер1338 во всех вариантах, виден захват фона через пластик; чистая полная маска не принята. 97 имеет крупные пробелы и scope-конкуренцию с88. 167/168 — части модулей,379 — неполное покрытие. Полная конкуренция всей сцены ещё не выполнена; общие каталоги не обновлялись.
 
 Prototype native input ссылался на старый frame index и не открывался штатно. Отдельный inspection input сериализует фактически использованные камеры: K/pose/timestamps всех кадров точно сохранены, оригинальные banks/renders неизменны. Это выявляет обязательную задачу штатного registered-frame extension, не обход проверки. Отчёт V12/50_ambiguous_scope_completion/REVIEW_RU.md. Дальше: выбор полного scope → устойчивый индекс кадров → общий native/refinement/catalog → foreground captions и прозрачность. Физические размеры не валидированы; Project B/C не менялись.
+
+## 55. Согласованность completion внутри одного scope проверена (2026-09-07)
+
+Stage50v4, b7f287c: box+foreground agreement используется только после прежнего ambiguity gate и при IoU≥0,8 с прежним победителем. Это не независимая truth evidence, не разрешение разных scopes и не ослабление geometry/core/source gates. Из7готовых validation наборов изменён только634/cam01_003304:43→42. Все прежние Factory/Knaack и ambiguous-v1 masks/point arrays точны; candidate geometry всех7наборов точна.1466tests/70,02с.
+
+Cohort-native16,128с: шкаф6540→8530IDs (+2475/−485), остальные5непустых memberships точны. Все3новые native/OBB проекции просмотрены: центральный пробел закрыт, левая рамка восстановлена, внешняя красная труба исключена. Общая конкуренция всей сцены пока не выполнена. Актуальный визуал V12/50_ambiguous_scope_completion/native_comparison_634_v4.jpg, отчёт REVIEW_RU.md (дополнениеv4).
+
+Далее — штатный registered-frame extension с неизменной исходной геометрией, проверенными anchors и сериализованными физическими timestamps; затем повторяемый recovery/native/refinement и проверка сохранности общего каталога. Прозрачный контейнер, whole/part и подписи остаются отдельными нерешёнными задачами Project A.
+
