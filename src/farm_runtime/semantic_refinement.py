@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import json
 import math
+from pathlib import Path
 import time
-import numpy as np
 
 REVIEW_PROMPT = """Review one physical object seen in multiple photographs. In each sheet, the left tile is the unmodified photo; numbered tiles 0..3 show alternative cyan masks. Tile 0 is an approximate target cue, not ground truth. All sheets refer to the same object.
 Identify the WHOLE target object at the most specific level directly supported by visible evidence. Do not guess its hidden function or exact subtype. Panels, ventilation slots, and cables alone do not establish device function. Prefer a broad physical category when different functions remain possible, and state this in uncertainty. Mention only parts actually visible; do not add a lid, gauge, mounting hardware, or nozzle merely because that class often has one. Separate attached functional parts from neighboring objects, unrelated pipes, cables, supports and background. A container is the whole container, not just its contents. A sign is the entire sign, not individual symbols. Occluded parts need not be invented. A partial object at the image edge remains a valid visible instance.
@@ -232,6 +232,7 @@ def validate_review(text, image_ids):
 
 class LocalObjectReviewer:
     def __init__(self, model_path):
+        self.model_path = Path(model_path).resolve()
         import torch
         from transformers import AutoProcessor, AutoModelForImageTextToText
 
