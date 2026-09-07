@@ -1600,11 +1600,16 @@ def accumulate_build_evidence(
     return rows, {"render_and_vjp": render_vjp_seconds}
 
 
-def make_claims(
+def build_sparse_claims(
     evidence: Mapping[int, ObjectEvidence],
-    gaussian_count: int,
     config: Mapping[str, Any],
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[dict[str, Any]], dict[str, int]]:
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Apply contributor evidence gates before exclusive scene ownership.
+
+    Claims retain overlapping object hypotheses. A caller may assemble object
+    scopes from them, but must still resolve unrelated competing claims before
+    publishing an exclusive scene bank. Evidence arrays are never modified.
+    """
     policy = config["build"]
     claims: list[dict[str, Any]] = []
     rows: list[dict[str, Any]] = []
@@ -1659,6 +1664,18 @@ def make_claims(
             "median_claim_purity": float(np.median(purity[accepted])) if len(indices) else 0.0,
             "median_claim_support": float(np.median(support)) if len(indices) else 0.0,
         })
+    return claims, rows
+
+
+def make_claims(
+    evidence: Mapping[int, ObjectEvidence],
+    gaussian_count: int,
+    config: Mapping[str, Any],
+) -> tuple[
+    np.ndarray, np.ndarray, np.ndarray, list[dict[str, Any]], dict[str, int], np.ndarray
+]:
+    policy = config["build"]
+    claims, rows = build_sparse_claims(evidence, config)
     labels, confidence, support, conflict = resolve_sparse_claims(
         claims,
         gaussian_count,

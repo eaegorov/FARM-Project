@@ -19,6 +19,8 @@ ACTIONS = {
     "surface-validation": "surface_validation",
     "surface-tracker": "surface_tracker",
     "scope-review": "scope_review",
+    "scope-families": "scope_family_review",
+    "assemble-objects": "scope_assembly",
     "scope-completion": "scope_completion",
     "camera-completion": "camera_completion",
     "registered-frames": "registered_frames",

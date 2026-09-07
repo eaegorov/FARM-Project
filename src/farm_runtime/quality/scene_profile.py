@@ -717,6 +717,9 @@ def semantics(args):
 
 def compile_plan(args):
     """Return a normal FARM DAG; no additional execution framework."""
+    whole_objects = getattr(args, "whole_objects", False)
+    if type(whole_objects) is not bool:
+        raise ValueError("whole_objects must be boolean")
     complementary_root = getattr(args, "complementary_model_root", None)
     complementary_vocabulary = getattr(args, "complementary_vocabulary", None)
     partial_view = getattr(args, "partial_view_association", False)
@@ -1264,16 +1267,56 @@ def compile_plan(args):
         f"{q}/catalog/catalog.json",
         [final_native, f"{q}/semantics/manifest.json"],
     )
+    artifacts = dict(
+        catalog=f"{q}/catalog/catalog.json",
+        native_masks=f"{q}/catalog/object_masks.npz",
+    )
+    if whole_objects:
+        source_catalog = artifacts["catalog"]
+        source_masks = artifacts["native_masks"]
+        families = f"{q}/scope_families/manifest.json"
+        add(
+            "scope_families",
+            "scope-families",
+            [
+                "--catalog", source_catalog,
+                "--model", args.vlm_model,
+                "--output", f"{q}/scope_families",
+            ],
+            families,
+            [source_catalog, source_masks, final_native, args.vlm_model],
+        )
+        add(
+            "object_assembly",
+            "assemble-objects",
+            [
+                "--catalog", source_catalog,
+                "--families", families,
+                "--output", f"{q}/object_assembly",
+            ],
+            f"{q}/object_assembly/catalog.json",
+            [source_catalog, source_masks, final_native, families, args.ply],
+            "geometry",
+        )
+        stages[-1]["outputs"].extend([
+            f"{q}/object_assembly/manifest.json",
+            f"{q}/object_assembly/object_masks.npz",
+        ])
+        artifacts.update(
+            source_catalog=source_catalog,
+            source_native_masks=source_masks,
+            scope_families=families,
+            object_assembly_report=f"{q}/object_assembly/manifest.json",
+            catalog=f"{q}/object_assembly/catalog.json",
+            native_masks=f"{q}/object_assembly/object_masks.npz",
+        )
     return dict(
         schema_version=1,
         project_root=str(args.project_root),
         scene=dict(id=args.scene_id),
         output=dict(root=str(args.output_root)),
         pipeline=dict(stages=stages),
-        artifacts=dict(
-            catalog=f"{q}/catalog/catalog.json",
-            native_masks=f"{q}/catalog/object_masks.npz",
-        ),
+        artifacts=artifacts,
         quality_profile=dict(
             schema="farm.bounded-quality-profile.v1",
             budgets=budgets,
@@ -1295,7 +1338,21 @@ def compile_plan(args):
                 if recovery_budget
                 else None
             ),
-            scope_resolution="preserve nested alternatives; no automatic physical merging",
+            scope_resolution=(
+                "opt-in reviewed whole-object families; separate objects and unclear relations remain separate"
+                if whole_objects
+                else "preserve nested alternatives; no automatic physical merging"
+            ),
+            whole_objects=dict(
+                enabled=whole_objects,
+                parent_budget=24 if whole_objects else 0,
+                catalog_schema=(
+                    "farm.quality-object-assembly.v1"
+                    if whole_objects
+                    else "farm.quality-scene-catalog.v1"
+                ),
+                physical_completeness_claimed=False,
+            ),
             release_eligible=False,
         ),
     )
@@ -1345,6 +1402,11 @@ def main(argv=None):
     )
     q.add_argument("--runtimes", type=Path)
     q.add_argument("--scene-id", required=True)
+    q.add_argument(
+        "--whole-objects",
+        action="store_true",
+        help="Opt in to automatic whole/part family review and a separate object assembly catalog",
+    )
     q.add_argument(
         "--partial-view-association",
         action="store_true",

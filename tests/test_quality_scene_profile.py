@@ -681,3 +681,85 @@ def test_recovered_semantics_do_not_displace_existing_multiview_candidates(
     assert manifest["deferred_group_ids"] == [4]
     assert manifest["candidate_budget"] == 2
     assert manifest["base_ranking"] == "original_timestamps_capped_by_retained_evidence"
+
+
+@pytest.mark.parametrize("refinement_crops", [0, 12])
+def test_whole_object_profile_binds_family_review_and_geometry_outputs(
+    tmp_path, refinement_crops
+):
+    args = SimpleNamespace(
+        initial_views=12, adaptive_views=8, vocabulary_views=8,
+        native_groups=128, semantic_groups=64, alternatives=16,
+        world_up=[0, -1, 0],
+        runtimes=write(tmp_path / "runtimes.json", {
+            "main": ["main-python"], "geometry": ["geometry-python"],
+        }),
+        rgbd=tmp_path / "rgbd", ply=tmp_path / "scene.ply",
+        vlm_model=tmp_path / "vlm", sam_model=tmp_path / "sam",
+        project_root=tmp_path, scene_id="new_scene",
+        output_root=tmp_path / "output", refinement_crops=refinement_crops,
+    )
+    baseline = compile_plan(args)
+    assert baseline["pipeline"]["stages"][-1]["id"] == "catalog"
+    assert baseline["artifacts"]["catalog"].endswith("/catalog/catalog.json")
+    assert baseline["quality_profile"]["whole_objects"]["enabled"] is False
+    args.whole_objects = True
+    enabled = compile_plan(args)
+    # The opt-in cannot rewrite discovery or per-candidate native membership.
+    assert enabled["pipeline"]["stages"][:-2] == baseline["pipeline"]["stages"]
+    path = write(tmp_path / "whole_objects.json", enabled)
+    resolved = plan_to_public_dict(load_plan(path), tmp_path / "run")
+    stages = {s["id"]: s for s in resolved["stages"]}
+    review, assembly = stages["scope_families"], stages["object_assembly"]
+    assert review["needs"] == ["catalog"]
+    assert assembly["needs"] == ["scope_families"]
+    assert review["command"][0] == "main-python"
+    assert assembly["command"][0] == "geometry-python"
+    assert "scope-families" in review["command"]
+    assert "assemble-objects" in assembly["command"]
+    for stage in (review, assembly):
+        assert "--group-id" not in stage["command"]
+        assert "--object-id" not in stage["command"]
+        assert all((chr(36) + "{") not in value for value in stage["command"])
+        assert set(stage["inputs"]) <= set(stage["fingerprint_inputs"])
+        assert str(tmp_path / "run/quality/catalog/catalog.json") in stage["inputs"]
+        assert str(tmp_path / "run/quality/catalog/object_masks.npz") in stage["inputs"]
+        final_name = "refined_native" if refinement_crops else "native"
+        assert str(tmp_path / f"run/quality/{final_name}/manifest.json") in stage["inputs"]
+    assert str(args.vlm_model) in review["fingerprint_inputs"]
+    assert str(args.ply) in assembly["fingerprint_inputs"]
+    assert str(tmp_path / "run/quality/scope_families/manifest.json") in assembly["inputs"]
+    artifacts = resolved["artifacts"]
+    assert artifacts["catalog"].endswith("/object_assembly/catalog.json")
+    assert artifacts["native_masks"].endswith("/object_assembly/object_masks.npz")
+    assert artifacts["source_catalog"].endswith("/catalog/catalog.json")
+    assert artifacts["source_native_masks"].endswith("/catalog/object_masks.npz")
+    assert artifacts["scope_families"] in review["outputs"]
+    assert {
+        artifacts["catalog"], artifacts["native_masks"], artifacts["object_assembly_report"],
+    } == set(assembly["outputs"])
+    assert enabled["quality_profile"]["whole_objects"]["catalog_schema"] == "farm.quality-object-assembly.v1"
+    args.whole_objects = "yes"
+    with pytest.raises(ValueError, match="boolean"):
+        compile_plan(args)
+
+
+def test_profile_cli_accepts_whole_objects_opt_in(tmp_path, monkeypatch):
+    from farm_runtime.quality import scene_profile
+
+    received = []
+    def fake_compile(args):
+        received.append(args.whole_objects)
+        return {"whole_objects": args.whole_objects}
+    monkeypatch.setattr(scene_profile, "compile_plan", fake_compile)
+    command = [
+        "plan", "--rgbd", str(tmp_path / "rgbd"),
+        "--ply", str(tmp_path / "scene.ply"),
+        "--sam-model", str(tmp_path / "sam"),
+        "--vlm-model", str(tmp_path / "vlm"),
+        "--project-root", str(tmp_path), "--output-root", str(tmp_path / "output"),
+        "--scene-id", "any_scene", "--world-up", "0", "-1", "0",
+    ]
+    assert scene_profile.main(command + ["--whole-objects", "--output", str(tmp_path / "with.json")]) == 0
+    assert scene_profile.main(command + ["--output", str(tmp_path / "without.json")]) == 0
+    assert received == [True, False]
