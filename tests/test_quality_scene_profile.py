@@ -601,3 +601,83 @@ def test_validated_cohort_preserves_masks_exclusions_and_flattened_indices(
     transients = json.loads((output / "transients.json").read_text())["observations"]
     assert all([d["label"] for d in r["detections"]] == ["person"] for r in transients)
     assert cohort["inference_calls"] == 0 and cohort["original_group_id"] == 7
+
+
+def test_recovered_semantics_do_not_displace_existing_multiview_candidates(
+    tmp_path, monkeypatch
+):
+    from farm_runtime.quality import scene_profile, scope_evidence, refinement
+    from farm_runtime.quality import native_observations
+
+    geometry = tmp_path / "geometry.json"
+    write(
+        geometry,
+        dict(
+            test_opened=False,
+            groups=[
+                dict(id=1, independent_timestamps=1),
+                dict(id=4, independent_timestamps=5),
+                dict(id=8, independent_timestamps=3),
+                dict(id=9, independent_timestamps=2),
+            ],
+        ),
+    )
+    native_input = tmp_path / "native_input.json"
+    write(
+        native_input,
+        dict(
+            objects=[
+                dict(object_id=oid, masks=[dict(source_kind=kind)])
+                for oid, kind in [
+                    (1, "validated_additional_view"),
+                    (4, "geometry_original"),
+                    (8, "validated_additional_view"),
+                    (9, "geometry_original"),
+                ]
+            ]
+        ),
+    )
+    native = tmp_path / "native.json"
+    write(native, dict(input=describe_file(native_input)))
+    # 1 is newly recovered; 8 gained views; 4 lost independent support.
+    monkeypatch.setattr(
+        native_observations,
+        "retained_timestamp_counts",
+        lambda *_: {1: 4, 4: 1, 8: 6, 9: 2},
+    )
+    observed = []
+
+    def prepare(argv):
+        observed.extend(
+            int(argv[i + 1]) for i, value in enumerate(argv) if value == "--group-id"
+        )
+        output = Path(argv[argv.index("--output") + 1])
+        output.mkdir()
+        write(output / "manifest.json", {})
+
+    monkeypatch.setattr(scope_evidence, "main", prepare)
+
+    def infer(argv):
+        output = Path(argv[argv.index("--output") + 1])
+        output.mkdir()
+        write(output / "manifest.json", {})
+
+    monkeypatch.setattr(refinement, "main", infer)
+    output = tmp_path / "semantics"
+    scene_profile.semantics(
+        SimpleNamespace(
+            geometry=geometry,
+            native=native,
+            groups=2,
+            model=tmp_path / "model",
+            output=output,
+            retain_stage=None,
+        )
+    )
+    manifest = json.loads((output / "manifest.json").read_text())
+    assert observed == [8, 9, 1]
+    assert manifest["selected_group_ids"] == [8, 9, 1]
+    assert manifest["recovery_added_group_ids"] == [1]
+    assert manifest["deferred_group_ids"] == [4]
+    assert manifest["candidate_budget"] == 2
+    assert manifest["base_ranking"] == "original_timestamps_capped_by_retained_evidence"

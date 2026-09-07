@@ -617,7 +617,19 @@ def semantics(args):
         from farm_runtime.quality.native_observations import retained_timestamp_counts
 
         counts = retained_timestamp_counts(native_input, args.geometry)
-    chosen, deferred = bounded_groups(geometry, args.groups, counts)
+    # Recovery has its own bounded reserve below. Added views must not consume
+    # base slots or boost old groups above unchanged original candidates.
+    base_counts = (
+        {
+            group["id"]: min(
+                group["independent_timestamps"], counts.get(group["id"], 0)
+            )
+            for group in geometry["groups"]
+        }
+        if counts is not None
+        else None
+    )
+    chosen, deferred = bounded_groups(geometry, args.groups, base_counts)
     recovered = (
         sorted(
             obj["object_id"]
@@ -694,6 +706,7 @@ def semantics(args):
             selected_group_ids=chosen,
             deferred_group_ids=deferred,
             candidate_budget=args.groups,
+            base_ranking="original_timestamps_capped_by_retained_evidence",
             recovery_added_group_ids=added,
             recovery_additional_budget_limit=16,
             labels_are_model_proposals=True,
