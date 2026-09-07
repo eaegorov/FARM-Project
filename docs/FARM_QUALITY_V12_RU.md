@@ -568,3 +568,11 @@ Cohort-native16,128с: шкаф6540→8530IDs (+2475/−485), остальные
 
 Далее — штатный registered-frame extension с неизменной исходной геометрией, проверенными anchors и сериализованными физическими timestamps; затем повторяемый recovery/native/refinement и проверка сохранности общего каталога. Прозрачный контейнер, whole/part и подписи остаются отдельными нерешёнными задачами Project A.
 
+## 56. Registered-frame extension включён в обычный pipeline (2026-09-07)
+
+Stage51,95e5135: quality registered-frames сохраняет исходную geometry/ID namespace и проверяет scene source SHA, metric scale, точные anchors K/pose/depth, trusted registration и train/dev budget. Merged index сохраняет исходныеtimestamps и согласует новые physical frame IDs между stereo/virtual views. Extension передаётся через audit до native; frozen input штатно открывается без bootstrap.
+
+1475tests/66,74с. Все56camera values/timestamps совпали с прототипом,48исходных frame arrays точны. Десять обычных стадий прошли за189,837с от готовойgeometry+registeredpreparation. Все segmentation/tracker/completion arrays и2Dchoices точны;6native memberships/timestamp support точны,14JPEG побайтно совпали с просмотренным Stage50v4. Шкаф8530IDs, контейнер1338с известными дефектами. Standard reload9frames/7objects прошёл.
+
+Отчёт V12/51_registered_frame_extension/REVIEW_RU.md. Это cohort replay, не итог всей сцены и не полностью автоматический object scheduler. Далее — объединить предыдущие5подтверждённых recovery групп40/159/0/614/517 с7новыми в общей native конкуренции (суммарно12≤16), затем refinement/catalog и сохранность прежних объектов. Общие каталоги пока Stage48Factory/Stage47Knaack; физические размеры и universal quality не приняты.
+
