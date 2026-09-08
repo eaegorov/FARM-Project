@@ -23,6 +23,7 @@ import math
 import re
 import struct
 import threading
+import tempfile
 import time
 import warnings
 from dataclasses import dataclass, field
@@ -53,7 +54,7 @@ _ABSOLUTE_UI_PATH_RE = re.compile(r"(?<![A-Za-z0-9_.-])/(?:[^\s`'\";,]+)")
 _VERIFIED_BANK_FIELDS = {
     "object_ids", "indptr", "indices", "confidence", "timestamp_support",
 }
-OBJECT_SELECTOR_PLACEHOLDER = "— выберите объект —"
+OBJECT_SELECTOR_PLACEHOLDER = "— select an object —"
 _OBJECT_SELECTOR_RE = re.compile(r"^#([0-9]+) · ")
 
 
@@ -524,6 +525,7 @@ class FarmBundle:
     catalog: tuple[Mapping[str, Any], ...]
     source_note: str
     source_warning: bool
+    metric_scale_verified: bool = False
 
 
 @dataclass(frozen=True)
@@ -1155,6 +1157,7 @@ def _validate_farm(spec: SceneSpec) -> tuple[FarmBundle, PlyTable]:
         catalog=tuple(catalog),
         source_note=source_note,
         source_warning=source_warning,
+        metric_scale_verified=context.get("metric_scale_verified") is True,
     ), source_table
 
 
@@ -2643,6 +2646,19 @@ def extract_object_evidence(
                     raise UnifiedViewerError(f"cannot decode RGB frame {image_id}: {exc}") from exc
         if image is None:
             continue
+        # Display-only quarter-turn from the saved camera-to-world pose.
+        # Source pixels, masks, boxes and camera calibration remain unchanged.
+        pose_value = _evidence_record_field(record, "pose")
+        if hasattr(pose_value, "detach"):
+            pose_value = pose_value.detach().cpu().numpy()
+        if pose_value is not None:
+            pose = np.asarray(pose_value, dtype=float)
+            if pose.shape == (4, 4) and np.isfinite(pose).all():
+                camera_up = pose[:3, :3].T @ scene.farm.world_up
+                if np.linalg.norm(camera_up[:2]) > 1e-6:
+                    roll = math.degrees(math.atan2(camera_up[0], -camera_up[1]))
+                    quarter_turns = int(round(roll / 90.0))
+                    image = np.ascontiguousarray(np.rot90(image, quarter_turns))
         frames.append(ObjectEvidenceFrame(
             image=_resize_evidence_image(image),
             image_id=image_id,
@@ -2829,10 +2845,29 @@ def _set_markdown(handle: Any, content: str) -> None:
         handle.value = content
 
 
-def _markdown_text(value: Any) -> str:
+def _display_text(value: Any) -> str:
+    """Keep public copy neutral while preserving source names in artifacts."""
     text = " ".join(str(value).replace("\x00", "").splitlines())
-    text = text.replace("FARM", "пайплайн").replace("farm", "pipeline")
     text = _ABSOLUTE_UI_PATH_RE.sub("[local path]", text)
+    components = (
+        (r"FARM(?:-Project)?", "scene processing"),
+        (r"ShapeR|REST3D|3D-GIMP|Inpaint360GS|Lucida", "reconstruction"),
+        (r"YOLOE?", "detector"),
+        (r"SAM[23]?", "segmentation"),
+        (r"Qwen(?:[0-9]+)?(?:-VL)?(?:-[0-9]+B)?(?:-Instruct)?", "caption model"),
+        (r"MobileCLIP", "feature model"),
+        (r"COLMAP", "source capture"),
+        (r"Viser", "viewer"),
+        (r"Graphdeco", "source format"),
+    )
+    for pattern, replacement in components:
+        text = re.sub(r"(?<![A-Za-z])(?:" + pattern + r")(?![A-Za-z])",
+                      replacement, text, flags=re.IGNORECASE)
+    return text
+
+
+def _markdown_text(value: Any) -> str:
+    text = _display_text(value)
     replacements = {
         "&": "&amp;", "<": "&lt;", ">": "&gt;", "`": "&#96;",
         "[": "&#91;", "]": "&#93;", "(": "&#40;", ")": "&#41;",
@@ -2851,7 +2886,7 @@ def object_selector_options(catalog: Sequence[Mapping[str, Any]]) -> tuple[str, 
         if object_id in seen:
             raise UnifiedViewerError(f"duplicate object id in presentation catalog: {object_id}")
         seen.add(object_id)
-        category = " ".join(str(row.get("category") or "object").split())
+        category = " ".join(_display_text(row.get("category") or "object").split())
         rows.append((object_id, category))
     return (OBJECT_SELECTOR_PLACEHOLDER,) + tuple(
         f"#{object_id} · {category}" for object_id, category in sorted(rows)
@@ -2945,6 +2980,48 @@ class _SceneRuntime:
     ] | None = None
 
 
+_VIEWER_START_LOCK = threading.Lock()
+
+
+def _create_neutral_server(viser: Any, *, host: str, port: int) -> tuple[Any, Any]:
+    """Serve a private client index without changing the installed UI package.
+
+    The pinned client has a hard-coded tab title and favicon, with no public
+    setting for either. Its assets stay unchanged; only our temporary index
+    differs. The factory override exists solely while this server starts.
+    """
+    from unittest.mock import patch
+
+    source = Path(viser.__file__).resolve().parent / "client" / "build"
+    temporary = tempfile.TemporaryDirectory(prefix="scene-viewer-client-")
+    target = Path(temporary.name)
+    try:
+        for item in source.iterdir():
+            if item.name != "index.html":
+                (target / item.name).symlink_to(item, target_is_directory=item.is_dir())
+        html = (source / "index.html").read_text(encoding="utf-8")
+        html, count = re.subn(r"<title>.*?</title>", "<title>Scene viewer</title>",
+                             html, count=1, flags=re.IGNORECASE | re.DOTALL)
+        if count != 1:
+            raise UnifiedViewerError("client document title is absent")
+        html = re.sub(r'<link\b[^>]*\brel=["\x27](?:shortcut )?icon["\x27][^>]*>',
+                      '<link rel="icon" href="data:,">', html, flags=re.IGNORECASE)
+        (target / "index.html").write_text(html, encoding="utf-8")
+        with _VIEWER_START_LOCK:
+            factory = viser.infra.WebsockServer
+
+            def create_http_server(*args: Any, **kwargs: Any) -> Any:
+                kwargs["http_server_root"] = target
+                return factory(*args, **kwargs)
+
+            with patch.object(viser.infra, "WebsockServer", create_http_server):
+                server = viser.ViserServer(host=host, port=int(port), label="Scene viewer")
+        return server, temporary
+    except BaseException:
+        temporary.cleanup()
+        raise
+
+
 class UnifiedViserViewer:
     """One Viser server and one focal scene canvas for every configured scene."""
 
@@ -2985,7 +3062,9 @@ class UnifiedViserViewer:
         self.exposure_warning = viewer_exposure_warning(host)
         if self.exposure_warning:
             warnings.warn(self.exposure_warning, RuntimeWarning, stacklevel=2)
-        self.server = viser.ViserServer(host=host, port=int(port), label="Просмотр сцены")
+        self.server, self._client_assets = _create_neutral_server(
+            viser, host=host, port=int(port)
+        )
         self.server.gui.configure_theme(
             control_layout="fixed",
             control_width="large",
@@ -3000,7 +3079,9 @@ class UnifiedViserViewer:
         self.runtime: dict[str, _SceneRuntime] = {}
         self.label_to_id: dict[str, str] = {}
         for scene in scenes:
-            option = f"{scene.spec.label} | {scene.farm.run_id}"
+            option = _display_text(scene.spec.label)
+            if option in self.label_to_id:
+                option = f"{option} · {_display_text(scene.spec.scene_id)}"
             self.label_to_id[option] = scene.spec.scene_id
             root = self.server.scene.add_frame(
                 f"/scenes/{scene.spec.scene_id}", show_axes=False, visible=False
@@ -3012,92 +3093,92 @@ class UnifiedViserViewer:
         self._updating_controls = False
 
         initial_option = next(label for label, scene_id in self.label_to_id.items() if scene_id == self.current_scene_id)
-        with self.server.gui.add_folder("Сцена", expand_by_default=True):
+        with self.server.gui.add_folder("Scene", expand_by_default=True):
             self.scene_select = self.server.gui.add_dropdown(
-                "Сцена / запуск",
+                "Scene",
                 options=tuple(self.label_to_id),
                 initial_value=initial_option,
             )
             self.scene_title = self.server.gui.add_markdown("")
-        with self.server.gui.add_folder("Выбранный объект", expand_by_default=True):
+        with self.server.gui.add_folder("Selected object", expand_by_default=True):
             self.object_select = self.server.gui.add_dropdown(
-                "Объект",
+                "Object",
                 options=object_selector_options(
                     self.runtime[self.current_scene_id].scene.farm.catalog
                 ),
                 initial_value=OBJECT_SELECTOR_PLACEHOLDER,
             )
             self.selected_markdown = self.server.gui.add_markdown(
-                "Нажмите на OBB или реконструированную поверхность объекта."
+                "Click an object box or reconstructed surface."
             )
             evidence_placeholder = np.zeros((64, 64, 3), dtype=np.uint8)
             self.evidence_image = self.server.gui.add_image(
                 evidence_placeholder,
-                label="Реальные ракурсы объекта из COLMAP",
+                label="Source object photos",
                 format="jpeg",
             )
             self.evidence_markdown = self.server.gui.add_markdown(
-                "Ракурсы загружаются только после выбора объекта."
+                "Photos load after selecting an object."
             )
-        with self.server.gui.add_folder("Камера", expand_by_default=True):
+        with self.server.gui.add_folder("Camera", expand_by_default=True):
             self.server.gui.add_markdown(
-                "Левая кнопка: вращение · правая: сдвиг · колесо: масштаб. "
-                "Щелчок по объекту переносит центр вращения на него."
+                "Left drag: orbit · right drag: pan · wheel: zoom. "
+                "Click an object to move the orbit center to it."
             )
-            self.reset_button = self.server.gui.add_button("Обзор сцены")
-            self.focus_button = self.server.gui.add_button("Приблизить выбранный объект")
-            self.previous_button = self.server.gui.add_button("Предыдущий вид")
-            self.front_button = self.server.gui.add_button("Спереди")
-            self.side_button = self.server.gui.add_button("Сбоку")
-            self.top_button = self.server.gui.add_button("Сверху")
-        with self.server.gui.add_folder("Слои", expand_by_default=True):
+            self.reset_button = self.server.gui.add_button("Scene overview")
+            self.focus_button = self.server.gui.add_button("Focus selected object")
+            self.previous_button = self.server.gui.add_button("Previous view")
+            self.front_button = self.server.gui.add_button("Front")
+            self.side_button = self.server.gui.add_button("Side")
+            self.top_button = self.server.gui.add_button("Top")
+        with self.server.gui.add_folder("Layers", expand_by_default=True):
             self.show_farm = self.server.gui.add_checkbox(
-                "Контекст сцены",
+                "Scene context",
                 initial_value=True,
-                hint="Облегчённое облако точек исходной сцены.",
+                hint="Lightweight point cloud of the source scene.",
             )
             self.show_obbs = self.server.gui.add_checkbox(
                 "3D OBB", initial_value=True
             )
             self.show_instances = self.server.gui.add_checkbox(
-                "3D Gaussian-маски",
+                "3D masks: points",
                 initial_value=False,
-                hint="Проверенные instance-splats; review-слой явно помечается в статусе.",
+                hint="Centers of verified source elements; no invented surface.",
             )
             self.isolate_selected = self.server.gui.add_checkbox(
-                "Только маска выбранного объекта",
+                "Isolate selected mask",
                 initial_value=True,
-                hint="Скрывает маски остальных объектов после выбора.",
+                hint="Hide other masks when an object is selected.",
             )
             self.show_meshes = self.server.gui.add_checkbox(
-                "Реконструированные mesh-объекты",
+                "Reconstructed meshes",
                 initial_value=False,
-                hint="Каноническая реконструкция либо явно отмеченный review-результат.",
+                hint="Completed reconstruction or an explicitly marked review result.",
             )
             self.show_source = self.server.gui.add_checkbox(
-                "Полная исходная 3DGS",
+                "Full source 3D scene",
                 initial_value=False,
                 hint=(
-                    "Тяжёлый слой: все исходные Gaussian rows в DC-preview Viser; "
-                    "без view-dependent higher-order SH."
+                    "All source elements. Colors are displayed independently "
+                    "of viewing direction; loading may take a moment."
                 ),
             )
             self.show_labels = self.server.gui.add_checkbox(
-                "Подписи объектов", initial_value=False
+                "Object labels", initial_value=False
             )
-        with self.server.gui.add_folder("Технические сведения", expand_by_default=False):
+        with self.server.gui.add_folder("Technical details", expand_by_default=False):
             self.scene_status = self.server.gui.add_markdown("")
             self.point_slider = self.server.gui.add_slider(
-                "Размер точки (м)",
+                "Point size",
                 min=0.002,
                 max=0.018,
                 step=0.001,
                 initial_value=self.point_size,
             )
             security_note = (
-                "⚠️ **Сетевой доступ:** " + _markdown_text(self.exposure_warning)
+                "⚠️ **Network access:** " + _markdown_text(self.exposure_warning)
                 if self.exposure_warning
-                else "🔒 **Сетевой доступ:** только loopback; авторизации нет."
+                else "🔒 **Network access:** localhost only; no authentication."
             )
             self.server.gui.add_markdown(security_note)
             if unavailable_scenes:
@@ -3107,7 +3188,7 @@ class UnifiedViserViewer:
                     for item in unavailable_scenes
                 )
                 self.server.gui.add_markdown(
-                    "**Недоступные сцены** (не отображаются):\n" + unavailable
+                    "**Unavailable scenes** (not displayed):\n" + unavailable
                 )
             self.source_markdown = self.server.gui.add_markdown("")
 
@@ -3228,7 +3309,8 @@ class UnifiedViserViewer:
                 self.point_size = float(self.point_slider.value)
                 for runtime in self.runtime.values():
                     for layer_name, multiplier in (
-                        ("farm_preview", 1.0), ("bridge_instances", 1.35), ("dense_lift_points", 1.5)
+                        ("farm_preview", 1.0), ("bridge_instances", 1.35), ("dense_lift_points", 1.5),
+                        ("exact_lift_review", 1.0), ("dense_lift", 1.0)
                     ):
                         layer = runtime.layers.get(layer_name)
                         if layer and layer.loaded:
@@ -3412,19 +3494,19 @@ class UnifiedViserViewer:
         runtime.selected_object_id = None
         _set_markdown(
             self.selected_markdown,
-            "Выберите объект в списке или нажмите на его OBB/поверхность.",
+            "Select an object from the list or click its box/surface.",
         )
         _set_markdown(
             self.scene_title,
-            f"# {_markdown_text(runtime.scene.spec.label)} | `{_markdown_text(runtime.scene.farm.run_id)}`",
+            f"# {_markdown_text(runtime.scene.spec.label)}",
         )
         self.evidence_image.image = np.zeros((64, 64, 3), dtype=np.uint8)
         evidence_state = runtime.scene.layers["object_evidence"]
         evidence_text = (
-            "Ракурсы объекта загружаются после выбора."
+            "Object photos load after selection."
             if evidence_state.ready
-            else "Ракурсы COLMAP недоступны: "
-            + _short_reason(evidence_state.reason)
+            else "Photos unavailable: "
+            + _markdown_text(_short_reason(evidence_state.reason))
         )
         _set_markdown(self.evidence_markdown, evidence_text)
         _set_markdown(self.scene_status, self._status_markdown(runtime))
@@ -3520,7 +3602,16 @@ class UnifiedViserViewer:
         )
         layer.handles.append(handle)
         runtime.camera_points = points
-        runtime.presets = camera_presets(points, runtime.scene.farm.world_up)
+        # The overview frames the catalog, rather than distant reconstruction
+        # noise or a large ceiling. The full scene remains navigable.
+        catalog_points = []
+        signs = np.asarray([[x, y, z] for x in (-1, 1) for y in (-1, 1) for z in (-1, 1)])
+        for row in runtime.scene.farm.catalog:
+            center = np.asarray(row["center_m"], dtype=float)
+            radius = 0.5 * float(np.linalg.norm(row["dimensions_m"]))
+            catalog_points.append(center + signs * radius)
+        framing = np.concatenate(catalog_points) if catalog_points else points
+        runtime.presets = camera_presets(framing, runtime.scene.farm.world_up)
 
     def _load_obb_layer(self, runtime: _SceneRuntime, layer: _LayerRuntime) -> None:
         runtime.scene.farm.catalog_binding.verify(field_name="FARM presentation catalog")
@@ -3592,12 +3683,18 @@ class UnifiedViserViewer:
             splats = filter_object_gaussian_splats(*splats, object_id)
             path_suffix = f"selected_{object_id:06d}"
         centers, covariances, rgbs, opacities, _ = splats
-        handle = self.server.scene.add_gaussian_splats(
+        if not len(centers):
+            raise UnifiedViewerError("The selected object has no verified 3D mask.")
+        if not np.isfinite(centers).all():
+            raise UnifiedViewerError("The 3D mask contains invalid coordinates.")
+        handle = self.server.scene.add_point_cloud(
             f"/scenes/{runtime.scene.spec.scene_id}/exact_lift_review/{path_suffix}",
-            centers=centers,
-            covariances=covariances,
-            rgbs=rgbs,
-            opacities=opacities,
+            points=centers,
+            colors=np.clip(np.rint(rgbs * 255.0), 0, 255).astype(np.uint8),
+            point_size=self.point_size,
+            point_shape="circle",
+            point_shading="flat",
+            precision="float32",
         )
         layer.handles.append(handle)
 
@@ -3691,12 +3788,18 @@ class UnifiedViserViewer:
             splats = filter_object_gaussian_splats(*splats, object_id)
             path_suffix = f"selected_{object_id:06d}"
         centers, covariances, rgbs, opacities, _ = splats
-        handle = self.server.scene.add_gaussian_splats(
+        if not len(centers):
+            raise UnifiedViewerError("The selected object has no verified 3D mask.")
+        if not np.isfinite(centers).all():
+            raise UnifiedViewerError("The 3D mask contains invalid coordinates.")
+        handle = self.server.scene.add_point_cloud(
             f"/scenes/{runtime.scene.spec.scene_id}/dense_lift/{path_suffix}",
-            centers=centers,
-            covariances=covariances,
-            rgbs=rgbs,
-            opacities=opacities,
+            points=centers,
+            colors=np.clip(np.rint(rgbs * 255.0), 0, 255).astype(np.uint8),
+            point_size=self.point_size,
+            point_shape="circle",
+            point_shading="flat",
+            precision="float32",
         )
         layer.handles.append(handle)
 
@@ -3822,9 +3925,9 @@ class UnifiedViserViewer:
                     self._status_markdown(runtime, error=str(exc)),
                 )
             self._apply_layer_visibility(runtime, instance_layer)
-        category = _markdown_text(row.get("category") or "объект")
+        category = _markdown_text(row.get("category") or "object")
         description = _markdown_text(
-            row.get("description") or "Описание отсутствует."
+            row.get("description") or "No description available."
         )
         dimensions = np.asarray(
             row.get("dimensions_m", [np.nan, np.nan, np.nan]), dtype=np.float64
@@ -3840,36 +3943,53 @@ class UnifiedViserViewer:
             if str(value).strip()
         ]
         members = [int(value) for value in (row.get("assembly_member_ids") or [])]
+        metric_verified = runtime.scene.farm.metric_scale_verified
+        length_unit = "m" if metric_verified else "reconstruction units"
+        volume_unit = "m³" if metric_verified else "reconstruction units³"
         lines = [
             f"## #{object_id} · {category}",
             description,
             (
-                f"**Размеры OBB:** {dimensions[0]:.3f} × {dimensions[1]:.3f} × "
-                f"{dimensions[2]:.3f} м · **объём OBB:** {volume_m3:.3f} м³"
+                f"**Box dimensions:** {dimensions[0]:.3f} × {dimensions[1]:.3f} × "
+                f"{dimensions[2]:.3f} {length_unit} · "
+                f"**Box volume:** {volume_m3:.3f} {volume_unit}"
             ),
             (
-                f"**Доказательность:** "
-                f"{_markdown_text(row.get('evidence_tier', 'неизвестно'))} · "
-                f"**семантика:** "
-                f"{_markdown_text(row.get('semantic_tier', 'неизвестно'))} · "
-                f"**геометрия:** "
-                f"{_markdown_text(row.get('geometry_status', 'неизвестно'))}"
+                f"**Evidence:** "
+                f"{_markdown_text(row.get('evidence_tier', 'unknown'))} · "
+                f"**Identity:** "
+                f"{_markdown_text(row.get('semantic_tier', 'unknown'))} · "
+                f"**Geometry:** "
+                f"{_markdown_text(row.get('geometry_status', 'unknown'))}"
             ),
         ]
+        if not metric_verified:
+            lines.insert(3, "Physical scale is unverified; dimensions use reconstruction units.")
+        lift_bundle = runtime.scene.dense_lift or runtime.scene.review_lift
+        if lift_bundle is not None:
+            with np.load(lift_bundle.bank_path, allow_pickle=False) as bank:
+                bank_ids = bank["object_ids"]
+                bank_ptr = bank["indptr"]
+                found = np.flatnonzero(bank_ids == object_id)
+                count = int(bank_ptr[found[0] + 1] - bank_ptr[found[0]]) if len(found) else 0
+            lines.append(
+                f"**3D mask:** {count:,} verified source points."
+                if count else "**3D mask:** did not pass verification; no verified mask is available."
+            )
         if attributes:
-            lines.append("**Атрибуты:** " + " · ".join(attributes))
+            lines.append("**Attributes:** " + " · ".join(attributes))
         if members:
             lines.append(
-                "**Части сборного объекта:** "
+                "**Assembly members:** "
                 + ", ".join(f"#{value}" for value in members)
             )
         if runtime.scene.bridge and object_id in runtime.scene.bridge.instance_rows:
             source = runtime.scene.bridge.instance_rows[object_id]
             lines.append(
-                "**Поддержка instance-mask:** "
+                "**Mask support:** "
                 f"{int(source.get('final_gaussians', 0)):,} Gaussian splats · "
-                f"{int(source.get('observations', 0))} наблюдений · "
-                f"медианная уверенность "
+                f"{int(source.get('observations', 0))} observations · "
+                f"median confidence "
                 f"{float(source.get('median_final_confidence', 0.0)):.3f}"
             )
         mesh = runtime.mesh_rows_by_id.get(object_id)
@@ -3878,13 +3998,13 @@ class UnifiedViserViewer:
             label = (
                 "QA review-mesh"
                 if object_id in runtime.review_mesh_ids
-                else "QA реконструкции"
+                else "Reconstruction QA"
             )
             lines.append(
                 f"**{label}:** "
-                f"{int(qa.get('vertices', qa.get('vertex_count', 0))):,} вершин · "
-                f"{int(qa.get('faces', qa.get('face_count', 0))):,} граней · "
-                f"ошибка центра {float(qa.get('center_error_m', 0.0)):.3f} м"
+                f"{int(qa.get('vertices', qa.get('vertex_count', 0))):,} vertices · "
+                f"{int(qa.get('faces', qa.get('face_count', 0))):,} faces · "
+                f"center error {float(qa.get('center_error_m', 0.0)):.3f} {length_unit}"
             )
         _set_markdown(self.selected_markdown, "\n\n".join(lines))
 
@@ -3894,7 +4014,7 @@ class UnifiedViserViewer:
         if not evidence_layer.ready:
             _set_markdown(
                 self.evidence_markdown,
-                "— **Ракурсы COLMAP недоступны:** "
+                "— **Photos unavailable:** "
                 + _markdown_text(_short_reason(evidence_layer.reason)),
             )
         else:
@@ -3914,14 +4034,14 @@ class UnifiedViserViewer:
                 icon = "⚠️" if gallery.provenance_warning else "✅"
                 cameras = sorted({str(frame.camera_id) for frame in gallery.frames})
                 provenance = (
-                    "review provenance: проверено при запуске, но не producer-signed"
+                    "saved photos and masks; quality requires review"
                     if gallery.provenance_warning
-                    else "producer-bound provenance"
+                    else "saved photos and masks bound to this result"
                 )
                 gallery_lines = [
-                    f"{icon} **Показано ракурсов:** {len(gallery.frames)} · "
-                    f"камер: {len(cameras)}",
-                    f"Источник: {_markdown_text(provenance)}.",
+                    f"{icon} **Views shown:** {len(gallery.frames)} · "
+                    f"cameras: {len(cameras)}",
+                    f"Source: {_markdown_text(provenance)}.",
                 ]
                 _set_markdown(
                     self.evidence_markdown, "\n\n".join(gallery_lines)
@@ -3930,7 +4050,7 @@ class UnifiedViserViewer:
                 self.evidence_image.image = blank
                 _set_markdown(
                     self.evidence_markdown,
-                    "⚠️ **Не удалось декодировать ракурсы COLMAP:** "
+                    "⚠️ **Could not load photos:** "
                     + _markdown_text(_short_reason(str(exc))),
                 )
 
@@ -3954,22 +4074,22 @@ class UnifiedViserViewer:
     ) -> str:
         scene = runtime.scene
         rows = [
-            "### Доступность и целостность",
-            f"Запуск `{_markdown_text(scene.farm.run_id)}` · "
-            f"конфигурация `{scene.farm.config_sha256[:12]}`",
+            "### Availability and integrity",
+            f"Run `{_markdown_text(scene.farm.run_id)}` · "
+            f"configuration `{scene.farm.config_sha256[:12]}`",
         ]
         if loading:
-            rows.append(f"⏳ Загрузка `{loading}` только для чтения…")
+            rows.append(f"⏳ Loading `{_markdown_text(loading.replace('_', ' '))}` read-only…")
         if error:
             rows.append(f"❌ {_markdown_text(_short_reason(error))}")
         layer_labels = {
-            "object_evidence": "Ракурсы объектов",
-            "bridge_instances": "Устаревший instance-preview",
-            "exact_lift_review": "Проверочный non-release lifting",
-            "legacy_shaper_review": "Проверочная реконструкция",
-            "source_gaussians": "Исходная 3DGS",
-            "dense_lift": "Проверенные instance-splats",
-            "shaper_meshes": "Реконструированные mesh-объекты",
+            "object_evidence": "Object photos",
+            "bridge_instances": "Legacy instance preview",
+            "exact_lift_review": "Review mask layer",
+            "legacy_shaper_review": "Review reconstruction",
+            "source_gaussians": "Source 3D scene",
+            "dense_lift": "Verified mask points",
+            "shaper_meshes": "Reconstructed meshes",
         }
         for name, label in layer_labels.items():
             state = scene.layers[name]
@@ -3985,9 +4105,8 @@ class UnifiedViserViewer:
                 f"{_markdown_text(_short_reason(state.reason))}"
             )
         rows.append(
-            "ℹ️ Полные splat-слои показываются как DC-preview Viser с "
-            "квантованием float16/uint8; view-dependent higher-order SH "
-            "не вычисляются."
+            "ℹ️ Source scene colors are independent of viewing "
+            "direction. Browser transfer uses reduced numerical precision."
         )
         return "\n\n".join(rows)
 
@@ -4002,18 +4121,18 @@ class UnifiedViserViewer:
         warning = "⚠️" if scene.farm.source_warning else "✅"
         integrity = "⚠️" if scene.farm.integrity_warning else "✅"
         return (
-            f"**Проверенный исходный asset**  \n"
+            f"**Verified source asset**  \n"
             f"`{_markdown_text(scene.source_table.path.name)}`  \n"
             f"{scene.source_table.count:,} Gaussian rows · {size_gib:.2f} GiB  \n"
             f"{scene.spec.source_fingerprint.algorithm}: "
             f"`{scene.spec.source_fingerprint.digest}`  \n"
             f"{warning} {_markdown_text(scene.farm.source_note)}  \n"
             f"{integrity} {_markdown_text(scene.farm.integrity_note)}\n\n"
-            f"**Все исходные rows** — тяжёлый опциональный слой: примерно "
-            f"{packed_mb:.0f} MB на клиента. Это DC-preview всех исходных rows "
-            "с anisotropic covariance и sigmoid opacity в metric coordinates. "
-            "Viser не вычисляет higher-order SH, поэтому изображение не является "
-            "bit-exact или view-dependent воспроизведением исходного renderer."
+            f"**Full source scene** — optional large layer: about "
+            f"{packed_mb:.0f} MB per client. The preview includes every source element "
+            "with its source shape and opacity in scene coordinates. "
+            "Colors do not change with viewing direction, so the appearance may "
+            "differ from the source photos."
         )
     def run_forever(self) -> None:
         try:
