@@ -3141,9 +3141,15 @@ class UnifiedViserViewer:
                 "3D OBB", initial_value=True
             )
             self.show_instances = self.server.gui.add_checkbox(
-                "3D masks: points",
+                "3D lifting masks",
                 initial_value=False,
-                hint="Centers of verified source elements; no invented surface.",
+                hint="Verified source elements assigned to objects.",
+            )
+            self.mask_display = self.server.gui.add_dropdown(
+                "Mask display",
+                options=("Points", "Gaussians"),
+                initial_value="Points",
+                hint="Points show source centers; Gaussians show their original shape and opacity.",
             )
             self.isolate_selected = self.server.gui.add_checkbox(
                 "Isolate selected mask",
@@ -3260,6 +3266,7 @@ class UnifiedViserViewer:
                         self._unload_layer(runtime, name)
                     self._apply_layer_visibility(runtime, name)
 
+        @self.mask_display.on_update
         @self.isolate_selected.on_update
         def _isolate_selected_changed(_event: Any = None) -> None:
             with self._mutation_lock:
@@ -3687,15 +3694,19 @@ class UnifiedViserViewer:
             raise UnifiedViewerError("The selected object has no verified 3D mask.")
         if not np.isfinite(centers).all():
             raise UnifiedViewerError("The 3D mask contains invalid coordinates.")
-        handle = self.server.scene.add_point_cloud(
-            f"/scenes/{runtime.scene.spec.scene_id}/exact_lift_review/{path_suffix}",
-            points=centers,
-            colors=np.clip(np.rint(rgbs * 255.0), 0, 255).astype(np.uint8),
-            point_size=self.point_size,
-            point_shape="circle",
-            point_shading="flat",
-            precision="float32",
-        )
+        path = f"/scenes/{runtime.scene.spec.scene_id}/exact_lift_review/{path_suffix}"
+        if self.mask_display.value == "Gaussians":
+            handle = self.server.scene.add_gaussian_splats(
+                path, centers=centers, covariances=covariances,
+                rgbs=rgbs, opacities=opacities,
+            )
+        else:
+            handle = self.server.scene.add_point_cloud(
+                path, points=centers,
+                colors=np.clip(np.rint(rgbs * 255.0), 0, 255).astype(np.uint8),
+                point_size=self.point_size, point_shape="circle",
+                point_shading="flat", precision="float32",
+            )
         layer.handles.append(handle)
 
     def _load_legacy_shaper_layer(self, runtime: _SceneRuntime, layer: _LayerRuntime) -> None:
@@ -3792,15 +3803,19 @@ class UnifiedViserViewer:
             raise UnifiedViewerError("The selected object has no verified 3D mask.")
         if not np.isfinite(centers).all():
             raise UnifiedViewerError("The 3D mask contains invalid coordinates.")
-        handle = self.server.scene.add_point_cloud(
-            f"/scenes/{runtime.scene.spec.scene_id}/dense_lift/{path_suffix}",
-            points=centers,
-            colors=np.clip(np.rint(rgbs * 255.0), 0, 255).astype(np.uint8),
-            point_size=self.point_size,
-            point_shape="circle",
-            point_shading="flat",
-            precision="float32",
-        )
+        path = f"/scenes/{runtime.scene.spec.scene_id}/dense_lift/{path_suffix}"
+        if self.mask_display.value == "Gaussians":
+            handle = self.server.scene.add_gaussian_splats(
+                path, centers=centers, covariances=covariances,
+                rgbs=rgbs, opacities=opacities,
+            )
+        else:
+            handle = self.server.scene.add_point_cloud(
+                path, points=centers,
+                colors=np.clip(np.rint(rgbs * 255.0), 0, 255).astype(np.uint8),
+                point_size=self.point_size, point_shape="circle",
+                point_shading="flat", precision="float32",
+            )
         layer.handles.append(handle)
 
     def _load_dense_points_layer(self, runtime: _SceneRuntime, layer: _LayerRuntime) -> None:
