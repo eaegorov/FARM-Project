@@ -237,6 +237,15 @@ def test_compiled_yoloe_pipeline_has_no_global_sam_and_isolates_new_runtime(tmp_
             str(args.yoloe_model_root / "yoloe/mobileclip2_b.ts")
             in s["fingerprint_inputs"]
         )
+    assert "--separate-scene-surfaces" in stages["native"]["command"]
+    assert "--native-selection" in stages["catalog"]["command"]
+    selection = "${run_dir}/quality/native/selection.json"
+    assert selection in stages["catalog"]["fingerprint_inputs"]
+    args.separate_scene_surfaces = False
+    legacy = {s["id"]: s for s in compile_plan(args)["pipeline"]["stages"]}
+    assert "--separate-scene-surfaces" not in legacy["native"]["command"]
+    assert "--native-selection" not in legacy["catalog"]["command"]
+    args.separate_scene_surfaces = True
     assert stages["coverage"]["needs"] == ["initial_geometry"]
     assert "--target-timestamps" not in stages["coverage"]["command"]
     args.target_timestamps = 3

@@ -74,6 +74,7 @@ def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     for name in ("native", "semantics", "output"):
         p.add_argument("--" + name, type=Path, required=True)
+    p.add_argument("--native-selection", type=Path)
     args = p.parse_args(argv)
     if args.output.exists():
         raise ValueError("new catalog output required")
@@ -113,6 +114,11 @@ def main(argv=None):
         )
     groups = {g["id"]: g for g in geometry["groups"]}
     selected = {o.object_id: o for o in run.objects}
+    context = None
+    if args.native_selection:
+        from farm_runtime.quality.scene_roles import bind_context_selection
+        context = bind_context_selection(args.native_selection, record, selected)
+    context_ids = {row["object_id"] for row in context or []}
     native_counts = {
         oid: len({run.frame(o.image_id).physical_timestamp for o in obj.observations})
         for oid, obj in selected.items()
@@ -217,6 +223,12 @@ def main(argv=None):
         schema="farm.quality-scene-catalog.v1",
         scene_id=run.scene_id,
         objects=rows,
+        **(dict(
+            scene_context=context,
+            scene_context_selection=describe_file(args.native_selection),
+            scene_context_masks_source=record,
+            scene_context_native_masks_assigned=False,
+        ) if context is not None else {}),
         source_ply=manifest["source_ply"],
         source_gaussian_count=source.count,
         meters_per_scene_unit=run.meters_per_scene_unit,
@@ -231,6 +243,7 @@ def main(argv=None):
             g
             for g in groups
             if groups[g]["independent_timestamps"] >= 2 and g not in selected
+            and g not in context_ids
         ),
         unconfirmed_single_timestamp_group_ids=sorted(
             g

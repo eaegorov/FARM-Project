@@ -16,6 +16,7 @@ import numpy as np
 from PIL import Image
 
 from farm_runtime.quality.mask_refinement import checked_file
+from farm_runtime.quality.scene_roles import POLICY as CONTEXT_POLICY
 from farm_runtime.quality_baseline import describe_file, write_json
 
 
@@ -623,7 +624,11 @@ def segment(args):
 def native(args):
     from farm_runtime.quality import native_observations
 
-    chosen, deferred = bounded_groups(read(args.geometry), args.groups)
+    geometry = read(args.geometry)
+    context = []
+    if getattr(args, "separate_scene_surfaces", False):
+        from farm_runtime.quality.scene_roles import surface_context
+        context = surface_context(geometry)
     recovery_validation = getattr(args, "recovery_validation", None)
     supplements = getattr(args, "recovery_supplement", [])
     if supplements and not recovery_validation:
@@ -637,6 +642,13 @@ def native(args):
         if recovery_validation
         else []
     )
+    # Recovered observations can change category evidence. Keep these groups
+    # object-eligible until the extra observations receive a role assessment.
+    context = [r for r in context if r["object_id"] not in recovered]
+    context_ids = {r["object_id"] for r in context}
+    counts = {g["id"]: (0 if g["id"] in context_ids else g["independent_timestamps"])
+              for g in geometry["groups"]}
+    chosen, deferred = bounded_groups(geometry, args.groups, counts)
     added = sorted(set(recovered) - set(chosen))
     chosen += added
     deferred = [g for g in deferred if g not in chosen]
@@ -674,6 +686,8 @@ def native(args):
         dict(
             selected_group_ids=chosen,
             deferred_group_ids=deferred,
+            **(dict(context_groups=context, context_policy=CONTEXT_POLICY)
+               if getattr(args, "separate_scene_surfaces", False) else {}),
             source_geometry=describe_file(args.geometry),
             policy="Independent timestamps descending, stable group ID tie break",
             candidate_budget=args.groups,
@@ -851,6 +865,9 @@ def semantics(args):
 
 def compile_plan(args):
     """Return a normal FARM DAG; no additional execution framework."""
+    separate_surfaces = getattr(args, "separate_scene_surfaces", True)
+    if type(separate_surfaces) is not bool:
+        raise ValueError("scene surface routing must be boolean")
     whole_objects = getattr(args, "whole_objects", False)
     if type(whole_objects) is not bool:
         raise ValueError("whole_objects must be boolean")
@@ -1353,6 +1370,7 @@ def compile_plan(args):
             f"{root}/configs/quality/native_rendered_v1.json",
             "--groups",
             args.native_groups,
+            *(["--separate-scene-surfaces"] if separate_surfaces else []),
             "--alternatives",
             args.alternatives,
             *up_args,
@@ -1491,11 +1509,14 @@ def compile_plan(args):
             final_native,
             "--semantics",
             f"{q}/semantics/manifest.json",
+            *(["--native-selection", f"{q}/native/selection.json"]
+              if separate_surfaces else []),
             "--output",
             f"{q}/catalog",
         ],
         f"{q}/catalog/catalog.json",
-        [final_native, f"{q}/semantics/manifest.json"],
+        [final_native, f"{q}/semantics/manifest.json",
+         *([f"{q}/native/selection.json"] if separate_surfaces else [])],
     )
     artifacts = dict(
         catalog=f"{q}/catalog/catalog.json",
@@ -1557,6 +1578,7 @@ def compile_plan(args):
                 association="geometry",
                 visual_features_used=False,
             ),
+            separate_scene_surfaces=separate_surfaces,
             depth_consistent_association=depth_consistent,
             explore_uncovered=getattr(args, "explore_uncovered", False),
             **(dict(target_independent_timestamps=target_timestamps)
@@ -1625,6 +1647,7 @@ def main(argv=None):
     q.add_argument("--views", type=int, required=True)
     q.add_argument("--world-up", type=float, nargs=3, required=True)
     q = command("native", ["geometry", "ply", "config"])
+    q.add_argument("--separate-scene-surfaces", action="store_true")
     q.add_argument("--recovery-validation", type=Path)
     q.add_argument("--recovery-supplement", type=Path, action="append", default=[])
     q.add_argument("--groups", type=int, default=128)
@@ -1643,6 +1666,9 @@ def main(argv=None):
     q = command("plan", ["rgbd", "ply", "vlm-model", "project-root", "output-root"])
     q.add_argument("--sam-model", type=Path)
     q.add_argument("--detector", choices=("sam3", "yoloe"), default="sam3")
+    q.add_argument("--include-scene-surfaces", action="store_false",
+                   dest="separate_scene_surfaces",
+                   help="Keep continuous building-surface candidates in object lifting")
     q.add_argument("--yoloe-model-root", type=Path)
     q.add_argument("--yoloe-checkpoint", type=Path)
     q.add_argument("--yoloe-vocabulary", type=Path)
