@@ -201,3 +201,35 @@ confidence, mask strength, PASS/REVIEW или качество формы. Пр�
   это QA preview, не native photorealistic 3DGS.
 - ShapeR/MV-SAM3D hallucinate unseen surfaces.
 - Полная 2D silhouette лучше bbox, но не заменяет ground-truth 3D.
+
+## Explicit YOLOE checkpoint comparison (development)
+
+The legacy pipeline default remains unchanged. `farm quality discovery` accepts
+an explicit segmentation `--checkpoint` in an isolated Ultralytics >=8.4 runtime.
+For YOLOE-26L/26X, put the official checkpoint and `mobileclip2_b.ts` under the
+local model root. The adapter never downloads these implicitly.
+
+```bash
+farm quality discovery --plan /data/development_plan.json \
+  --model-root /models --vocabulary /config/yoloe_vocabulary.txt \
+  --checkpoint /models/yoloe/yoloe-26x-seg.pt \
+  --confidence 0.25 --world-up 0 -1 0 --output /output/new_comparison
+```
+
+The prepared plan lists unique development source frames with hashes, camera
+rotations and capture timestamps. Alternatively supply `--packet`, `--colmap`
+and `--images` to build the ordinary plan. Do not combine both input modes.
+
+The adapter preserves native suppression and real mask logits in source camera
+orientation. A startup parity check must exercise the custom predictor. Person
+exclusions are emitted only when the vocabulary actually contains `person`;
+zero detections without this query are not evidence that the image has no people.
+The native geometry adapter accepts both per-frame query metadata and the
+explicit all-frame detector query declaration.
+
+This is a detector-to-geometry integration, not a drop-in replacement for the
+legacy visual embedding/association backend. Detector category hypotheses remain
+separate from final appearance annotations. `quality scene-catalog` takes labels
+and captions from the namespace-bound Qwen appearance stage; absent annotations
+remain unavailable. MobileCLIP text embeddings do not establish an object's
+physical identity, ownership, completeness or measured dimensions.

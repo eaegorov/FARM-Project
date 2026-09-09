@@ -312,7 +312,14 @@ def prepare_geometry(
             transient = inputs.transients.get(name)
             if (
                 transient is None
-                or not any(q["prompt"] == "person" for q in transient["queries"])
+                or not (
+                    any(q["prompt"] == "person" for q in transient.get("queries", []))
+                    or (
+                        "queries" not in transient
+                        and inputs.transient_manifest.get("person_query_present")
+                        is True
+                    )
+                )
                 or any(d["label"] != "person" for d in transient["detections"])
             ):
                 raise ValueError("explicit person-only transient evidence required")

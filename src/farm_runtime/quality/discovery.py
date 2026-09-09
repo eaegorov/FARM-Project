@@ -185,11 +185,21 @@ def build_ablation(packet, colmap, *, sampling, timestamp_count, image_root):
     }
 
 
-def predictor_parity(model, plan, *, resolution=640):
+def predictor_parity(
+    model,
+    plan,
+    *,
+    resolution=640,
+    predictor_factory=soft_mask_predictor,
+    confidence=0.4,
+    extra_options=None,
+    predict_call=None,
+):
     """Compare the custom soft decoder to the pinned native YOLOE predictor."""
     import torch
     from ultralytics.models.yolo.segment.predict import SegmentationPredictor
 
+    predict_call = predict_call or model.predict
     rows = []
     for name in plan["variants"][0]["views"][:2]:
         with Image.open(plan["sources"][name]["source_image"]["path"]) as im:
@@ -198,7 +208,7 @@ def predictor_parity(model, plan, *, resolution=640):
         options = dict(
             source=image,
             imgsz=resolution,
-            conf=0.4,
+            conf=confidence,
             iou=0.5,
             agnostic_nms=True,
             max_det=200,
@@ -207,14 +217,17 @@ def predictor_parity(model, plan, *, resolution=640):
             verbose=False,
             save=False,
         )
+        options.update(extra_options or {})
         model.predictor = None
-        native = model.predict(**options, predictor=SegmentationPredictor)[0]
+        native = predict_call(**options, predictor=SegmentationPredictor)[0]
         native_boxes = native.boxes.data.detach().clone()
         native_masks = (
             None if native.masks is None else native.masks.data.detach().clone().bool()
         )
         model.predictor = None
-        soft = model.predict(**options, predictor=soft_mask_predictor())[0]
+        soft = predict_call(**options, predictor=predictor_factory())[0]
+        if not hasattr(soft, "farm_mask_logits"):
+            raise ValueError("custom predictor was not used; soft logits missing")
         box_equal = native_boxes.shape == soft.boxes.data.shape and torch.allclose(
             native_boxes, soft.boxes.data, atol=1e-4, rtol=1e-5
         )
@@ -238,23 +251,100 @@ def predictor_parity(model, plan, *, resolution=640):
     return rows
 
 
-def infer(plan, output, *, model_root, vocabulary, world_up):
-    import torch
-    from scene_graph.segmentation.yoloe import YOLOESegmenter
+def validate_inference_plan(plan):
+    """Reject changed inputs or mixed evaluation roles before GPU initialization."""
+    import re
+    from farm_runtime.quality.mask_refinement import checked_file
 
+    if plan.get("test_opened") is not False or not plan.get("variants"):
+        raise ValueError("explicit nonempty development plan required")
+    names = [v["name"] for v in plan["variants"]]
+    if len(set(names)) != len(names) or any(
+        not re.fullmatch(r"[a-z0-9_]+", n) for n in names
+    ):
+        raise ValueError("unique safe variant names required")
+    seen = set()
+    stems = set()
+    for variant in plan["variants"]:
+        views = variant["views"]
+        if not views or len(set(views)) != len(views):
+            raise ValueError("nonempty unique views per variant required")
+        resolution = variant["resolution"]
+        if type(resolution) is not int or not 32 <= resolution <= 2048:
+            raise ValueError("resolution must be in 32..2048")
+        for name in views:
+            row = plan["sources"][name]
+            if row.get("name") != name or not str(row.get("timestamp", "")):
+                raise ValueError("source name and capture identity required")
+            if name not in seen:
+                stem = Path(name).stem
+                if stem in stems:
+                    raise ValueError("ambiguous source image basenames")
+                stems.add(stem)
+                checked_file(row["source_image"])
+                seen.add(name)
+
+
+def infer(
+    plan, output, *, model_root, vocabulary, world_up, checkpoint=None, confidence=0.4
+):
+    import torch
+
+    if plan.get("test_opened") is not False or not 0 < confidence < 1:
+        raise ValueError("development plan and confidence in (0,1) required")
+    validate_inference_plan(plan)
     torch.manual_seed(20260905)
     started = time.monotonic()
-    segmenter = YOLOESegmenter(
-        vocab_file=vocabulary, conf_thres=0.4, use_dino_features=False
-    )
-    model = segmenter.model
-    # Dedicated predictor retains the same checkpoint/vocabulary/NMS semantics.
+    extra_options = {}
+    if checkpoint is None:
+        from scene_graph.segmentation.yoloe import YOLOESegmenter
+        from ultralytics.nn.text_model import _resolve_mobileclip_checkpoint
+
+        segmenter = YOLOESegmenter(
+            vocab_file=vocabulary, conf_thres=confidence, use_dino_features=False
+        )
+        model = segmenter.model
+        model_descriptor = describe_file(model_root / "yoloe/yoloe-v8l-seg-pf.pt")
+        components = {
+            "vocabulary_head_checkpoint": describe_file(segmenter._base_ckpt),
+            "text_encoder_checkpoint": describe_file(
+                _resolve_mobileclip_checkpoint("blt")
+            ),
+        }
+        predictor_factory = soft_mask_predictor
+    else:
+        from farm_runtime.quality.yoloe_modern import load_text_model
+        from farm_runtime.quality.yoloe_modern import (
+            soft_mask_predictor as modern_predictor,
+        )
+
+        model, components = load_text_model(checkpoint, vocabulary, model_root)
+        model_descriptor = components["detector_checkpoint"]
+        predictor_factory = modern_predictor
+        # Explicitly use dense predictions + native NMS, matching the comparison.
+        extra_options = {"nms": None}
+    predict_call = model.predict
+    if checkpoint is not None:
+        from functools import partial
+        from ultralytics.engine.model import Model
+
+        # YOLOE.predict consumes the predictor argument as a visual-prompt
+        # selector and does not forward it for text prompts in Ultralytics 8.4.
+        # Dispatch through the ordinary model API to retain our soft decoder.
+        predict_call = partial(Model.predict, model)
     model.predictor = None
-    predictor = soft_mask_predictor()
+    predictor = predictor_factory()
     torch.cuda.synchronize()
     setup_seconds = time.monotonic() - started
     setup_peak_allocated_mib = torch.cuda.max_memory_allocated() / 2**20
-    parity = predictor_parity(model, plan)
+    parity = predictor_parity(
+        model,
+        plan,
+        predictor_factory=predictor_factory,
+        confidence=confidence,
+        extra_options=extra_options,
+        predict_call=predict_call,
+    )
     results = []
     for variant in plan["variants"]:
         dest = output / variant["name"]
@@ -264,10 +354,10 @@ def infer(plan, output, *, model_root, vocabulary, world_up):
         # inference. Report it separately so variant order does not bias A/B.
         warm_started = time.monotonic()
         torch.cuda.reset_peak_memory_stats()
-        model.predict(
+        predict_call(
             source=Image.new("RGB", (variant["resolution"], variant["resolution"])),
             imgsz=variant["resolution"],
-            conf=0.4,
+            conf=confidence,
             iou=0.5,
             agnostic_nms=True,
             max_det=200,
@@ -276,6 +366,7 @@ def infer(plan, output, *, model_root, vocabulary, world_up):
             verbose=False,
             save=False,
             predictor=predictor,
+            **extra_options,
         )
         torch.cuda.synchronize()
         warmup = {
@@ -317,10 +408,10 @@ def infer(plan, output, *, model_root, vocabulary, world_up):
                 )
             )
             model_pixels += size * size  # padded YOLO tensor, batch=1
-            pred = model.predict(
+            pred = predict_call(
                 source=Image.fromarray(small),
                 imgsz=size,
-                conf=0.4,
+                conf=confidence,
                 iou=0.5,
                 agnostic_nms=True,
                 max_det=200,
@@ -329,6 +420,7 @@ def infer(plan, output, *, model_root, vocabulary, world_up):
                 verbose=False,
                 save=False,
                 predictor=predictor,
+                **extra_options,
             )[0]
             masks = pred.farm_mask_logits
             detections = []
@@ -433,6 +525,7 @@ def infer(plan, output, *, model_root, vocabulary, world_up):
             "peak_allocated_mib": torch.cuda.max_memory_allocated() / 2**20,
             "peak_reserved_mib": torch.cuda.max_memory_reserved() / 2**20,
             "source_frames": len(observations),
+            "person_query_present": "person" in model.names.values(),
             "detections": sum(len(o["detections"]) for o in observations),
             "labels": dict(
                 Counter(d["label"] for o in observations for d in o["detections"])
@@ -441,20 +534,40 @@ def infer(plan, output, *, model_root, vocabulary, world_up):
             "status": "PROPOSALS_REQUIRE_VISUAL_AND_GEOMETRY_REVIEW",
         }
         write_json(dest / "predictions.json", summary)
+        if "person" in model.names.values():
+            write_json(
+                dest / "transients.json",
+                dict(
+                    summary,
+                    observations=[
+                        dict(
+                            row,
+                            queries=[{"prompt": "person"}],
+                            detections=[
+                                d for d in row["detections"] if d["label"] == "person"
+                            ],
+                        )
+                        for row in observations
+                    ],
+                    role="person-only exclusion proposals from this detector; worn parts not merged",
+                ),
+            )
         canvas.save(dest / "overview.jpg", quality=90)
         results.append({k: v for k, v in summary.items() if k != "observations"})
-    from ultralytics.nn.text_model import _resolve_mobileclip_checkpoint
-
     report = {
         "schema": "farm.discovery-ablation-results.v1",
         "plan_sha256": json_digest(plan),
-        "model": describe_file(model_root / "yoloe/yoloe-v8l-seg-pf.pt"),
-        "model_components": {
-            "vocabulary_head_checkpoint": describe_file(segmenter._base_ckpt),
-            "text_encoder_checkpoint": describe_file(
-                _resolve_mobileclip_checkpoint("blt")
-            ),
-        },
+        "model": model_descriptor,
+        "model_components": components,
+        "mode": "legacy-vocabulary" if checkpoint is None else "text",
+        "confidence_threshold": confidence,
+        "extra_predict_options": extra_options,
+        "code": describe_file(Path(__file__)),
+        "modern_adapter_code": (
+            describe_file(Path(__file__).with_name("yoloe_modern.py"))
+            if checkpoint is not None
+            else None
+        ),
         "vocabulary": describe_file(vocabulary),
         "setup_seconds": setup_seconds,
         "setup_peak_allocated_mib": setup_peak_allocated_mib,
@@ -470,12 +583,19 @@ def infer(plan, output, *, model_root, vocabulary, world_up):
 
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--packet", type=Path, required=True)
-    p.add_argument("--colmap", type=Path, required=True)
-    p.add_argument("--images", type=Path, required=True)
+    p.add_argument("--plan", type=Path, help="Prepared development source plan")
+    p.add_argument("--packet", type=Path)
+    p.add_argument("--colmap", type=Path)
+    p.add_argument("--images", type=Path)
     p.add_argument("--output", type=Path, required=True)
     p.add_argument("--model-root", type=Path, required=True)
     p.add_argument("--vocabulary", type=Path, required=True)
+    p.add_argument(
+        "--checkpoint",
+        type=Path,
+        help="Opt-in modern text checkpoint; separate Ultralytics runtime required",
+    )
+    p.add_argument("--confidence", type=float, default=0.4)
     p.add_argument("--sampling", choices=("pilot", "scene"), default="scene")
     p.add_argument("--timestamps", type=int, default=48)
     p.add_argument("--world-up", nargs=3, type=float, required=True)
@@ -493,16 +613,24 @@ def main(argv=None):
     args = p.parse_args(argv)
     if args.output.exists() or args.timestamps < 2:
         raise ValueError("output must be new and timestamps >= 2")
-    packet = json.loads(args.packet.read_text())
-    plan = build_ablation(
-        packet,
-        args.colmap,
-        sampling=args.sampling,
-        timestamp_count=args.timestamps,
-        image_root=args.images,
-    )
+    if args.plan is not None:
+        if any(x is not None for x in (args.packet, args.colmap, args.images)):
+            p.error("--plan cannot be combined with --packet/--colmap/--images")
+        plan = json.loads(args.plan.read_text())
+    else:
+        if any(x is None for x in (args.packet, args.colmap, args.images)):
+            p.error("provide --plan or all of --packet/--colmap/--images")
+        packet = json.loads(args.packet.read_text())
+        plan = build_ablation(
+            packet,
+            args.colmap,
+            sampling=args.sampling,
+            timestamp_count=args.timestamps,
+            image_root=args.images,
+        )
     if args.variant:
         plan["variants"] = [v for v in plan["variants"] if v["name"] in args.variant]
+    validate_inference_plan(plan)
     args.output.mkdir(parents=True)
     write_json(args.output / "plan.json", plan)
     if not args.plan_only:
@@ -512,6 +640,8 @@ def main(argv=None):
             model_root=args.model_root,
             vocabulary=args.vocabulary,
             world_up=args.world_up,
+            checkpoint=args.checkpoint,
+            confidence=args.confidence,
         )
     return 0
 

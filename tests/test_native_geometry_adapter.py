@@ -562,3 +562,29 @@ def test_semantics_recovery_has_separate_budget_and_preserves_base_selection(
     assert stage["recovery_added_group_ids"] == [8]
     assert stage["candidate_budget"] == 1
     assert stage["deferred_group_ids"] == []
+
+
+@pytest.mark.parametrize(
+    "queried,empty_row_queries", [(True, False), (False, False), (True, True)]
+)
+def test_detector_transient_query_contract(tmp_path, queried, empty_row_queries):
+    geometry, config = geometry_fixture(tmp_path / "source")
+    path = tmp_path / "source/transients.json"
+    value = json.loads(path.read_text())
+    value["person_query_present"] = queried
+    for row in value["observations"]:
+        row.pop("queries")
+        if empty_row_queries:
+            row["queries"] = []
+        row["detections"] = []
+    write_json(path, value)
+    data = json.loads(geometry.read_text())
+    data["inputs"]["transients"] = describe_file(path)
+    write_json(geometry, data)
+    if not queried or empty_row_queries:
+        with pytest.raises(ValueError, match="person-only"):
+            prepare_geometry(geometry, config, tmp_path / "native", [0, -1, 0])
+    else:
+        run, _, _ = prepare_geometry(geometry, config, tmp_path / "native", [0, -1, 0])
+        excluded, _ = load_observation_exclusion(run, run.frames[0])
+        assert not excluded.any()

@@ -66,7 +66,7 @@ class SurfaceInputs:
         _, observations = read_observations(self.proposals_path)
         self.observations = {r["name"]: r for r in observations}
         self.transients_path = checked_file(self.geometry["inputs"]["transients"])
-        _, transients = read_observations(self.transients_path)
+        self.transient_manifest, transients = read_observations(self.transients_path)
         self.transients = {r["name"]: r for r in transients}
         self.nodes = {r["id"]: r for r in self.geometry["nodes"]}
         with np.load(
