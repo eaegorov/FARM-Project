@@ -15,14 +15,23 @@ from farm_runtime.quality.surface_evidence import SurfaceInputs, rank_views
 from farm_runtime.quality_baseline import describe_file, write_json
 
 
-def choose_views(visibility, group_timestamps, frame_timestamps, budget):
+def choose_views(
+    visibility, group_timestamps, frame_timestamps, budget, *, target_timestamps=None
+):
     """Maximize marginal best visible fraction, favoring weakly observed groups.
 
     This schedules segmentation, not foreground votes. One frame per physical
     timestamp may be selected, and a group's existing timestamp adds no evidence.
+    An optional target allows several independent confirmations of a weak group,
+    maximizing the sum of its best required visibility fractions. These are
+    predicted opportunities only; detections must still confirm the association.
     """
     if type(budget) is not int or not 1 <= budget <= 24:
         raise ValueError("view budget must be an integer from 1 to 24")
+    if target_timestamps is not None and (
+        type(target_timestamps) is not int or not 2 <= target_timestamps <= 4
+    ):
+        raise ValueError("target timestamps must be an integer in 2..4 or None")
     if any(not timestamps for timestamps in group_timestamps.values()):
         raise ValueError("every group requires an observed timestamp")
     weights = {g: 1 / len(ts) for g, ts in group_timestamps.items()}
@@ -40,10 +49,18 @@ def choose_views(visibility, group_timestamps, frame_timestamps, budget):
             if timestamp not in group_timestamps[gid]:
                 candidates[name][gid] = fraction
     covered = dict.fromkeys(weights, 0.0)
+    required = {g: max(1, target_timestamps - len(ts)) if target_timestamps else 1
+                for g, ts in group_timestamps.items()}
+    best = {g: [] for g in weights}
+
+    def marginal(gid, fraction):
+        floor = min(best[gid]) if len(best[gid]) == required[gid] else 0.0
+        return max(0.0, fraction - floor)
+
     selected, used_timestamps = [], set()
     for _ in range(budget):
         gains = {
-            name: sum(weights[g] * max(0, v - covered[g]) for g, v in groups.items())
+            name: sum(weights[g] * marginal(g, v) for g, v in groups.items())
             for name, groups in candidates.items()
             if frame_timestamps[name] not in used_timestamps
         }
@@ -59,7 +76,7 @@ def choose_views(visibility, group_timestamps, frame_timestamps, budget):
                 marginal_score=gains[name],
                 visible_groups=len(groups),
                 improved_group_ids=sorted(
-                    g for g, v in groups.items() if v > covered[g]
+                    g for g, v in groups.items() if marginal(g, v) > 0
                 ),
                 visibility=groups,
             )
@@ -67,6 +84,7 @@ def choose_views(visibility, group_timestamps, frame_timestamps, budget):
         used_timestamps.add(timestamp)
         for gid, value in groups.items():
             covered[gid] = max(covered[gid], value)
+            best[gid] = sorted(best[gid] + [value], reverse=True)[:required[gid]]
     return selected, covered
 
 
@@ -141,10 +159,12 @@ def main(argv=None):
         parser.add_argument("--" + name, type=Path, required=True)
     parser.add_argument("--views", type=int, default=8)
     parser.add_argument("--explore-uncovered", action="store_true")
+    parser.add_argument("--target-timestamps", type=int, choices=(2, 3, 4),
+                        help="Schedule independent confirmation opportunities within the same view budget")
     args = parser.parse_args(argv)
     if args.output.exists():
         raise ValueError("new output required")
-    choose_views({}, {}, {}, args.views)  # Validate budget before input work.
+    choose_views({}, {}, {}, args.views, target_timestamps=args.target_timestamps)
     plan = json.loads(args.plan.read_text())
     if plan.get("test_opened") is not False:
         raise ValueError("development-only source plan required")
@@ -195,6 +215,7 @@ def main(argv=None):
         group_timestamps,
         {name: str(frame["frame_id"]) for name, frame in inputs.frames.items()},
         args.views,
+        target_timestamps=args.target_timestamps,
     )
     targeted_count = len(selected)
     if args.explore_uncovered:
@@ -235,7 +256,14 @@ def main(argv=None):
                 explore_uncovered=args.explore_uncovered,
                 exploration_supplies_object_evidence=False,
                 group_weight="1 / original independent timestamps",
-                coverage_objective="sum of marginal best visible fraction per group",
+                coverage_objective=(
+                    "sum of best required independent visibility fractions per group"
+                    if args.target_timestamps else
+                    "sum of marginal best visible fraction per group"
+                ),
+                **(dict(target_independent_timestamps=args.target_timestamps,
+                        predicted_visibility_is_confirmation=False)
+                   if args.target_timestamps else {}),
                 candidate_gates="Existing rank_views: >=20 points and >=0.25 visible fraction",
                 transient_handling="New images require person segmentation before supplying evidence.",
             ),

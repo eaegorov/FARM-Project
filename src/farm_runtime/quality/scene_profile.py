@@ -877,6 +877,11 @@ def compile_plan(args):
         raise ValueError("detector confidence must be in (0,1)")
     if complementary_vocabulary and not complementary_root:
         raise ValueError("complementary vocabulary requires a model root")
+    target_timestamps = getattr(args, "target_timestamps", None)
+    if target_timestamps is not None and (
+        type(target_timestamps) is not int or not 2 <= target_timestamps <= 4
+    ):
+        raise ValueError("target timestamps must be in 2..4")
     recovery_budget = getattr(args, "recovery_groups", 0)
     if type(recovery_budget) is not int or not 0 <= recovery_budget <= 16:
         raise ValueError("recovery group budget must be in 0..16")
@@ -1142,6 +1147,7 @@ def compile_plan(args):
             "--views",
             args.adaptive_views,
             *(["--explore-uncovered"] if getattr(args, "explore_uncovered", False) else []),
+            *(["--target-timestamps", target_timestamps] if target_timestamps else []),
             "--output",
             f"{q}/coverage",
         ],
@@ -1553,6 +1559,8 @@ def compile_plan(args):
             ),
             depth_consistent_association=depth_consistent,
             explore_uncovered=getattr(args, "explore_uncovered", False),
+            **(dict(target_independent_timestamps=target_timestamps)
+               if target_timestamps else {}),
             start="completed registered metric RGBD from existing FARM ingress",
             refinement=(
                 "bounded other-timestamp crop refinement"
@@ -1641,6 +1649,8 @@ def main(argv=None):
     q.add_argument("--detector-confidence", type=float, default=0.4)
     q.add_argument("--depth-consistent-association", action="store_true")
     q.add_argument("--explore-uncovered", action="store_true", help="Use spare adaptive budget for unseen camera directions and positions")
+    q.add_argument("--target-timestamps", type=int, choices=(2, 3, 4),
+                   help="Seek independent object confirmations within the adaptive view budget")
     q.add_argument("--runtimes", type=Path)
     q.add_argument("--scene-id", required=True)
     q.add_argument(

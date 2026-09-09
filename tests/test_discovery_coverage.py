@@ -112,3 +112,43 @@ def test_exploration_is_scale_invariant_and_rejects_invalid_poses():
     frames["far"]["T_world_cam"][0][0] = np.nan
     with pytest.raises(ValueError, match="finite"):
         explore_views(frames, old, [], 2)
+
+
+
+def test_confirmation_target_schedules_third_capture_without_counting_stereo_twice():
+    visibility = {"a": {1: .9}, "a_stereo": {1: 1.0},
+                  "b": {1: .8}, "c": {1: .7}, "old": {1: 1.0}}
+    timestamps = {"a": "1", "a_stereo": "1", "b": "2", "c": "3", "old": "0"}
+    base, _ = choose_views(visibility, {1: {"0"}}, timestamps, 8)
+    confirmed, covered = choose_views(
+        visibility, {1: {"0"}}, timestamps, 8, target_timestamps=3
+    )
+    assert [r["name"] for r in base] == ["a_stereo"]
+    assert [r["name"] for r in confirmed] == ["a_stereo", "b"]
+    assert confirmed[1]["improved_group_ids"] == [1]
+    assert confirmed[1]["marginal_score"] == pytest.approx(.8)
+    assert covered == {1: 1.0}
+
+
+def test_confirmation_obeys_budget_and_never_treats_existing_time_as_new():
+    vis = {"same": {1: 1.0, 2: .9}, "next": {1: .8, 2: .8}, "other": {1: .7}}
+    groups = {1: {"0", "1"}, 2: {"0"}}
+    timestamps = {"same": "1", "next": "2", "other": "3"}
+    selected, _ = choose_views(vis, groups, timestamps, 2, target_timestamps=3)
+    assert [r["name"] for r in selected] == ["next", "same"]
+    assert selected[1]["visibility"] == {2: .9}
+    assert all(1 not in r["improved_group_ids"] for r in selected[1:])
+    assert len({r["timestamp"] for r in selected}) == 2
+
+
+def test_confirmation_target_does_not_invent_visibility_or_require_all_targets():
+    selected, covered = choose_views(
+        {"empty": {1: 0.0}}, {1: {"old"}}, {"empty": "new"}, 8, target_timestamps=4
+    )
+    assert selected == [] and covered == {1: 0.0}
+
+
+@pytest.mark.parametrize("target", [True, 1, 5, 3.0, "3"])
+def test_invalid_confirmation_target_is_rejected(target):
+    with pytest.raises(ValueError, match="target timestamps"):
+        choose_views({}, {}, {}, 8, target_timestamps=target)

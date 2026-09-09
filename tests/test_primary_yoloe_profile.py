@@ -238,6 +238,16 @@ def test_compiled_yoloe_pipeline_has_no_global_sam_and_isolates_new_runtime(tmp_
             in s["fingerprint_inputs"]
         )
     assert stages["coverage"]["needs"] == ["initial_geometry"]
+    assert "--target-timestamps" not in stages["coverage"]["command"]
+    args.target_timestamps = 3
+    confirmed = compile_plan(args)
+    coverage = next(s for s in confirmed["pipeline"]["stages"] if s["id"] == "coverage")
+    command = coverage["command"]
+    assert command[command.index("--target-timestamps") + 1] == "3"
+    assert confirmed["quality_profile"]["budgets"] == plan["quality_profile"]["budgets"]
+    assert len(confirmed["pipeline"]["stages"]) == len(plan["pipeline"]["stages"])
+    args.target_timestamps = None
+
     assert "--explore-uncovered" in stages["coverage"]["command"]
     for name in ["initial_geometry", "geometry"]:
         assert "--depth-consistent-association" in stages[name]["command"]
