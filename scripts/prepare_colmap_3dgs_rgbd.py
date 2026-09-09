@@ -1235,6 +1235,7 @@ def run(args: argparse.Namespace) -> int:
             frames.append({
                 "frame_id": identity.timestamp,
                 "timestamp_ns": int((timestamp_rank[identity.timestamp] + 1) * dt_ns),
+                "physical_timestamp": str((timestamp_rank[identity.timestamp] + 1) * dt_ns),
                 "camera": identity.camera,
                 "rgb_path": f"rgb/{key}.jpg", "depth_path": f"depth/{key}.npy",
                 "depth_size": [height, width], "K": K.tolist(),
@@ -1247,6 +1248,11 @@ def run(args: argparse.Namespace) -> int:
         cameras = list(dict.fromkeys(frame["camera"] for frame in frames))
         frames_index = {
             "schema_version": "farm_frames_json_v1", "scene_id": args.scene_id,
+            "timestamp_contract": {
+                "timestamp_ns": "synthetic processing order at nominal_hz; not elapsed video time",
+                "physical_timestamp": "capture-group key shared by simultaneous cameras; not a measured time",
+                "frame_id": "source capture identity parsed from the COLMAP image name",
+            },
             "cameras": cameras,
             "depth_units": "metres",
             "pose_translation_units": "metres",

@@ -59,6 +59,21 @@ def test_extension_preserves_original_cameras_and_shares_new_physical_timestamp(
     assert rows["c"]["depth_path"] == str(tmp_path / "new/c.npy")
 
 
+def test_extension_remaps_additional_alias_and_keeps_original_capture_key(tmp_path):
+    old = index([dict(frame("a", "t1"), physical_timestamp="42")])
+    new = index([
+        dict(frame("a", "t1"), timestamp_ns=900, physical_timestamp="900"),
+        dict(frame("b", "t1", camera="cam1"), timestamp_ns=900, physical_timestamp="900"),
+        dict(frame("c", "t2"), timestamp_ns=100, physical_timestamp="100"),
+        dict(frame("d", "t2", camera="cam1"), timestamp_ns=100, physical_timestamp="100"),
+    ])
+    merged, _ = merge_indices(old, new, tmp_path, tmp_path, ["b", "c", "d"])
+    rows = {r["source_image"]: r for r in merged["frames"]}
+    assert rows["a"]["physical_timestamp"] == rows["b"]["physical_timestamp"] == "42"
+    assert rows["c"]["physical_timestamp"] == rows["d"]["physical_timestamp"] == str(rows["c"]["timestamp_ns"])
+    assert len({r["physical_timestamp"] for r in rows.values()}) == 2
+
+
 @pytest.mark.parametrize(
     "fault",
     [

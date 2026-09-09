@@ -44,6 +44,7 @@ except ModuleNotFoundError:  # package import: scripts.geometry.refine_farm_obje
     )
 from scene_graph.utils.geometry import VOXEL_BASE_V, decode_voxel_keys_numpy
 from scene_graph.map_update.mask_observations import resolve_object_mask_observations
+from farm_runtime.frame_identity import normalize_capture_timestamps
 from farm_runtime.obb_release_evidence import (
     OBBReleaseEvidencePolicy,
     evaluate_obb_release_evidence,
@@ -70,6 +71,8 @@ def _load_frames(path: Path) -> tuple[Path, dict[str, dict]]:
     rows = payload.get("frames") if isinstance(payload, dict) else None
     if not isinstance(rows, list):
         raise ValueError(f"No frames list in {path}")
+    if payload.get("schema_version") == "farm_frames_json_v1":
+        rows = normalize_capture_timestamps(rows)
     by_stem: dict[str, dict] = {}
     for row in rows:
         if not isinstance(row, dict):

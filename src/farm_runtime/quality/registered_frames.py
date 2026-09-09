@@ -9,6 +9,7 @@ from pathlib import Path
 
 import numpy as np
 
+from farm_runtime.frame_identity import normalize_capture_timestamps
 from farm_runtime.quality.mask_refinement import checked_file
 from farm_runtime.quality_baseline import describe_file, write_json
 
@@ -28,7 +29,7 @@ def trusted_names(index):
 
 
 def merge_indices(original, additional, original_root, additional_root, names):
-    """Preserve original poses/timestamps; remap only added physical timestamps."""
+    """Preserve original poses/clocks; extend capture groups without collisions."""
     for key in ("depth_units", "pose_translation_units"):
         if original.get(key) != "metres" or additional.get(key) != "metres":
             raise ValueError("metric registered frames required")
@@ -87,10 +88,17 @@ def merge_indices(original, additional, original_root, additional_root, names):
         return result
 
     merged = copy.deepcopy(original)
-    merged["frames"] = [relocated(r, original_root) for r in original["frames"]]
+    merged["frames"] = normalize_capture_timestamps(
+        [relocated(r, original_root) for r in original["frames"]]
+    )
+    capture_keys = {str(r["frame_id"]): r["physical_timestamp"] for r in merged["frames"]}
     for name in sorted(names):
         row = relocated(extra[name], additional_root)
         row["timestamp_ns"] = timestamps[str(row["frame_id"])]
+        # Additional preparation has its own clock; its alias must be remapped.
+        row["physical_timestamp"] = capture_keys.get(
+            str(row["frame_id"]), str(row["timestamp_ns"])
+        )
         K, pose = np.asarray(row["K"], float), np.asarray(row["T_world_cam"], float)
         if (
             K.shape != (3, 3)
@@ -100,6 +108,7 @@ def merge_indices(original, additional, original_root, additional_root, names):
         ):
             raise ValueError("finite registered camera matrices required")
         merged["frames"].append(row)
+    merged["frames"] = normalize_capture_timestamps(merged["frames"])
     for group in additional["camera_registration"]["groups"]:
         selected = [n for n in group["source_images"] if n in names]
         if selected:
