@@ -1141,6 +1141,7 @@ def compile_plan(args):
             f"{q}/input/plan.json",
             "--views",
             args.adaptive_views,
+            *(["--explore-uncovered"] if getattr(args, "explore_uncovered", False) else []),
             "--output",
             f"{q}/coverage",
         ],
@@ -1551,6 +1552,7 @@ def compile_plan(args):
                 visual_features_used=False,
             ),
             depth_consistent_association=depth_consistent,
+            explore_uncovered=getattr(args, "explore_uncovered", False),
             start="completed registered metric RGBD from existing FARM ingress",
             refinement=(
                 "bounded other-timestamp crop refinement"
@@ -1638,6 +1640,7 @@ def main(argv=None):
     q.add_argument("--yoloe-vocabulary", type=Path)
     q.add_argument("--detector-confidence", type=float, default=0.4)
     q.add_argument("--depth-consistent-association", action="store_true")
+    q.add_argument("--explore-uncovered", action="store_true", help="Use spare adaptive budget for unseen camera directions and positions")
     q.add_argument("--runtimes", type=Path)
     q.add_argument("--scene-id", required=True)
     q.add_argument(

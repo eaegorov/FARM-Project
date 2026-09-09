@@ -287,3 +287,13 @@ structural masks, so it does not establish useful-object recall or safe
 automatic inventory admission. Nested alternatives remain separate hypotheses.
 An empty adaptive schedule records zero inference and merges with the initial
 batch without reloading the model. All budgets remain explicit.
+
+
+The optional `--explore-uncovered` profile flag spends only the unused adaptive
+view budget on camera positions/directions not covered by observed or already
+scheduled frames. The previous visibility-driven choices retain priority.
+Exploration supplies no visibility votes or object admission; it only schedules
+segmentation. Physical timestamps still count once downstream. The trajectory
+scale uses O(N) storage and is invariant to scene translation, rotation and
+uniform scale; scoring is bounded by the adaptive view budget. Camera novelty
+is a scheduling heuristic, not proof of a newly discovered object.

@@ -70,11 +70,77 @@ def choose_views(visibility, group_timestamps, frame_timestamps, budget):
     return selected, covered
 
 
+def explore_views(frames, observed, targeted, budget):
+    """Use unspent segmentation budget for new camera directions/positions.
+
+    This supplies no visibility or foreground evidence. A new direction at an
+    already observed timestamp may reveal new objects, but downstream timestamp
+    aggregation still counts that physical capture only once.
+    """
+    if type(budget) is not int or not 1 <= budget <= 24 or len(targeted) > budget:
+        raise ValueError("view budget must be in 1..24 and contain targeted views")
+    selected_names = {r["name"] for r in targeted}
+    if len(selected_names) != len(targeted) or not selected_names <= frames.keys():
+        raise ValueError("unique known targeted frames required")
+    all_frames = {**observed, **frames}
+    poses = {n: np.asarray(f["T_world_cam"], float) for n, f in all_frames.items()}
+    if any(t.shape != (4, 4) or not np.isfinite(t).all() for t in poses.values()):
+        raise ValueError("finite 4x4 camera transforms required")
+    if not observed:
+        raise ValueError("observed camera poses required for exploration")
+    # Normalize distances by the existing scene trajectory, not physical units.
+    centers = np.array([t[:3, 3] for t in poses.values()])
+    radii = np.linalg.norm(centers - centers.mean(axis=0), axis=-1)
+    positive = radii[radii > 1e-9]
+    scale = float(2 * np.median(positive)) if len(positive) else 1.0
+    directions = {}
+    for name, t in poses.items():
+        direction = t[:3, 2]
+        norm = np.linalg.norm(direction)
+        if norm < 1e-8:
+            raise ValueError("nonzero camera viewing direction required")
+        directions[name] = direction / norm
+    reference = set(observed) | selected_names
+    used_timestamps = {str(frames[n]["frame_id"]) for n in selected_names}
+    extra = []
+    while len(targeted) + len(extra) < budget:
+        scores = {}
+        for name, frame in frames.items():
+            if name in reference or str(frame["frame_id"]) in used_timestamps:
+                continue
+            scores[name] = min(
+                np.linalg.norm(poses[name][:3, 3] - poses[other][:3, 3]) / scale
+                + np.arccos(np.clip(np.dot(directions[name], directions[other]), -1, 1))
+                / np.pi
+                for other in reference
+            )
+        if not scores or max(scores.values()) <= 1e-9:
+            break
+        name = max(scores, key=lambda n: (scores[n], n))
+        ts = str(frames[name]["frame_id"])
+        extra.append(
+            dict(
+                name=name,
+                timestamp=ts,
+                marginal_score=0.0,
+                visible_groups=0,
+                improved_group_ids=[],
+                visibility={},
+                pose_novelty=float(scores[name]),
+                selection_reason="unspent_budget_camera_exploration",
+            )
+        )
+        reference.add(name)
+        used_timestamps.add(ts)
+    return extra
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ("geometry", "plan", "output"):
         parser.add_argument("--" + name, type=Path, required=True)
     parser.add_argument("--views", type=int, default=8)
+    parser.add_argument("--explore-uncovered", action="store_true")
     args = parser.parse_args(argv)
     if args.output.exists():
         raise ValueError("new output required")
@@ -84,6 +150,7 @@ def main(argv=None):
         raise ValueError("development-only source plan required")
     inputs = SurfaceInputs(args.geometry)
     old_names = {f["source"] for f in inputs.geometry["frames"]}
+    observed_frames = {n: f for n, f in inputs.frames.items() if n in old_names}
     # Preserve the original preparation as the camera/timestamp authority.
     inputs.frames = {
         name: frame
@@ -129,6 +196,9 @@ def main(argv=None):
         {name: str(frame["frame_id"]) for name, frame in inputs.frames.items()},
         args.views,
     )
+    targeted_count = len(selected)
+    if args.explore_uncovered:
+        selected += explore_views(inputs.frames, observed_frames, selected, args.views)
     names = [row["name"] for row in selected]
     adaptive = dict(plan)
     adaptive.update(
@@ -153,6 +223,8 @@ def main(argv=None):
             adaptive_plan=describe_file(args.output / "plan.json"),
             group_candidates=rows,
             selected=selected,
+            targeted_views=targeted_count,
+            exploratory_views=len(selected) - targeted_count,
             existing_groups=len(covered),
             groups_with_predicted_additional_coverage=sum(
                 v > 0 for v in covered.values()
@@ -160,6 +232,8 @@ def main(argv=None):
             total_seconds=time.monotonic() - started,
             policy=dict(
                 maximum_new_views=args.views,
+                explore_uncovered=args.explore_uncovered,
+                exploration_supplies_object_evidence=False,
                 group_weight="1 / original independent timestamps",
                 coverage_objective="sum of marginal best visible fraction per group",
                 candidate_gates="Existing rank_views: >=20 points and >=0.25 visible fraction",
@@ -168,7 +242,11 @@ def main(argv=None):
             status=(
                 "additional_views_selected"
                 if selected
-                else "no_remaining_covisible_views"
+                else (
+                    "no_remaining_novel_views"
+                    if args.explore_uncovered
+                    else "no_remaining_covisible_views"
+                )
             ),
             closed_test_opened=False,
             release_eligible=False,

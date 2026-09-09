@@ -208,6 +208,7 @@ def test_compiled_yoloe_pipeline_has_no_global_sam_and_isolates_new_runtime(tmp_
         detector_confidence=0.25,
         sam_model=None,
         depth_consistent_association=True,
+        explore_uncovered=True,
         initial_views=12,
         adaptive_views=8,
         vocabulary_views=8,
@@ -237,6 +238,7 @@ def test_compiled_yoloe_pipeline_has_no_global_sam_and_isolates_new_runtime(tmp_
             in s["fingerprint_inputs"]
         )
     assert stages["coverage"]["needs"] == ["initial_geometry"]
+    assert "--explore-uncovered" in stages["coverage"]["command"]
     for name in ["initial_geometry", "geometry"]:
         assert "--depth-consistent-association" in stages[name]["command"]
     assert stages["appearance"]["command"][0] == "main-python"
