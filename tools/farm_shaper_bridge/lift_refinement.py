@@ -3,8 +3,9 @@
 The refinement is deliberately downstream of strong multi-timestamp claims and
 upstream of the frozen held-out boundary.  It may add only previously unknown
 source rows that have positive build evidence and are spatially connected to a
-strong core.  It never opens held-out masks and never overwrites another object
-or a strong unresolved conflict.
+strong core. An optional remote-component filter may clear isolated claims; it
+does not force an object into one component. It never opens held-out masks,
+reassigns another object, or promotes a strong unresolved conflict.
 """
 
 from __future__ import annotations
@@ -12,9 +13,88 @@ from __future__ import annotations
 from typing import Any, Mapping, Sequence
 
 import numpy as np
+from scipy.sparse import coo_matrix
+from scipy.sparse.csgraph import connected_components
 from scipy.spatial import cKDTree
 
 from tools.farm_shaper_bridge.common import UNKNOWN_ID, resolve_sparse_claims
+
+
+def remote_component_mask(
+    points: np.ndarray,
+    radii: np.ndarray,
+    connection: Mapping[str, Any],
+    policy: Mapping[str, Any],
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Propose small, distant islands around a dominant connected surface.
+
+    This heuristic does not establish physical identity. Nearby disconnected
+    parts and substantial secondary components remain. Fragmented objects and
+    excessive proposed removal cause abstention; callers must explicitly opt in.
+    """
+    points, radii = np.asarray(points, float), np.asarray(radii, float)
+    if points.ndim != 2 or points.shape[1] != 3 or radii.shape != (len(points),):
+        raise ValueError("aligned N x 3 points and N radii required")
+    if not np.isfinite(points).all() or not np.isfinite(radii).all() or np.any(radii < 0):
+        raise ValueError("finite points and nonnegative radii required")
+    removed = np.zeros(len(points), bool)
+    audit = dict(points=len(points), removed=0, reason="too_few_points")
+    if len(points) < 2:
+        return removed, audit
+    distance, near = cKDTree(points).query(
+        points, k=min(int(policy["neighbors"]) + 1, len(points)), workers=4
+    )
+    source = np.broadcast_to(np.arange(len(points))[:, None], near.shape)
+    limit = np.clip(
+        float(connection["connection_radius_multiplier"]) * (radii[:, None] + radii[near]),
+        float(connection["minimum_connection_radius_m"]),
+        float(connection["maximum_connection_radius_m"]),
+    )
+    edges = (source != near) & (distance <= limit)
+    graph = coo_matrix(
+        (np.ones(int(edges.sum()), bool), (source[edges], near[edges])),
+        shape=(len(points), len(points)),
+    ).tocsr()
+    count, labels = connected_components(graph, directed=False)
+    sizes = np.bincount(labels, minlength=count)
+    dominant = int(sizes.argmax())
+    fraction = float(sizes[dominant] / len(points))
+    audit.update(components=count, dominant_fraction=fraction)
+    if fraction < float(policy["minimum_dominant_fraction"]):
+        audit["reason"] = "no_dominant_surface"
+        return removed, audit
+    main = points[labels == dominant]
+    # Rotation/translation invariant extent. All main points contribute, so an
+    # already extended component cannot make the separation threshold tighter.
+    diameter_bound = float(2 * np.linalg.norm(main - main.mean(axis=0), axis=1).max())
+    separation = max(
+        3 * float(connection["maximum_connection_radius_m"]),
+        float(policy["minimum_relative_separation"]) * diameter_bound,
+    )
+    other = np.flatnonzero(labels != dominant)
+    gap = np.full(count, np.inf)
+    if len(other):
+        nearest = cKDTree(main).query(points[other], workers=4)[0]
+        np.minimum.at(gap, labels[other], nearest)
+    candidates = (
+        (sizes <= float(policy["maximum_component_fraction"]) * len(points))
+        & (gap > separation)
+    )
+    candidates[dominant] = False
+    proposed = candidates[labels]
+    audit.update(
+        separation_threshold_m=separation,
+        proposed=int(proposed.sum()),
+        proposed_components=int(candidates.sum()),
+    )
+    if proposed.sum() > float(policy["maximum_removed_fraction"]) * len(points):
+        audit["reason"] = "removal_budget_exceeded"
+        return removed, audit
+    audit.update(
+        removed=int(proposed.sum()),
+        reason="remote_small_components" if proposed.any() else "no_remote_small_components",
+    )
+    return proposed, audit
 
 
 def _membership_mask(sorted_values: np.ndarray, query: np.ndarray) -> np.ndarray:
@@ -268,6 +348,22 @@ def refine_connected_claims(
     }
     for row in object_rows:
         row["added_gaussians"] = added_by_id.get(int(row["object_id"]), 0)
+    # Growth counts above are gross additions, before optional island removal.
+    # Removal counts are recorded separately; source ownership is never transferred.
+    remote_policy = policy.get("remote_components", {})
+    if remote_policy.get("enabled", False):
+        for row in object_rows:
+            oid = int(row["object_id"])
+            # Local candidate indices contain every owned row of this object.
+            index = evidence[oid].indices
+            index = index[labels[index] == oid]
+            removed, remote_audit = remote_component_mask(
+                means_m[index], radius_m[index], policy, remote_policy
+            )
+            labels[index[removed]] = UNKNOWN_ID
+            confidence[index[removed]] = 0
+            support[index[removed]] = 0
+            row["remote_components"] = remote_audit
     return labels, confidence, support, {
         "enabled": True,
         "heldout_masks_opened": False,

@@ -769,3 +769,43 @@ def test_lift_config_rejects_invalid_visible_share(tmp_path, value):
     path.write_text(json.dumps(config))
     with pytest.raises(ValueError, match="build.minimum_visible_share"):
         load_config(path)
+
+@pytest.mark.parametrize("key,value", [
+    ("enabled", 1), ("neighbors", True), ("neighbors", 0), ("neighbors", 65),
+    ("minimum_dominant_fraction", .5), ("maximum_component_fraction", .8),
+    ("maximum_removed_fraction", .8), ("minimum_relative_separation", float("nan")),
+    ("minimum_relative_separation", 0), ("minimum_relative_separation", True),
+])
+def test_remote_component_config_is_validated(tmp_path, key, value):
+    source = Path(__file__).resolve().parents[1] / "configs/quality/native_rendered_v1.json"
+    payload = json.loads(source.read_text())
+    remote = dict(enabled=True, neighbors=16, minimum_dominant_fraction=.6,
+                  maximum_component_fraction=.05, maximum_removed_fraction=.15,
+                  minimum_relative_separation=.25)
+    remote[key] = value
+    payload["refinement"]["remote_components"] = remote
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(payload))
+    with pytest.raises(ValueError, match="remote.component"):
+        load_config(path)
+
+
+def test_remote_components_require_enabled_refinement(tmp_path):
+    source = Path(__file__).resolve().parents[1] / "configs/quality/native_rendered_v1.json"
+    payload = json.loads(source.read_text())
+    payload["refinement"].update(enabled=False, remote_components=dict(enabled=True))
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(payload))
+    with pytest.raises(ValueError, match="requires refinement.enabled"):
+        load_config(path)
+
+
+@pytest.mark.parametrize("remote", [None, [], False])
+def test_remote_component_section_requires_mapping(tmp_path, remote):
+    source = Path(__file__).resolve().parents[1] / "configs/quality/native_rendered_v1.json"
+    payload = json.loads(source.read_text())
+    payload["refinement"]["remote_components"] = remote
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(payload))
+    with pytest.raises(ValueError, match="remote_components"):
+        load_config(path)

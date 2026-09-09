@@ -169,3 +169,102 @@ def test_growth_does_not_reintroduce_rejected_build_visible_share():
     )
     np.testing.assert_array_equal(result, labels)
     assert audit["eligible"] == 0
+
+def _remote_policy():
+    return dict(enabled=True, neighbors=16, minimum_dominant_fraction=0.6,
+                maximum_component_fraction=0.05, maximum_removed_fraction=0.15,
+                minimum_relative_separation=0.25)
+
+
+def _remote_fixture():
+    x, y = np.meshgrid(np.arange(10) * .01, np.arange(10) * .01)
+    core = np.column_stack([x.ravel(), y.ravel(), np.zeros(100)])
+    def island(x, count):
+        return np.column_stack([x + np.arange(count) * .005,
+                                np.zeros(count), np.zeros(count)])
+    # A nearby part and a substantial remote part must remain.
+    points = np.concatenate([core, island(.25, 5), island(2, 4), island(4, 10)])
+    connection = dict(connection_radius_multiplier=2.,
+                      minimum_connection_radius_m=.025,
+                      maximum_connection_radius_m=.06)
+    return points, np.full(len(points), .012), connection
+
+
+def test_remote_components_preserve_nearby_and_substantial_separate_parts():
+    from tools.farm_shaper_bridge.lift_refinement import remote_component_mask
+    points, radii, connection = _remote_fixture()
+    removed, audit = remote_component_mask(points, radii, connection, _remote_policy())
+    assert np.flatnonzero(removed).tolist() == list(range(105, 109))
+    assert audit["removed"] == 4
+    assert audit["reason"] == "remote_small_components"
+
+
+def test_remote_components_abstain_when_fragmented_or_over_budget():
+    from tools.farm_shaper_bridge.lift_refinement import remote_component_mask
+    points, radii, connection = _remote_fixture()
+    policy = _remote_policy()
+    policy["maximum_removed_fraction"] = .02
+    removed, audit = remote_component_mask(points, radii, connection, policy)
+    assert not removed.any()
+    assert audit["reason"] == "removal_budget_exceeded"
+    separated = np.column_stack([np.arange(50), np.zeros(50), np.zeros(50)])
+    removed, audit = remote_component_mask(separated, np.full(50, .01), connection, _remote_policy())
+    assert not removed.any()
+    assert audit["reason"] == "no_dominant_surface"
+
+
+def test_remote_components_are_rotation_translation_and_scale_equivariant():
+    from tools.farm_shaper_bridge.lift_refinement import remote_component_mask
+    points, radii, connection = _remote_fixture()
+    expected, _ = remote_component_mask(points, radii, connection, _remote_policy())
+    angle = .71
+    rot = np.array([[np.cos(angle), -np.sin(angle), 0],
+                    [np.sin(angle), np.cos(angle), 0], [0, 0, 1]])
+    moved = (points @ rot.T) * 17 + [23, -61, 14]
+    connection = {k: v * 17 if k.endswith("_m") else v for k, v in connection.items()}
+    actual, _ = remote_component_mask(moved, radii * 17, connection, _remote_policy())
+    np.testing.assert_array_equal(actual, expected)
+
+
+def test_remote_component_removal_clears_evidence_without_reassigning_other_objects():
+    points, radii, connection = _remote_fixture()
+    n = len(points)
+    item = SimpleNamespace(
+        indices=np.arange(n), positive_weight=np.ones(n), negative_weight=np.zeros(n),
+        visible_weight=np.ones(n), positive_timestamps=np.full(n, 2, np.uint16),
+        negative_timestamps=np.zeros(n, np.uint16), build_timestamp_count=3,
+    )
+    config = _config()
+    config["refinement"].update(connection, remote_components=_remote_policy())
+    labels = np.full(n, 41, np.int32)
+    labels[-1] = 73
+    conf = np.full(n, .9, np.float32)
+    support = np.full(n, 2, np.uint16)
+    result, conf, support, audit = refine_connected_claims(
+        points, radii, {41: item}, labels, conf, support,
+        np.array([], np.int64), config,
+    )
+    assert result[-1] == 73
+    assert np.flatnonzero(result == UNKNOWN_ID).tolist() == list(range(105, 109))
+    assert not conf[105:109].any() and not support[105:109].any()
+    assert audit["objects"][0]["remote_components"]["removed"] == 4
+    assert audit["strong_labels_overwritten"] == 0
+
+
+def test_remote_component_disabled_preserves_membership_exactly():
+    points, radii, connection = _remote_fixture()
+    n = len(points)
+    item = SimpleNamespace(
+        indices=np.arange(n), positive_weight=np.ones(n), negative_weight=np.zeros(n),
+        visible_weight=np.ones(n), positive_timestamps=np.full(n, 2, np.uint16),
+        negative_timestamps=np.zeros(n, np.uint16), build_timestamp_count=3,
+    )
+    initial = np.full(n, 41, np.int32)
+    config = _config()
+    config["refinement"].update(connection)
+    result, conf, support, audit = refine_connected_claims(
+        points, radii, {41: item}, initial.copy(), np.full(n, .9),
+        np.full(n, 2, np.uint16), np.array([], np.int64), config,
+    )
+    np.testing.assert_array_equal(result, initial)
+    assert "remote_components" not in audit["objects"][0]

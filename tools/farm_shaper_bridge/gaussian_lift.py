@@ -288,6 +288,33 @@ def _require_sections(config: Mapping[str, Any]) -> None:
     finite("refinement", "minimum_winner_margin", minimum=0)
     finite("refinement", "minimum_winner_ratio", minimum=1)
 
+    remote = refinement.get("remote_components")
+    if "remote_components" in refinement:
+        if not isinstance(remote, dict) or not isinstance(remote.get("enabled"), bool):
+            raise ValueError("refinement.remote_components.enabled must be boolean")
+        if remote["enabled"]:
+            if not refinement["enabled"]:
+                raise ValueError("remote component filtering requires refinement.enabled")
+            neighbors = remote.get("neighbors")
+            if type(neighbors) is not int or not 1 <= neighbors <= 64:
+                raise ValueError("remote component neighbors must be an integer in 1..64")
+            for key in ("minimum_dominant_fraction", "maximum_component_fraction",
+                        "maximum_removed_fraction", "minimum_relative_separation"):
+                value = remote.get(key)
+                if (
+                    isinstance(value, bool)
+                    or not isinstance(value, (int, float))
+                    or not np.isfinite(value)
+                    or not 0 < value <= 1
+                ):
+                    raise ValueError(f"remote component {key} must be finite in (0,1]")
+            if remote["minimum_dominant_fraction"] <= 0.5:
+                raise ValueError("remote component dominance must exceed one half")
+            if remote["maximum_component_fraction"] >= remote["minimum_dominant_fraction"]:
+                raise ValueError("remote component removal must be smaller than dominant surface")
+            if remote["maximum_removed_fraction"] >= remote["minimum_dominant_fraction"]:
+                raise ValueError("remote component total removal must be smaller than dominant surface")
+
     for key in ("alpha_threshold", "good_timestamp_iou", "minimum_median_iou",
                 "minimum_q25_iou", "minimum_median_precision", "minimum_median_recall",
                 "minimum_median_largest_component"):
