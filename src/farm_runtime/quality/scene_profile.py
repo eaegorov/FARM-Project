@@ -91,7 +91,7 @@ def prepare_inputs(rgbd, output):
     )
 
 
-def union_vocabulary(scene, core, output):
+def union_vocabulary(scene, core, output, *, maximum_terms=80, ensure_person=False):
     document = read(scene)
     if document.get("reserved_test_opened") is not False:
         raise ValueError("development scene vocabulary required")
@@ -100,14 +100,18 @@ def union_vocabulary(scene, core, output):
             x.strip().lower() for x in core.read_text().splitlines() if x.strip()
         )
     )
-    if "person" not in terms or len(terms) > 80:
+    if type(maximum_terms) is not int or not 1 <= maximum_terms <= 2048:
+        raise ValueError("vocabulary budget must be in 1..2048")
+    if ensure_person and "person" not in terms:
+        terms.append("person")
+    if "person" not in terms or len(terms) > maximum_terms:
         raise ValueError("bounded core vocabulary must include person")
     counts = document["categories"]["objects"]
     extras = sorted(
         (x for x in counts if x not in terms), key=lambda x: (-counts[x], x)
     )
-    omitted = extras[80 - len(terms) :]
-    terms = sorted(terms + extras[: 80 - len(terms)])
+    omitted = extras[maximum_terms - len(terms) :]
+    terms = sorted(terms + extras[: maximum_terms - len(terms)])
     output.mkdir(parents=True)
     path = output / "vocabulary.txt"
     path.write_text("\n".join(terms) + "\n")
@@ -120,6 +124,16 @@ def union_vocabulary(scene, core, output):
             vocabulary=describe_file(path),
             omitted_scene_terms=omitted,
             terms=len(terms),
+            maximum_terms=maximum_terms,
+            query_roles={
+                term: sorted(
+                    role
+                    for role, values in document["categories"].items()
+                    if term in values
+                )
+                for term in terms
+            },
+            query_roles_are_scene_hypotheses=True,
             test_opened=False,
             interpretation="Core categories are queries, never assertions of presence.",
         ),
@@ -843,6 +857,24 @@ def compile_plan(args):
     complementary_root = getattr(args, "complementary_model_root", None)
     complementary_vocabulary = getattr(args, "complementary_vocabulary", None)
     partial_view = getattr(args, "partial_view_association", False)
+    depth_consistent = getattr(args, "depth_consistent_association", False)
+    detector = getattr(args, "detector", "sam3")
+    model_root = getattr(args, "yoloe_model_root", None)
+    checkpoint = getattr(args, "yoloe_checkpoint", None)
+    vocabulary = getattr(args, "yoloe_vocabulary", None)
+    confidence = getattr(args, "detector_confidence", 0.4)
+    if detector not in {"sam3", "yoloe"}:
+        raise ValueError("detector must be sam3 or yoloe")
+    if detector == "yoloe" and (not model_root or complementary_root):
+        raise ValueError(
+            "primary YOLOE requires its model root and no complementary detector"
+        )
+    if detector == "sam3" and any(
+        x is not None for x in (model_root, checkpoint, vocabulary)
+    ):
+        raise ValueError("YOLOE options require --detector yoloe")
+    if not 0 < confidence < 1:
+        raise ValueError("detector confidence must be in (0,1)")
     if complementary_vocabulary and not complementary_root:
         raise ValueError("complementary vocabulary requires a model root")
     recovery_budget = getattr(args, "recovery_groups", 0)
@@ -858,6 +890,12 @@ def compile_plan(args):
     crop_budget = getattr(args, "refinement_crops", 0)
     if type(crop_budget) is not int or not 0 <= crop_budget <= 32:
         raise ValueError("refinement crop budget must be in 0..32")
+    if (detector == "sam3" or total_recovery or crop_budget) and not getattr(
+        args, "sam_model", None
+    ):
+        raise ValueError(
+            "SAM model required for SAM discovery or bounded refinement/recovery"
+        )
     budgets = dict(
         recovery_groups=recovery_budget,
         coverage_groups=coverage_budget,
@@ -889,13 +927,22 @@ def compile_plan(args):
         if args.runtimes
         else {"main": ["${python_executable}"], "geometry": ["${python_executable}"]}
     )
-    if set(runtimes) != {"main", "geometry"} or any(
-        not isinstance(v, list)
-        or not v
-        or any(not isinstance(x, str) or not x for x in v)
-        for v in runtimes.values()
+    if (
+        not {"main", "geometry"} <= set(runtimes)
+        or set(runtimes) - {"main", "geometry", "detector"}
+        or any(
+            not isinstance(v, list)
+            or not v
+            or any(not isinstance(x, str) or not x for x in v)
+            for v in runtimes.values()
+        )
     ):
-        raise ValueError("main and geometry Python command prefixes required")
+        raise ValueError(
+            "main and geometry Python prefixes required; optional detector prefix allowed"
+        )
+    detector_runtime = "detector" if "detector" in runtimes else "main"
+    if checkpoint is not None and "detector" not in runtimes:
+        raise ValueError("modern YOLOE requires an explicit isolated detector runtime")
     root = "${execution_project_root}"
     q = "${run_dir}/quality"
     stages = []
@@ -964,12 +1011,28 @@ def compile_plan(args):
             "--scene",
             f"{q}/scene_vocabulary/manifest.json",
             "--core",
-            f"{root}/configs/quality/core_vocabulary.txt",
+            (
+                (vocabulary or f"{root}/configs/yoloe_vocabulary.txt")
+                if detector == "yoloe"
+                else f"{root}/configs/quality/core_vocabulary.txt"
+            ),
+            *(
+                ["--max-terms", "2048", "--ensure-person"]
+                if detector == "yoloe"
+                else []
+            ),
             "--output",
             f"{q}/vocabulary",
         ],
         f"{q}/vocabulary/manifest.json",
-        [f"{q}/scene_vocabulary/manifest.json"],
+        [
+            f"{q}/scene_vocabulary/manifest.json",
+            (
+                (vocabulary or f"{root}/configs/yoloe_vocabulary.txt")
+                if detector == "yoloe"
+                else f"{root}/configs/quality/core_vocabulary.txt"
+            ),
+        ],
     )
 
     def sam(name, plan, views):
@@ -992,6 +1055,43 @@ def compile_plan(args):
             ],
             f"{q}/{name}/manifest.json",
             [plan, f"{q}/vocabulary/vocabulary.txt"],
+        )
+
+    def segment_primary(name, plan, views):
+        if detector == "sam3":
+            return sam(name, plan, views)
+        weights = checkpoint or model_root / "yoloe/yoloe-v8l-seg-pf.pt"
+        components = (
+            [model_root / "yoloe/mobileclip2_b.ts"]
+            if checkpoint
+            else [
+                model_root / "yoloe/yoloe-v8l-seg.pt",
+                model_root / "mobileclip/mobileclip_blt.pt",
+            ]
+        )
+        add(
+            name,
+            "yoloe-discovery",
+            [
+                "--primary-profile",
+                "--plan",
+                plan,
+                "--views",
+                views,
+                "--model-root",
+                model_root,
+                "--vocabulary",
+                f"{q}/vocabulary/vocabulary.txt",
+                *(["--checkpoint", checkpoint] if checkpoint else []),
+                "--confidence",
+                confidence,
+                *up_args,
+                "--output",
+                f"{q}/{name}",
+            ],
+            f"{q}/{name}/manifest.json",
+            [plan, f"{q}/vocabulary/vocabulary.txt", weights, *components],
+            detector_runtime,
         )
 
     def merge(name, sources):
@@ -1020,6 +1120,7 @@ def compile_plan(args):
                 "--transients",
                 f"{q}/{proposals}/transients.json",
                 *(["--partial-view-association"] if partial_view else []),
+                *(["--depth-consistent-association"] if depth_consistent else []),
                 "--output",
                 f"{q}/{name}",
             ],
@@ -1027,7 +1128,7 @@ def compile_plan(args):
             [f"{q}/{proposals}/manifest.json", f"{q}/{proposals}/transients.json"],
         )
 
-    sam("initial_segmentation", f"{q}/input/plan.json", args.initial_views)
+    segment_primary("initial_segmentation", f"{q}/input/plan.json", args.initial_views)
     merge("initial_proposals", [f"{q}/initial_segmentation/manifest.json"])
     geometry("initial_geometry", "initial_proposals")
     add(
@@ -1046,7 +1147,9 @@ def compile_plan(args):
         f"{q}/coverage/plan.json",
         [f"{q}/initial_geometry/manifest.json", f"{q}/input/plan.json"],
     )
-    sam("adaptive_segmentation", f"{q}/coverage/plan.json", args.adaptive_views)
+    segment_primary(
+        "adaptive_segmentation", f"{q}/coverage/plan.json", args.adaptive_views
+    )
     merge(
         "combined_proposals",
         [
@@ -1440,6 +1543,14 @@ def compile_plan(args):
         quality_profile=dict(
             schema="farm.bounded-quality-profile.v1",
             budgets=budgets,
+            detector=dict(
+                backend=detector,
+                checkpoint=str(checkpoint) if checkpoint else None,
+                labels_are_hypotheses=True,
+                association="geometry",
+                visual_features_used=False,
+            ),
+            depth_consistent_association=depth_consistent,
             start="completed registered metric RGBD from existing FARM ingress",
             refinement=(
                 "bounded other-timestamp crop refinement"
@@ -1490,7 +1601,9 @@ def main(argv=None):
         return q
 
     command("inputs", ["rgbd"])
-    command("vocabulary", ["scene", "core"])
+    q = command("vocabulary", ["scene", "core"])
+    q.add_argument("--max-terms", type=int, default=80)
+    q.add_argument("--ensure-person", action="store_true")
     q = command("merge")
     q.add_argument("--source", type=Path, action="append", required=True)
     q = command("union", ["primary"])
@@ -1517,9 +1630,14 @@ def main(argv=None):
     )
     q.add_argument("--native", type=Path)
     q.add_argument("--groups", type=int, default=64)
-    q = command(
-        "plan", ["rgbd", "ply", "sam-model", "vlm-model", "project-root", "output-root"]
-    )
+    q = command("plan", ["rgbd", "ply", "vlm-model", "project-root", "output-root"])
+    q.add_argument("--sam-model", type=Path)
+    q.add_argument("--detector", choices=("sam3", "yoloe"), default="sam3")
+    q.add_argument("--yoloe-model-root", type=Path)
+    q.add_argument("--yoloe-checkpoint", type=Path)
+    q.add_argument("--yoloe-vocabulary", type=Path)
+    q.add_argument("--detector-confidence", type=float, default=0.4)
+    q.add_argument("--depth-consistent-association", action="store_true")
     q.add_argument("--runtimes", type=Path)
     q.add_argument("--scene-id", required=True)
     q.add_argument(
@@ -1574,7 +1692,13 @@ def main(argv=None):
     if args.phase == "inputs":
         prepare_inputs(args.rgbd, args.output)
     elif args.phase == "vocabulary":
-        union_vocabulary(args.scene, args.core, args.output)
+        union_vocabulary(
+            args.scene,
+            args.core,
+            args.output,
+            maximum_terms=args.max_terms,
+            ensure_person=args.ensure_person,
+        )
     elif args.phase == "merge":
         merge_proposals(args.source, args.output)
     elif args.phase == "union":

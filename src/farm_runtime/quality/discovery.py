@@ -581,9 +581,182 @@ def infer(
     print(json.dumps(report), flush=True)
 
 
+def primary_profile(args):
+    """Reuse the measured YOLOE decoder in the common scene pipeline."""
+    from farm_runtime.quality.mask_refinement import checked_file
+
+    source = json.loads(args.plan.read_text())
+    if source.get("test_opened") is not False or not 1 <= args.views <= 24:
+        raise ValueError("development plan and 1..24 primary views required")
+    if not 0 < args.confidence < 1:
+        raise ValueError("confidence must be in (0,1)")
+    up = np.asarray(args.world_up, float)
+    if up.shape != (3,) or not np.isfinite(up).all() or np.linalg.norm(up) < 1e-8:
+        raise ValueError("finite nonzero world-up required")
+    variants = [v for v in source["variants"] if v["name"] == "balanced_upright"]
+    if len(variants) != 1:
+        raise ValueError("one balanced_upright source variant required")
+    names = variants[0]["views"]
+    if len(names) != len(set(names)):
+        raise ValueError("unique source views required")
+    selected = (
+        [
+            names[i]
+            for i in np.unique(
+                np.linspace(0, len(names) - 1, min(args.views, len(names)))
+                .round()
+                .astype(int)
+            )
+        ]
+        if names
+        else []
+    )
+    prompts = [s.strip() for s in args.vocabulary.read_text().splitlines() if s.strip()]
+    if "person" not in prompts or len(prompts) != len(set(prompts)):
+        raise ValueError("unique primary vocabulary must include person")
+    plan = dict(
+        schema="farm.primary-yoloe-source-plan.v1",
+        source_plan=describe_file(args.plan),
+        sources={n: source["sources"][n] for n in selected},
+        variants=[
+            dict(
+                name="balanced_upright",
+                views=selected,
+                upright=True,
+                resolution=640,
+                allow_upscale=True,
+            )
+        ],
+        test_opened=False,
+    )
+    if selected:
+        validate_inference_plan(plan)
+    weights = args.checkpoint or args.model_root / "yoloe/yoloe-v8l-seg-pf.pt"
+    text_weights = args.model_root / (
+        "yoloe/mobileclip2_b.ts" if args.checkpoint else "mobileclip/mobileclip_blt.pt"
+    )
+    config = dict(
+        detector=describe_file(weights),
+        text_encoder=describe_file(text_weights),
+        vocabulary=describe_file(args.vocabulary),
+        confidence=args.confidence,
+        mode="modern-text" if args.checkpoint else "legacy-vocabulary",
+        resolution=640,
+        allow_upscale=True,
+        world_up=args.world_up,
+        iou=0.5,
+        agnostic_nms=True,
+        max_det=200,
+    )
+    if args.checkpoint is None:
+        config["vocabulary_head"] = describe_file(
+            args.model_root / "yoloe/yoloe-v8l-seg.pt"
+        )
+        # The legacy loader uses environment lookup. Verify it before loading.
+        from scene_graph.runtime_paths import find_model_file
+        from ultralytics.nn.text_model import _resolve_mobileclip_checkpoint
+
+        for item in (config["detector"], config["vocabulary_head"]):
+            resolved = find_model_file(Path(item["path"]).name, "yoloe")
+            if resolved is None or resolved.resolve() != Path(item["path"]).resolve():
+                raise ValueError("runtime YOLOE checkpoint differs from model root")
+        if (
+            Path(_resolve_mobileclip_checkpoint("blt")).resolve()
+            != text_weights.resolve()
+        ):
+            raise ValueError("runtime MobileCLIP checkpoint differs from model root")
+    args.output.mkdir(parents=True)
+    write_json(args.output / "plan.json", plan)
+    write_json(args.output / "config.json", config)
+    started = time.monotonic()
+    observations = []
+    result = None
+    if selected:
+        infer(
+            plan,
+            args.output,
+            model_root=args.model_root,
+            vocabulary=args.vocabulary,
+            world_up=args.world_up,
+            checkpoint=args.checkpoint,
+            confidence=args.confidence,
+        )
+        result = json.loads((args.output / "results.json").read_text())
+        prediction = json.loads(
+            (args.output / "balanced_upright/predictions.json").read_text()
+        )
+        if prediction.get("person_query_present") is not True:
+            raise ValueError("primary model did not run the required person query")
+        actual_text = result["model_components"]["text_encoder_checkpoint"]
+        if actual_text["sha256"] != config["text_encoder"]["sha256"]:
+            raise ValueError(
+                "loaded text encoder differs from compiled primary profile"
+            )
+        if result["model"]["sha256"] != config["detector"]["sha256"]:
+            raise ValueError("loaded detector differs from compiled primary profile")
+        if args.checkpoint is None and (
+            result["model_components"]["vocabulary_head_checkpoint"]["sha256"]
+            != config["vocabulary_head"]["sha256"]
+        ):
+            raise ValueError(
+                "loaded vocabulary head differs from compiled primary profile"
+            )
+        for row in prediction["observations"]:
+            checked_file(row["mask_artifact"])
+            counts = Counter(d["label"] for d in row["detections"])
+            if set(counts) - set(prompts):
+                raise ValueError("detector labels differ from the compiled vocabulary")
+            observations.append(
+                dict(
+                    row, queries=[dict(prompt=p, detections=counts[p]) for p in prompts]
+                )
+            )
+    manifest = dict(
+        schema="farm.primary-yoloe-discovery.v1",
+        source_plan=describe_file(args.plan),
+        plan=describe_file(args.output / "plan.json"),
+        model_config=describe_file(args.output / "config.json"),
+        model_weights=config["detector"],
+        vocabulary=config["vocabulary"],
+        observations=observations,
+        source_image_encoder_calls=len(observations),
+        model_components=result["model_components"] if result else None,
+        total_seconds=time.monotonic() - started,
+        no_inference_reason=None if selected else "no_additional_views",
+        person_query_present=True,
+        test_opened=False,
+        release_eligible=False,
+        labels_are_detector_hypotheses=True,
+        visual_features_for_legacy_association_exported=False,
+    )
+    write_json(args.output / "manifest.json", manifest)
+    write_json(
+        args.output / "transients.json",
+        dict(
+            manifest,
+            observations=[
+                dict(
+                    row,
+                    queries=[q for q in row["queries"] if q["prompt"] == "person"],
+                    detections=[d for d in row["detections"] if d["label"] == "person"],
+                )
+                for row in observations
+            ],
+            role="person-only exclusions",
+        ),
+    )
+    return 0
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--plan", type=Path, help="Prepared development source plan")
+    p.add_argument(
+        "--primary-profile",
+        action="store_true",
+        help="Emit common pipeline proposals from bounded source views",
+    )
+    p.add_argument("--views", type=int, default=12)
     p.add_argument("--packet", type=Path)
     p.add_argument("--colmap", type=Path)
     p.add_argument("--images", type=Path)
@@ -611,6 +784,17 @@ def main(argv=None):
         ),
     )
     args = p.parse_args(argv)
+    if args.primary_profile:
+        if (
+            args.plan is None
+            or args.plan_only
+            or args.variant
+            or any(x is not None for x in (args.packet, args.colmap, args.images))
+        ):
+            p.error("primary profile requires --plan and no ablation selectors")
+        if args.output.exists():
+            raise ValueError("new output required")
+        return primary_profile(args)
     if args.output.exists() or args.timestamps < 2:
         raise ValueError("output must be new and timestamps >= 2")
     if args.plan is not None:

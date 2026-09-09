@@ -10,6 +10,7 @@ ACTIONS = {
     "scene-vocabulary": "scene_vocabulary",
     "concept-discovery": "concept_discovery",
     "complementary-discovery": "complementary_discovery",
+    "yoloe-discovery": "discovery",
     "discovery-coverage": "discovery_coverage",
     "proposal-geometry": "proposal_geometry",
     "scope-evidence": "scope_evidence",

@@ -255,3 +255,35 @@ Validation: 1,803 tests passed, 6 modern-runtime tests skipped in the legacy
 container; modern decoder parity is checked separately. Experiment sources,
 full-cohort membership comparisons and visual reviews are under
 `output/farm_pipeline/research/quality_2026-09-09/` outside the repository.
+
+## YOLOE as the primary detector in the common profile
+
+The measured YOLOE adapter can now feed the existing scene pipeline, including
+adaptive registered-view selection, native Gaussian masks, nested alternatives,
+Qwen appearance and the final candidate catalog. Opt in with
+`quality scene-profile plan --detector yoloe --yoloe-model-root ...`.
+The historical SAM3 profile remains available. With zero recovery/refinement
+budgets, a YOLOE profile does not require or load SAM3.
+
+For YOLOE-26L/X, supply `--yoloe-checkpoint` and a `detector` command prefix
+in the runtime JSON, alongside `main` and `geometry`. This isolates modern
+Ultralytics from the Qwen and native-rendering environments. The local
+`yoloe/mobileclip2_b.ts` checkpoint is required and verified against the loaded
+encoder. Without an explicit checkpoint the pinned legacy YOLOE-v8L backend is
+used. Model weights, text weights, vocabulary and inference configuration are
+bound to the stage; mixed batches cannot silently merge.
+
+The YOLOE search vocabulary retains the broad repository vocabulary, adds the
+explicit person exclusion query and scene-specific object proposals, with a
+2,048-term cap. `--yoloe-vocabulary` can supply another broad core. Scene query
+roles and conflicting role hypotheses remain metadata; they do not authorize
+object deletion or determine final labels. Qwen independently describes actual
+selected regions. Modern visual embeddings are not exported to the original
+feature-based association backend; this profile uses geometric association.
+
+`--depth-consistent-association` is available in the compiled profile as a
+separate experiment. Its improved view association also strengthens large
+structural masks, so it does not establish useful-object recall or safe
+automatic inventory admission. Nested alternatives remain separate hypotheses.
+An empty adaptive schedule records zero inference and merges with the initial
+batch without reloading the model. All budgets remain explicit.
