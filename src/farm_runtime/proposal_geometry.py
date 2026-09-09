@@ -32,6 +32,7 @@ class GeometryPolicy:
     negative_mask_fraction: float = 0.35
     ambiguity_margin: float = 0.08
     partial_view_association: bool = False
+    depth_consistent_proximity: bool = False
 
 
 def mask_overlap(a, b):
@@ -183,12 +184,33 @@ def project_evidence(
     return result
 
 
+def depth_proximity_radius(node, frames, policy):
+    """Use the same depth tolerance as projection, in prepared scene units."""
+    pose = np.asarray(frames[node["frame"]]["T_world_cam"])
+    camera = (node["points"] - pose[:3, 3]) @ pose[:3, :3]
+    median_depth = float(np.median(camera[:, 2])) if len(camera) else 0.0
+    return max(policy.depth_absolute_m, policy.depth_relative * median_depth)
+
+
 def compare_surfaces(a, b, frames, policy=GeometryPolicy()):
     """Geometry-only pair evidence; no category or appearance similarity."""
     pa, pb = a["points"], b["points"]
     if min(len(pa), len(pb)) < policy.min_points:
         return {"decision": "unknown", "reason": "insufficient_surface"}
     radius = max(0.025, 2 * max(a["pixel_footprint_m"], b["pixel_footprint_m"]))
+    if policy.depth_consistent_proximity:
+        # Independently sampled depth surfaces can differ within the allowed
+        # projection tolerance. Keep bidirectional visibility, mask agreement,
+        # ambiguity checks and cannot-links as separate requirements.
+        tolerances = [
+            (
+                node["_depth_proximity_radius_m"]
+                if "_depth_proximity_radius_m" in node
+                else depth_proximity_radius(node, frames, policy)
+            )
+            for node in (a, b)
+        ]
+        radius = max(radius, *tolerances)
     # Reject remote surfaces cheaply before either projection or tree query.
     gap = np.maximum(a["bounds"][0] - b["bounds"][1], b["bounds"][0] - a["bounds"][1])
     if np.any(gap > radius):
@@ -329,6 +351,10 @@ def associate(nodes, frames, policy=GeometryPolicy()):
     import torch
 
     for node in nodes:
+        if policy.depth_consistent_proximity:
+            node["_depth_proximity_radius_m"] = depth_proximity_radius(
+                node, frames, policy
+            )
         node["tree"] = cKDTree(node["points"])
         node["bounds"] = (
             (node["points"].min(0), node["points"].max(0))

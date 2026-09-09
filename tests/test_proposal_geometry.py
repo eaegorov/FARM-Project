@@ -285,3 +285,43 @@ def test_complementary_edges_cannot_block_an_existing_primary_component(monkeypa
     groups, _ = associate(nodes, {name: f for name in ("a", "b", "c")})
     assert any(0 in g and 1 in g and 2 in g for g in groups)
     assert not any(2 in g and 3 in g for g in groups)
+
+
+def depth_offset_pair(offset=0.032):
+    f, g = scene(), scene()
+    f["K"][:2, :2] *= 10
+    g["K"][:2, :2] *= 10
+    g["depth"] += offset
+    mask = np.zeros((40, 40), bool)
+    mask[10:30, 10:30] = True
+    return [node("a", mask, f), node("b", mask, g)], {"a": f, "b": g}
+
+
+def test_depth_consistent_proximity_accepts_only_projection_supported_offset():
+    nodes, frames = depth_offset_pair()
+    assert associate(nodes, frames)[0] == [[0], [1]]
+    groups, evidence = associate(
+        nodes, frames, GeometryPolicy(depth_consistent_proximity=True)
+    )
+    assert groups == [[0, 1]]
+    pair = evidence["candidate_pairs"][0]
+    assert pair["radius_m"] == 0.04
+    assert min(d["mask_agreement"] for d in pair["directions"]) > 0.9
+    # Unchanged default must still be independent of opt-in metadata on nodes.
+    assert associate(nodes, frames)[0] == [[0], [1]]
+
+
+def test_depth_consistent_proximity_preserves_unknown_and_scope_conflicts():
+    policy = GeometryPolicy(depth_consistent_proximity=True)
+    for condition in ("missing", "excluded", "background", "remote", "same_frame"):
+        nodes, frames = depth_offset_pair(0.15 if condition == "remote" else 0.032)
+        if condition == "missing":
+            frames["b"]["depth"][:] = 0
+        elif condition == "excluded":
+            frames["b"]["excluded"][:] = True
+        elif condition == "background":
+            nodes[1]["mask"][:] = False
+            nodes[1]["mask"][:8, :8] = True
+        elif condition == "same_frame":
+            nodes[1]["frame"] = "a"
+        assert associate(nodes, frames, policy)[0] == [[0], [1]]

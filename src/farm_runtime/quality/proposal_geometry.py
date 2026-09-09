@@ -145,11 +145,19 @@ def main(argv=None):
         action="store_true",
         help="Experimental: evaluate border-clipped matches within their observed field of view.",
     )
+    parser.add_argument(
+        "--depth-consistent-association",
+        action="store_true",
+        help="Experimental: align sparse surface proximity with the existing depth tolerance.",
+    )
     args = parser.parse_args(argv)
     if args.output.exists():
         raise ValueError("output directory must be new")
     started = time.monotonic()
-    policy = GeometryPolicy(partial_view_association=args.partial_view_association)
+    policy = GeometryPolicy(
+        partial_view_association=args.partial_view_association,
+        depth_consistent_proximity=args.depth_consistent_association,
+    )
     _, observations = read_observations(args.proposals)
     if args.views_from:
         _, selection = read_observations(args.views_from)

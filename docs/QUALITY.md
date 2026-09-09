@@ -233,3 +233,25 @@ separate from final appearance annotations. `quality scene-catalog` takes labels
 and captions from the namespace-bound Qwen appearance stage; absent annotations
 remain unavailable. MobileCLIP text embeddings do not establish an object's
 physical identity, ownership, completeness or measured dimensions.
+
+### Depth-consistent association experiment
+
+`quality proposal-geometry --depth-consistent-association` lets independently
+sampled surfaces match within the same depth tolerance already used by their
+bidirectional projections. Mask agreement, visibility, ambiguity, same-frame
+conflicts and cannot-links still apply. The flag is off by default. Tolerances
+use the units of prepared geometry; the experiment does not validate physical
+scene scale.
+
+Frozen-node replays on Factory, Knaack and Industrial preserve all previous
+cannot-links and join additional independent observations. These are association
+results, not object recall: building surfaces also acquire more observations.
+On Industrial, newly supported ceiling masks compete with light fixtures for
+Gaussian ownership, reducing several fixture masks and increasing lift time.
+Do not enable this flag as a quality preset before separating background context
+from object ownership and reviewing both recovered and degraded objects.
+
+Validation: 1,803 tests passed, 6 modern-runtime tests skipped in the legacy
+container; modern decoder parity is checked separately. Experiment sources,
+full-cohort membership comparisons and visual reviews are under
+`output/farm_pipeline/research/quality_2026-09-09/` outside the repository.
