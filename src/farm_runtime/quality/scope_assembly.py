@@ -436,8 +436,51 @@ def family_view_masks(run, frame, by_object, config, families):
     return decoded, surface, masks, depth
 
 
+def missing_member_exemption(source_evidence, assembled, families, config):
+    """Exempt only previously supported points exclusive to absent members.
+
+    A missing mask does not justify removing background votes for arbitrary
+    neighboring Gaussians. Points also supported by a present family member
+    keep the observed mask's negative evidence.
+    """
+    claims, _ = lift.build_sparse_claims(source_evidence, config)
+    strong = {r["object_id"]: r["indices"] for r in claims}
+    support = {}
+    for parent, members in families.items():
+        aligned = assembled[parent].indices
+        support[parent] = {}
+        for member in members:
+            item = source_evidence[member]
+            eligible = (np.isin(item.indices, strong[member]) |
+                        growth_evidence_eligible(item, config))
+            support[parent][member] = np.isin(aligned, item.indices[eligible])
+    audit = []
+
+    def exemption(frame, parent, indices, observations):
+        if not np.array_equal(indices, assembled[parent].indices):
+            raise ValueError("family candidate order changed")
+        observed = {obs.object_id for obs in observations}
+        missing = set(families[parent]) - observed
+        absent_support = np.zeros(len(indices), bool)
+        present_support = np.zeros(len(indices), bool)
+        for member, mask in support[parent].items():
+            if member in missing:
+                absent_support |= mask
+            else:
+                present_support |= mask
+        exempt = absent_support & ~present_support
+        audit.append(dict(image_id=frame.image_id, parent_id=parent,
+                          missing_member_ids=sorted(missing),
+                          exempt_candidate_gaussians=int(exempt.sum()),
+                          total_candidates=len(indices)))
+        return exempt
+
+    return exemption, audit
+
+
 def remeasure_whole_object_evidence(
-    run, split, assembled, families, gs, config, *, incomplete_views_unknown=False
+    run, split, assembled, families, gs, config, *, incomplete_views_unknown=False,
+    missing_member_negatives=False, source_evidence=None
 ):
     """Rerender family mask unions once per capture; retain unrelated evidence.
 
@@ -447,6 +490,8 @@ def remeasure_whole_object_evidence(
     """
     from dataclasses import replace
 
+    if missing_member_negatives and (incomplete_views_unknown or source_evidence is None):
+        raise ValueError("local exemption requires original member evidence and ordinary background")
     merged_run = whole_object_run(run, families)
     objects = {obj.object_id: obj for obj in merged_run.objects}
     if set(objects) != set(assembled):
@@ -479,12 +524,19 @@ def remeasure_whole_object_evidence(
         return {oid: decoded[oid] for oid in by_object}, surface, audit, depth
 
     measure_run = replace(merged_run, objects=tuple(objects[oid] for oid in sorted(families)))
+    extra, exemption_audit = {}, []
+    if missing_member_negatives:
+        callback, exemption_audit = missing_member_exemption(
+            source_evidence, fresh, families, config)
+        extra["negative_evidence_exemption"] = callback
     rows, timing = lift.accumulate_build_evidence(
-        gs, measure_run, split, fresh, config, view_mask_loader=load_family_masks)
+        gs, measure_run, split, fresh, config, view_mask_loader=load_family_masks, **extra)
     result = dict(assembled)
     result.update(fresh)
     return result, dict(
-        negative_policy=("incomplete_family_view_is_unknown" if incomplete_views_unknown else "observed_mask_union"),
+        negative_policy=("missing_member_supported_points_only" if missing_member_negatives else
+                         "incomplete_family_view_is_unknown" if incomplete_views_unknown else "observed_mask_union"),
+        negative_exemptions=exemption_audit,
         policy="per_view_union_then_exact_timestamp_votes",
         candidate_indices_unchanged=True, cached_counts_summed=False,
         unrelated_evidence_preserved=True,
@@ -540,7 +592,11 @@ def main(argv=None):
                         help="Experiment: rerender per-view family mask unions with unchanged native gates")
     parser.add_argument("--incomplete-family-views-unknown", action="store_true",
                         help="With remeasurement: absent family masks cannot cast whole-object background votes")
+    parser.add_argument("--missing-member-negative-exemption", action="store_true",
+                        help="Experiment: retain background except points supported only by absent family members")
     args = parser.parse_args(argv)
+    if args.missing_member_negative_exemption and (not args.remeasure_whole_object or args.incomplete_family_views_unknown):
+        raise ValueError("local negative policy requires remeasurement without whole-view suppression")
     if args.incomplete_family_views_unknown and not args.remeasure_whole_object:
         raise ValueError("incomplete-family policy requires whole-object remeasurement")
     if args.output.exists():
@@ -641,7 +697,8 @@ def main(argv=None):
     if args.remeasure_whole_object and families:
         assembled, whole_measurement = remeasure_whole_object_evidence(
             run, split, assembled, families, gs, config,
-            incomplete_views_unknown=args.incomplete_family_views_unknown)
+            incomplete_views_unknown=args.incomplete_family_views_unknown,
+            missing_member_negatives=args.missing_member_negative_exemption, source_evidence=evidence)
         measurement_path = args.output / "whole_object_evidence.json"
         write_json(measurement_path, whole_measurement)
         whole_measurement = describe_file(measurement_path)

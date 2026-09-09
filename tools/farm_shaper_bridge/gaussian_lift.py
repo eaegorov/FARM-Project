@@ -1468,6 +1468,7 @@ def accumulate_build_evidence(
     config: Mapping[str, Any],
     *,
     view_mask_loader=None,
+    negative_evidence_exemption=None,
 ) -> tuple[list[dict[str, Any]], dict[str, float]]:
     import torch
 
@@ -1553,6 +1554,12 @@ def accumulate_build_evidence(
                     ].float().cpu().numpy()
                     gate = _depth_gate(gaussians, item, frame, depth, config)
                     selected[~gate] = 0.0
+                    if negative_evidence_exemption is not None:
+                        exempt = np.asarray(negative_evidence_exemption(
+                            frame, object_id, item.indices, by_object[object_id]))
+                        if exempt.dtype != np.bool_ or exempt.shape != item.indices.shape:
+                            raise ValueError("negative exemption must align with candidate indices")
+                        selected[exempt, 1] = 0.0
                     buffers[object_id]["positive"] = np.maximum(
                         buffers[object_id]["positive"], selected[:, 0]
                     )

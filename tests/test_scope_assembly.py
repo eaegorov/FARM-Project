@@ -516,3 +516,32 @@ def test_missing_part_masks_do_not_cast_background_for_whole_object(tmp_path):
         assert record["negative_evidence_disabled_for_incomplete_family"] is incomplete
         if 3 in observed:
             np.testing.assert_array_equal(after[3]["negative_weight"], before[3]["negative_weight"])
+
+
+def test_missing_member_exemption_preserves_background_and_shared_member_negatives():
+    from farm_runtime.quality.scope_assembly import missing_member_exemption
+    source = {1: evidence(1, [0, 1], 20), 2: evidence(2, [1, 2, 4], 20)}
+    source[2].positive_timestamps[2] = 0
+    source[2].positive_weight[2] = 0
+    merged = {1: evidence(1, [0, 1, 2, 3, 4], 20)}
+    snapshot = {g: item.positive_weight.copy() for g, item in source.items()}
+    callback, audit = missing_member_exemption(source, merged, {1: [1, 2]}, config())
+    exempt = callback(SimpleNamespace(image_id=7), 1, merged[1].indices,
+                      [SimpleNamespace(object_id=1)])
+    # 0 belongs to visible member; 1 is shared; 3 is unsupported background;
+    # 4 had no valid source evidence. Only absent member's exclusive 2 is unknown.
+    assert exempt.tolist() == [False, False, True, False, False]
+    assert audit[-1]["exempt_candidate_gaussians"] == 1
+    assert not callback(SimpleNamespace(image_id=8), 1, merged[1].indices,
+                        [SimpleNamespace(object_id=1), SimpleNamespace(object_id=2)]).any()
+    with pytest.raises(ValueError, match="order"):
+        callback(SimpleNamespace(image_id=9), 1, merged[1].indices[::-1], [])
+    for g, item in source.items():
+        np.testing.assert_array_equal(item.positive_weight, snapshot[g])
+
+
+def test_local_negative_policy_rejects_whole_view_suppression(tmp_path):
+    from farm_runtime.quality.scope_assembly import remeasure_whole_object_evidence
+    with pytest.raises(ValueError, match="ordinary background"):
+        remeasure_whole_object_evidence(whole_run_fixture(tmp_path), {}, {}, {}, None,
+            config(), missing_member_negatives=True, incomplete_views_unknown=True)
