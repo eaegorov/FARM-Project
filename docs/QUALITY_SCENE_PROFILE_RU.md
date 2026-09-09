@@ -1,102 +1,156 @@
-# Ограниченный quality-профиль FARM
+# Общий профиль обработки 3DGS + COLMAP
 
-`quality scene-profile plan` собирает существующие проверенные этапы в обычный
-FARM DAG. Его выполняет `farm run`: snapshot исходников, отдельные журналы,
-статусы этапов и время остаются в стандартном orchestrator.
+Профиль собирает подготовку наблюдений, поиск объектов, согласование ракурсов,
+перенос масок в исходные Gaussian и описания в стандартный DAG. Его выполняет
+обычный orchestrator: снимок исходников, журналы, статусы и время каждого этапа
+сохраняются в каталоге запуска.
 
-Это development-профиль для **уже подготовленного зарегистрированного RGBD** из
-3DGS+COLMAP. Исходный FARM ingress отвечает за масштаб, gravity и RGB↔GS
-регистрацию. Профиль не объявляет unregistered depth метрическим наблюдением.
-Обработка исходных PLY/COLMAP/RGB и время ingress пока считаются отдельно.
+Это **профиль разработки**. Проверка 9 сентября 2026 на Factory, Knaack и
+Industrial подтвердила полезное исправление конкуренции с окружением, но
+выявила пропуски предметов, дубликаты и неправильные названия. Готовность
+автоматического каталога для произвольной новой сцены не подтверждена.
 
-```mermaid
-flowchart LR
-    A[Registered metric RGBD] --> B[8 context RGB: scene vocabulary]
-    B --> C[Core + scene queries, максимум 80]
-    C --> D[12 RGB: SAM3 proposals]
-    D --> E[Geometric association]
-    E --> F[До 8 дополнительных RGB по видимости]
-    F --> G[Новые proposals + прежние masks]
-    G --> H[Geometric association]
-    H --> I[Native lift и nested alternatives]
-    I --> R[Опционально: до 12 crops по противоречиям]
-    R --> S[SAM tracker + concepts, проверка по OTHER timestamps]
-    S --> T[Пересчёт native только при принятых изменениях]
-    T --> J[2 актуальных contextual crops: compact appearance]
-    T --> K[Общий каталог и source-order masks]
-    J --> K
-```
+## Текущая рабочая конфигурация
 
-## Запуск
+Для дальнейших сравнений используется явный профиль **YOLOE-26X + Qwen3-VL-4B,
+24 начальных + до 24 дополнительных ракурсов**. Это рекомендация для разработки,
+а не смена всех CLI defaults или разрешение заменить проверенный каталог viewer.
 
-В inference-контейнере с FARM source:
+| Шаг | Назначение |
+|---|---|
+| Зарегистрированные RGBD | Фотографии, камеры и глубина согласованы с исходным PLY |
+| Словарь | Qwen по 8 контекстным кадрам дополняет общий словарь поиска |
+| Сегментация | YOLOE-26X предлагает 2D-маски и гипотезы категорий |
+| Согласование | Геометрия и глубина связывают наблюдения; считаются физические моменты съёмки |
+| Дополнительные камеры | Подтверждение кандидатов, затем исследование новых позиций и направлений |
+| Native lifting | Исходные Gaussian распределяются между предметными группами с учётом видимости |
+| Описания | Qwen рассматривает выделенную область в двух реальных видах |
+| Каталог | Маски, наблюдаемые OBB, описания, альтернативы состава и происхождение данных |
 
-```bash
-python -m farm_runtime.cli quality scene-profile plan \
-  --scene-id my_scene \
-  --rgbd /absolute/registered_rgbd \
-  --ply /absolute/scene.ply \
-  --sam-model /absolute/sam3_checkpoint \
-  --vlm-model /absolute/qwen3_vl_4b_checkpoint \
-  --world-up 0 -1 0 \
-  --refinement-crops 12 \
-  --project-root /absolute/FARM-Project \
-  --output-root /absolute/quality_outputs \
-  --runtimes /absolute/runtime_prefixes.json \
-  --output /absolute/quality_pipeline.json
-```
+MobileCLIP2 кодирует текстовые категории для YOLOE-26L/X. Этот адаптер не передаёт
+современные визуальные embeddings в старый feature-based association backend:
+в текущем профиле ассоциация геометрическая. Финальные label/caption предлагает
+Qwen по конкретным областям, а не непосредственно детектор. Ни одна из этих
+моделей сама по себе не удостоверяет правильность названия.
 
-`world-up` должен быть получен из конкретной сцены; пример оси не универсален.
-`runtime_prefixes.json` содержит ровно `main` и `geometry`: каждый — список
-аргументов команды, запускающей Python. Для раздельных Docker-образов это
-`docker run ... --entrypoint /path/to/python IMAGE`, для единого подготовленного
-контейнера — путь Python. Shell interpolation не используется. Пути входов,
-outputs и `${execution_project_root}` должны быть доступны в обоих runtime;
-последний — snapshot, созданный существующим orchestrator. Runtime pins и
-mounts задаются конфигурацией установки, а не названиями Factory/Knaack.
+### Команда для новой сцены
 
-На документированном FARM control plane:
+Пример для установленного control plane и доступных inference runtimes:
 
-```bash
-farm validate-plan --config /absolute/quality_pipeline.json
-farm run --config /absolute/quality_pipeline.json --run-id quality-v1
-farm status --run /absolute/quality_outputs/my_scene/runs/quality-v1
-```
+    python3 -m farm_runtime.cli quality scene-profile plan \
+      --scene-id my_scene \
+      --project-root /absolute/FARM-Project \
+      --output-root /absolute/quality_outputs \
+      --rgbd /absolute/registered_rgbd \
+      --ply /absolute/scene.ply \
+      --runtimes /absolute/runtime_prefixes.json \
+      --detector yoloe \
+      --yoloe-model-root /absolute/models \
+      --yoloe-checkpoint /absolute/models/yoloe/yoloe-26x-seg.pt \
+      --vlm-model /absolute/qwen3_vl_4b_checkpoint \
+      --detector-confidence 0.25 \
+      --depth-consistent-association --explore-uncovered \
+      --initial-views 24 --adaptive-views 24 --vocabulary-views 8 \
+      --native-groups 128 --semantic-groups 128 --alternatives 16 \
+      --recovery-groups 0 --coverage-groups 0 --refinement-crops 0 \
+      --world-up 0 -1 0 \
+      --output /absolute/quality_pipeline.json
 
-GPU inference выполняется в контейнерах. Host control plane и его подготовка
-описаны в [DEPLOYMENT.md](DEPLOYMENT.md). Если `--runtimes` пропущен, команды
-используют Python текущего orchestrator; это пригодно только для контейнера,
-в котором доступны обе группы зависимостей.
+**Ось world-up нужно получить из данных конкретной сцены.** Значение в примере
+подходит проверенным входам, но не является универсальным. Путь RGBD должен
+содержать полный доступный зарегистрированный пул: профиль сам выбирает кадры.
 
-## Бюджеты и смысл результата
+В runtime JSON задаются списки аргументов запуска Python: main, geometry и,
+для современного YOLOE, detector. Последний изолирует актуальный Ultralytics
+от окружений Qwen и Gaussian renderer. Требуется локальный
+yoloe/mobileclip2_b.ts. Пути входов, выходов и снимка исходников должны быть
+доступны в соответствующих контейнерах. Подробности установки —
+[DEPLOYMENT.md](DEPLOYMENT.md), контракты адаптера — [QUALITY.md](QUALITY.md).
 
-По умолчанию 12 первоначальных + до 8 дополнительных сегментируемых RGB,
-8 context RGB для словаря, до 128 native candidates, до 64 appearance
-candidates × 2 timestamps, до 16 nested alternatives. При превышении
-object-бюджета порядок задаётся числом независимых timestamps и стабильным ID;
-необработанные IDs явно перечислены. Это ограничивает работу, но не доказывает
-полноту сцены. Если новых полезных видов нет, SAM3 повторно не загружается.
-Отсутствие multi-timestamp groups останавливает native stage с явной причиной.
+    farm validate-plan --config /absolute/quality_pipeline.json
+    farm run --config /absolute/quality_pipeline.json --run-id quality-v1
+    farm status --run /absolute/quality_outputs/my_scene/runs/quality-v1
 
-Native profile использует `configs/quality/native_rendered_v1.json`: валидная
-rendered contribution, отрицательное свидетельство конкретного кандидата,
-сохранение transient/depth unknown. Выполняется только `exclusions_on`;
-`native-observations --mode both` сохраняет прежний режим ablation.
-Калиброванного release этот конфиг не заявляет.
+Для показанного YOLOE-26X требуется явный runtime с ключом detector, даже если
+все зависимости установлены вместе. Режим без runtimes с Python control plane
+доступен для SAM3/legacy при наличии их зависимостей. Явный checkpoint обязателен
+для воспроизведения YOLOE-26X: без него адаптер использует legacy YOLOE-v8L.
+Исторический SAM3 backend остаётся отдельной возможностью CLI.
 
-Выход `quality/catalog/catalog.json` связывает:
+## Отделение непрерывного окружения
 
-- `object_masks.npz`: exclusive primary membership исходных строк PLY;
-- `scope_alternatives/*.npz`: отдельные пересекающиеся варианты physical scope;
-- observed OBB и tail-sensitivity, независимые timestamps;
-- `label`/`caption` как **unverified model proposals**, с исходными canvases;
-- SHA256 namespace геометрии, исходный PLY, его масштаб, причины неопределённости
-  и отложенные IDs.
+Собранный план по умолчанию включает separate-scene-surfaces на native этапе
+и передаёт его selection в каталог. Непрерывные поверхности не конкурируют
+с предметами за одни и те же Gaussian. Правило допускает только согласованные
+точные категории ceiling, floor, wall, ground, roof во всех наблюдениях,
+минимум два физических timestamp и непротиворечивый состав labels.
+Смесь предметных и структурных категорий остаётся среди объектов; смесь только структурных категорий может выводиться в окружение. Группы, принятые отдельной
+проверкой recovery, не удаляются этим правилом.
 
-`physical_dimensions_m=null` не скрывает оценку observed geometry: она доступна
-в `observed_obb.dimensions_m`. Это разные утверждения. Глубина за прозрачным
-окном и скрытая толщина панели не становятся физическим измерением объекта.
-Маски альтернатив не объединяются молча в exclusive bank.
+В quality scene-profile native эта политика включается явно флагом
+--separate-scene-surfaces. У quality native-observations такого флага нет. В plan флаг --include-scene-surfaces отключает её.
+Каталог хранит scene_context и происхождение решения. Отдельный native-банк
+для окружения не создаётся; physical_role_validated остаётся false.
+Поэтому ошибочно названный пол может остаться предметом, а согласованная
+категория не равнозначна доказанной физической роли.
+
+Контроль commit 4edbd46: 101 исходный кандидат, три потолочные гипотезы вынесены
+из предметной конкуренции. Из 98 оставшихся улучшились две маски; 92 непустых
+и четыре пустых сохранили точно тот же состав Gaussian. Это проверка регрессий
+на данных разработки, не измерение полноты сцены.
+
+## Время и пределы качества
+
+Свежие 13 этапов с профилем 24 + 24 на одной NVIDIA L4:
+
+| Сцена | Пул RGBD | Обработано кадров | Время от RGBD | Кандидаты / непустые маски |
+|---|---:|---:|---:|---:|
+| Factory | 48 | 48 | 8:31 | 80 / 76 |
+| Knaack | 48 | 48 | 4:42 | 30 / 30 |
+| Industrial | 88 | 48 | 7:04 | 61 / 58 |
+
+Модели и CUDA-расширения уже установлены; загрузка моделей и новый inference
+включены. Подготовка этих пулов из существующих pinhole COLMAP, RGB и PLY
+измерена отдельно: 0:44, 0:45 и 1:01. Извлечение кадров, fisheye conversion,
+обучение 3DGS и создание обзорных галерей в эти времена не входят.
+
+Число кандидатов не измеряет recall. Быстрый профиль 12 + 8 потерял десять
+прежних целей Knaack; 24 + 24 вернул их, но разделил конус на две группы.
+В Industrial даже больший бюджет потерял оба подтверждающих направления
+двух контейнеров и светильника. Увеличение бюджета сейчас меняет исходную
+выборку, а не гарантирует её расширение. Дубликаты и целое/часть остаются
+открытыми проблемами до exclusive распределения точек.
+
+Артефакты контроля в рабочем дереве данных:
+output/farm_pipeline/research/quality_2026-09-09/pipeline_validation/bounded_cycle.
+Начальная точка — RESULT_RU.md; полный фиксированный набор — OBJECT_REVIEW_RU.md;
+воспроизводимые конфигурации и метрики — coverage48-4edbd46-v1.
+
+## Что означает каталог
+
+В quality/catalog/catalog.json связаны:
+
+- object_masks.npz: принадлежность исходных строк PLY основным группам;
+- отдельные scope_alternatives: пересекающиеся гипотезы состава объекта;
+- observed OBB, чувствительность к удалённым точкам и независимые timestamps;
+- label/caption со статусом unverified_model_proposal и исходными изображениями;
+- source PLY, namespace геометрии, причины неопределённости и отложенные группы.
+
+physical_dimensions_m = null не скрывает наблюдаемую геометрию: она доступна
+в observed_obb.dimensions_m. Но размер наблюдаемой оболочки, скрытая толщина
+и реальные физические размеры — разные утверждения. Масштаб исходной сцены
+требует подтверждения. Альтернативы не объединяются молча в основной банк.
+
+Целый шкаф, тележка с грузом или составное оборудование допустимы как одна
+единица. Принудительно делить предмет на все видимые детали не требуется.
+Автоматическое согласование целого и частей пока не считается решённым.
+
+## Дополнительные команды разработки
+
+Ниже сохранены справочные контракты предыдущих экспериментов. Они **не входят
+в рекомендуемый профиль 24 + 24**, пока отдельное сравнение не подтвердит
+пользу на всём фиксированном наборе. Исторические времена и ID иллюстрируют
+конкретные опыты и не определяют правила обработки новых сцен.
 
 `--refinement-crops 12` включает пять дополнительных этапов того же DAG:
 scheduler, SAM tracker, SAM concepts, other-timestamp selection и conditional
