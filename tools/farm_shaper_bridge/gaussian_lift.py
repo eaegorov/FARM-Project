@@ -1466,9 +1466,12 @@ def accumulate_build_evidence(
     split: Mapping[str, Any],
     evidence: Mapping[int, ObjectEvidence],
     config: Mapping[str, Any],
+    *,
+    view_mask_loader=None,
 ) -> tuple[list[dict[str, Any]], dict[str, float]]:
     import torch
 
+    mask_loader = _load_view_masks if view_mask_loader is None else view_mask_loader
     build_timestamps = set(split["build_timestamps"])
     grouped: dict[str, dict[int, dict[int, list[MaskObservation]]]] = defaultdict(
         lambda: defaultdict(lambda: defaultdict(list))
@@ -1500,7 +1503,7 @@ def accumulate_build_evidence(
         timestamp_row = {"physical_timestamp_ns": int(timestamp), "views": []}
         for image_id, by_object in sorted(grouped[timestamp].items()):
             frame = run.frame(image_id)
-            decoded, total_surface, mask_audit, depth_audit = _load_view_masks(
+            decoded, total_surface, mask_audit, depth_audit = mask_loader(
                 run, frame, by_object, config
             )
             depth = np.load(frame.depth_path, mmap_mode="r")

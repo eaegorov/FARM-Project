@@ -420,3 +420,99 @@ def test_optional_identity_cli_applies_only_after_loading_known_objects(tmp_path
         assembly.main(args)
     assert calls == ([known] if enable_identity else [])
     assert not (tmp_path / "result").exists()
+
+
+def whole_run_fixture(tmp_path):
+    from tools.farm_shaper_bridge.common import Frame, FarmObject, MaskObservation, RunData
+    from farm_runtime.quality.native_observations import write_native_mask
+    frames = tuple(Frame(i, str(i // 2), 100 * (i // 2 + 1), f"cam{i % 2}",
+                         f"cam{i % 2}", "center", f"view{i}.jpg", (32, 32),
+                         np.eye(3), np.eye(4), tmp_path / f"view{i}.jpg",
+                         tmp_path / f"depth{i}.npy") for i in range(3))
+    for frame in frames:
+        np.save(frame.depth_path, np.ones((32, 32), np.float32))
+    overrides, objects = {}, []
+    for oid, views, region in [(1, [0, 1], (4, 10)), (2, [0, 2], (14, 20)), (3, [0], (24, 28))]:
+        observations = []
+        for view in views:
+            mask = np.zeros((32, 32), bool)
+            mask[8:24, region[0]:region[1]] = True
+            path = tmp_path / f"{oid}_{view}.npz"
+            write_native_mask(path, mask, mask.shape, 0)
+            overrides[oid, view] = path
+            observations.append(MaskObservation(oid, view, path.name, {}))
+        objects.append(FarmObject(oid, "object", "", np.zeros(3), np.ones(3), np.eye(3), tuple(observations)))
+    return RunData(tmp_path, "test", {}, frames, tuple(objects), 1.,
+                   dict(depth_min_m=.05, depth_max_m=80), "", None, {}, {}, True,
+                   mask_overrides=overrides)
+
+
+def test_whole_object_masks_union_exact_pixels_keep_gaps_and_neighbor_background(tmp_path):
+    from farm_runtime.quality.scope_assembly import whole_object_run
+    run = whole_run_fixture(tmp_path)
+    merged = whole_object_run(run, {1: [1, 2]})
+    assert [o.object_id for o in merged.objects] == [1, 3]
+    assert len(run.objects) == 3 and merged.mask_overrides is run.mask_overrides
+    by_object = {o.object_id: [v for v in o.observations if v.image_id == 0]
+                 for o in merged.objects}
+    masks, _, _, _ = lift._load_view_masks(merged, merged.frame(0), by_object, config())
+    assert int(masks[1]["raw"].sum()) == 16 * 12
+    assert not masks[1]["raw"][:, 10:14].any()  # no bounding-box fill between pieces
+    assert masks[3]["raw"][8:24, 24:28].all()
+    assert {obs.object_id for obs in by_object[1]} == {1, 2}  # original mask addressing
+
+
+def test_whole_object_remeasurement_zeros_counts_and_never_duplicates_timestamps(tmp_path, monkeypatch):
+    from farm_runtime.quality.scope_assembly import remeasure_whole_object_evidence
+    run = whole_run_fixture(tmp_path)
+    original = {1: evidence(1, [0, 1], 20), 3: evidence(3, [2], 15)}
+    seen = {}
+    def renderer(gs, merged, split, fresh, cfg, *, view_mask_loader):
+        assert split["build_timestamps"] == ["100"]  # frame 2 is not build evidence
+        assert fresh[1].build_timestamp_count == 1  # two cameras plus two parts count once
+        assert [o.object_id for o in merged.objects] == [1]
+        by_object = {1: [o for o in merged.objects[0].observations if o.image_id == 0]}
+        decoded, _, mask_audit, _ = view_mask_loader(merged, merged.frame(0), by_object, cfg)
+        assert set(decoded) == {1}
+        assert {r["object_id"] for r in mask_audit} == {1, 3}
+        for item in fresh.values():
+            assert not item.positive_timestamps.any()
+            assert not item.positive_weight.any()
+        fresh[1].positive_timestamps[:] = 1
+        seen["called"] = True
+        return [], {"render_and_vjp": 0.0}
+    monkeypatch.setattr(lift, "accumulate_build_evidence", renderer)
+    measured, audit = remeasure_whole_object_evidence(
+        run, {"build_timestamps": ["100"]}, original, {1: [1, 2]}, None, config())
+    assert seen["called"] and measured[1].positive_timestamps.tolist() == [1, 1]
+    assert original[1].positive_timestamps.tolist() == [20, 20]
+    np.testing.assert_array_equal(original[1].indices, measured[1].indices)
+    assert audit["cached_counts_summed"] is False
+    assert measured[3] is original[3]  # preserve independent depth-recovery evidence
+
+
+def test_whole_object_run_rejects_overlapping_families(tmp_path):
+    from farm_runtime.quality.scope_assembly import whole_object_run
+    with pytest.raises(ValueError, match="disjoint"):
+        whole_object_run(whole_run_fixture(tmp_path), {1: [1, 2], 3: [2, 3]})
+
+
+def test_missing_part_masks_do_not_cast_background_for_whole_object(tmp_path):
+    from farm_runtime.quality.scope_assembly import family_view_masks, whole_object_run
+    run = whole_object_run(whole_run_fixture(tmp_path), {1: [1, 2]})
+    c = config()
+    c["mask"]["other_mask_negative_policy"] = "independent"
+    c["mask"]["negative_domain"] = "visible_background"
+    for fid, incomplete in [(0, False), (1, True)]:
+        observed = {obj.object_id: [o for o in obj.observations if o.image_id == fid]
+                    for obj in run.objects}
+        observed = {oid: rows for oid, rows in observed.items() if rows}
+        before, _, _, _ = lift._load_view_masks(run, run.frame(fid), observed, c)
+        after, _, audit, _ = family_view_masks(run, run.frame(fid), observed, c, {1: [1, 2]})
+        np.testing.assert_array_equal(after[1]["positive_weight"], before[1]["positive_weight"])
+        assert before[1]["negative_weight"].any()
+        assert bool(after[1]["negative_weight"].any()) is (not incomplete)
+        record = next(r for r in audit if r["object_id"] == 1)
+        assert record["negative_evidence_disabled_for_incomplete_family"] is incomplete
+        if 3 in observed:
+            np.testing.assert_array_equal(after[3]["negative_weight"], before[3]["negative_weight"])

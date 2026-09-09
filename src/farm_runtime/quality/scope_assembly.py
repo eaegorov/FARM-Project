@@ -389,6 +389,111 @@ def collapse_family_evidence(evidence, families, config, timestamp_sets):
     return result, audit
 
 
+
+
+def whole_object_run(run, families):
+    """Group source observations without changing their mask paths or split.
+
+    The native renderer unions raw/inlier pixels per object and image before
+    computing evidence. Keep original observation IDs so immutable overrides
+    still resolve to the original child masks. Unrelated objects remain in the
+    run: their masks still participate in the existing background policy.
+    """
+    from dataclasses import replace
+
+    objects = {obj.object_id: obj for obj in run.objects}
+    children = [g for members in families.values() for g in members]
+    if (len(children) != len(set(children)) or not set(children) <= objects.keys()
+            or any(parent not in members for parent, members in families.items())):
+        raise ValueError("disjoint known parent-containing families required")
+    absorbed = set(children) - families.keys()
+    merged = []
+    for oid, obj in sorted(objects.items()):
+        if oid in absorbed:
+            continue
+        observations = tuple(
+            observation
+            for member in sorted(families.get(oid, [oid]))
+            for observation in objects[member].observations
+        )
+        merged.append(replace(obj, observations=observations))
+    return replace(run, objects=tuple(merged))
+
+
+def family_view_masks(run, frame, by_object, config, families):
+    """An unobserved family member is unknown, not background for that member."""
+    decoded, surface, masks, depth = lift._load_view_masks(run, frame, by_object, config)
+    for parent, members in families.items():
+        if parent not in decoded:
+            continue
+        observed = {obs.object_id for obs in by_object[parent]}
+        missing = set(members) - observed
+        if missing:
+            decoded[parent]["negative_weight"] = np.zeros_like(decoded[parent]["negative_weight"])
+        row = next(r for r in masks if r["object_id"] == parent)
+        row["unobserved_family_member_ids"] = sorted(missing)
+        row["negative_evidence_disabled_for_incomplete_family"] = bool(missing)
+    return decoded, surface, masks, depth
+
+
+def remeasure_whole_object_evidence(
+    run, split, assembled, families, gs, config, *, incomplete_views_unknown=False
+):
+    """Rerender family mask unions once per capture; retain unrelated evidence.
+
+    Unrelated objects still define mask context, but their measured evidence
+    is preserved, including any prior compositing-depth recovery. Candidate
+    indices and native acceptance thresholds remain fixed.
+    """
+    from dataclasses import replace
+
+    merged_run = whole_object_run(run, families)
+    objects = {obj.object_id: obj for obj in merged_run.objects}
+    if set(objects) != set(assembled):
+        raise ValueError("assembled evidence does not match whole-object run")
+    build = set(split["build_timestamps"])
+    fresh = {}
+    for oid in families:
+        old, obj = assembled[oid], objects[oid]
+        times = {run.frame(obs.image_id).physical_timestamp for obs in obj.observations} & build
+        fresh[oid] = lift.ObjectEvidence(
+            obj=obj, indices=old.indices.copy(), radius_m=old.radius_m.copy(),
+            build_timestamp_count=len(times),
+            **{field: np.zeros_like(getattr(old, field))
+               for field in FIELDS if field not in ("indices", "radius_m")},
+        )
+    context = {}
+    for obj in merged_run.objects:
+        for obs in obj.observations:
+            context.setdefault(obs.image_id, {}).setdefault(obj.object_id, []).append(obs)
+
+    def load_family_masks(measure_run, frame, by_object, policy):
+        all_observations = context[frame.image_id]
+        if incomplete_views_unknown:
+            decoded, surface, audit, depth = family_view_masks(
+                merged_run, frame, all_observations, policy, families)
+        else:
+            decoded, surface, audit, depth = lift._load_view_masks(
+                merged_run, frame, all_observations, policy)
+        # Mask context stays complete; render channels are only measured families.
+        return {oid: decoded[oid] for oid in by_object}, surface, audit, depth
+
+    measure_run = replace(merged_run, objects=tuple(objects[oid] for oid in sorted(families)))
+    rows, timing = lift.accumulate_build_evidence(
+        gs, measure_run, split, fresh, config, view_mask_loader=load_family_masks)
+    result = dict(assembled)
+    result.update(fresh)
+    return result, dict(
+        negative_policy=("incomplete_family_view_is_unknown" if incomplete_views_unknown else "observed_mask_union"),
+        policy="per_view_union_then_exact_timestamp_votes",
+        candidate_indices_unchanged=True, cached_counts_summed=False,
+        unrelated_evidence_preserved=True,
+        other_objects_retained_for_background=True, build_timestamps_only=True,
+        families={str(p): sorted(m) for p, m in families.items()},
+        views=rows, timing=timing,
+    )
+
+
 def resolve(evidence, gs, config):
     from tools.farm_shaper_bridge.lift_refinement import refine_connected_claims, apply_provisional_geometry_gate
     from tools.farm_shaper_bridge.common import build_verified_csr
@@ -431,7 +536,13 @@ def main(argv=None):
                         help="manifest from a prior source/config-bound assembly run")
     parser.add_argument("--identity-review", type=Path,
                         help="optional immutable same-object review bound to --families")
+    parser.add_argument("--remeasure-whole-object", action="store_true",
+                        help="Experiment: rerender per-view family mask unions with unchanged native gates")
+    parser.add_argument("--incomplete-family-views-unknown", action="store_true",
+                        help="With remeasurement: absent family masks cannot cast whole-object background votes")
     args = parser.parse_args(argv)
+    if args.incomplete_family_views_unknown and not args.remeasure_whole_object:
+        raise ValueError("incomplete-family policy requires whole-object remeasurement")
     if args.output.exists():
         raise ValueError("new output directory required")
     started = time.monotonic()
@@ -526,6 +637,15 @@ def main(argv=None):
     timestamp_sets = {g: {run.frame(o.image_id).physical_timestamp for o in obj.observations}
                       & set(split["build_timestamps"]) for g, obj in objects.items()}
     assembled, pool_audit = collapse_family_evidence(evidence, families, config, timestamp_sets)
+    whole_measurement = None
+    if args.remeasure_whole_object and families:
+        assembled, whole_measurement = remeasure_whole_object_evidence(
+            run, split, assembled, families, gs, config,
+            incomplete_views_unknown=args.incomplete_family_views_unknown)
+        measurement_path = args.output / "whole_object_evidence.json"
+        write_json(measurement_path, whole_measurement)
+        whole_measurement = describe_file(measurement_path)
+        finish_stage("remeasure_whole_object_votes", families=len(families))
     bank, rows, resolved_audit = resolve(assembled, gs, config)
     finish_stage("assemble_ownership", families=len(families), masks=len(bank["object_ids"]))
     bank_path = args.output / "object_masks.npz"
@@ -571,6 +691,8 @@ def main(argv=None):
                   primary_bank_exclusive=True, physical_ownership_assigned=False,
                   closed_test_opened=False, release_eligible=False)
     result.update(identity_provenance)
+    if whole_measurement is not None:
+        result["whole_object_evidence"] = whole_measurement
     result["source_native_output"] = result.pop("native_output")
     result["native_bank_stage"] = "scope_assembly"
     result["native_bank_source"] = describe_file(bank_path)
@@ -596,9 +718,11 @@ def main(argv=None):
     finish_stage("export_catalog", objects=len(selected_objects))
     write_json(args.output / "manifest.json", dict(
         schema="farm.scope-assembly-run.v1", sources=source, family_review=describe_file(args.families),
+        assembly_code=describe_file(Path(__file__)),
         **identity_provenance,
         catalog=describe_file(args.output / "catalog.json"), bank=describe_file(bank_path),
         families=families, family_selection=selection_audit, pooling=pool_audit,
+        whole_object_evidence=whole_measurement,
         baseline_replay_exact=True, baseline_confidence_max_abs_error=confidence_error, baseline_object_rows=old_rows,
         baseline_audit=old_audit, object_rows=rows, assembled_audit=resolved_audit,
         changes=changes, stage_seconds=stage_seconds, original_candidates=len(catalog["objects"]),
